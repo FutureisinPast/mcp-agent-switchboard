@@ -2,10 +2,10 @@
 .SYNOPSIS
   Build the Agent Broker release artifacts for GitHub:
     1) the bridge VSIX (vsce)            -> extensions/antigravity-agent-broker-bridge/*.vsix
-    2) the self-contained agent-broker.exe (PyInstaller, embeds the VSIX + scripts) -> dist/
+    2) the self-contained agent-switchboard.exe (PyInstaller, embeds the VSIX + scripts) -> dist/
 
   Both the .py installer and the .exe register `<broker> serve` and install the bundled
-  VSIX, and both expose a built-in uninstall. Upload dist/agent-broker.exe (+ optionally
+  VSIX, and both expose a built-in uninstall. Upload dist/agent-switchboard.exe (+ optionally
   the .vsix) to the GitHub Release page.
 
 .PARAMETER SkipVsix   Skip the VSIX build (reuse the newest existing one).
@@ -41,7 +41,7 @@ if (-not $SkipVsix) {
 }
 
 if (-not $SkipExe) {
-  Write-Host '=== Building agent-broker.exe (PyInstaller) ===' -ForegroundColor Cyan
+  Write-Host '=== Building agent-switchboard.exe (PyInstaller) ===' -ForegroundColor Cyan
   $py = Resolve-Python
   & $py -c "import PyInstaller" 2>$null
   if ($LASTEXITCODE -ne 0) {
@@ -54,11 +54,11 @@ if (-not $SkipExe) {
     & $py -m PyInstaller --noconfirm 'agent-broker.spec'
     if ($LASTEXITCODE -ne 0) { throw "pyinstaller failed (exit $LASTEXITCODE)" }
   } finally { Pop-Location }
-  $exe = Join-Path $root 'dist\agent-broker.exe'
+  $exe = Join-Path $root 'dist\agent-switchboard.exe'
   if (Test-Path $exe) {
     Write-Host "EXE: $exe ($([math]::Round((Get-Item $exe).Length/1MB,1)) MB)" -ForegroundColor Green
   } else {
-    throw 'Build reported success but dist\agent-broker.exe is missing.'
+    throw 'Build reported success but dist\agent-switchboard.exe is missing.'
   }
 }
 
