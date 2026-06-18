@@ -143,7 +143,7 @@ function Restore-DebugShortcuts {
   }
 
   if ($changed -eq 0) {
-    Add-Action "shortcuts" "unchanged" "$HostName shortcuts had no Agent Broker debug flags."
+    Add-Action "shortcuts" "unchanged" "$HostName shortcuts had no Agent Switchboard debug flags."
   }
 }
 

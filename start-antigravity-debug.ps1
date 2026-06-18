@@ -38,7 +38,7 @@ function Resolve-AntigravityCommand {
     }
   }
 
-  throw "Could not find Antigravity IDE. Install Antigravity or pass a valid path in Agent Broker config."
+  throw "Could not find Antigravity IDE. Install Antigravity or pass a valid path in Agent Switchboard config."
 }
 
 function Focus-AntigravityWindow {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Agent Broker — one-run installer / uninstaller.
+"""Agent Switchboard — one-run installer / uninstaller.
 
 Detects which agents you have (Codex, Claude, Antigravity, VS Code), registers the
 broker's MCP server with each, installs the bridge extension, and (optionally) sets
@@ -208,7 +208,7 @@ def require_ide_windows_closed(action: str, dry: bool) -> bool:
     if not windows:
         return True
     head("Close apps first")
-    print(f"  Agent Broker cannot {action} while Antigravity or VS Code windows are open.")
+    print(f"  Agent Switchboard cannot {action} while Antigravity or VS Code windows are open.")
     print("  Close these windows, then run setup again:")
     for window in windows:
         title = f" - {window['title']}" if window.get("title") else ""
@@ -797,7 +797,7 @@ def setup_debug_port(dry: bool) -> str:
 def menu() -> int:
     while True:
         print("\n" + "=" * 44)
-        print("  Agent Broker - setup")
+        print("  Agent Switchboard - setup")
         print("=" * 44)
         print("  1) Status (what's detected)")
         print("  2) Install / repair")
@@ -852,7 +852,7 @@ def main(argv: list[str]) -> int:
 if __name__ == "__main__":
     if sys.version_info < (3, 10):
         print(
-            f"Agent Broker setup requires Python 3.10+ (found {sys.version.split()[0]}). "
+            f"Agent Switchboard setup requires Python 3.10+ (found {sys.version.split()[0]}). "
             "Install a newer Python and re-run."
         )
         raise SystemExit(1)

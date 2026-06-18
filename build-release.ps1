@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Build the Agent Broker release artifacts for GitHub:
+  Build the Agent Switchboard release artifacts for GitHub:
     1) the bridge VSIX (vsce)            -> extensions/antigravity-agent-broker-bridge/*.vsix
     2) the self-contained agent-switchboard.exe (PyInstaller, embeds the VSIX + scripts) -> dist/
 
