@@ -7,6 +7,7 @@ The one binary is dual-mode so a GitHub user needs no Python at all:
   agent-broker.exe install ...     -> setup subcommands (install/uninstall/status)
   agent-broker.exe uninstall ...   -> rollback everything this tool changed
   agent-broker.exe serve           -> run the MCP server over stdio (what agents launch)
+  agent-broker.exe doctor [--json] -> read-only capability report for this machine
   agent-broker.exe bridge <args>   -> broker CLI used by the bridge extension
 
 `broker_command()` in setup.py registers `<this-exe> serve` with every host, so the
@@ -26,6 +27,11 @@ def run() -> int:
         import agent_broker_mcp as broker
         # Enter the MCP stdio loop: the server keys off argv, so present it with none.
         sys.argv = [sys.argv[0]]
+        return broker.main()
+    if first in ("doctor", "debate"):
+        import agent_broker_mcp as broker
+        # Map `agent-broker doctor|debate [args]` onto the broker's `bridge` path.
+        sys.argv = [sys.argv[0], "bridge", *sys.argv[1:]]
         return broker.main()
     if first == "bridge":
         import agent_broker_mcp as broker

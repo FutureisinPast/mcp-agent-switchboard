@@ -8,6 +8,7 @@ needed by Codex, Claude Code, and Antigravity over stdio JSON-RPC.
 
 from __future__ import annotations
 
+import calendar
 import json
 import hashlib
 import os
@@ -33,7 +34,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "0.5.0"
+BROKER_VERSION = "1.0.0"
 
 # How long to wait for the SQLite write lock before raising "database is locked".
 DB_TIMEOUT_SECONDS = 30
@@ -450,6 +451,32 @@ def init_db() -> None:
                 except sqlite3.OperationalError as exc:
                     if "duplicate column" not in str(exc).lower():
                         raise
+        # claude_requests mirrors codex_requests so a Claude-extension reply has a
+        # first-class row to attach to (respond_to_request + ledger know about it).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS claude_requests (
+                id TEXT PRIMARY KEY,
+                project TEXT NOT NULL,
+                root_path TEXT,
+                topic TEXT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL,
+                response TEXT,
+                error TEXT,
+                created_by TEXT,
+                created_at TEXT NOT NULL,
+                notified_at TEXT,
+                completed_at TEXT,
+                responder TEXT,
+                responder_model TEXT,
+                target_model TEXT,
+                strict_model INTEGER DEFAULT 0,
+                task_kind TEXT,
+                token_budget INTEGER
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS shared_context_blobs (
@@ -486,6 +513,63 @@ def init_db() -> None:
             """
         )
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS context_snapshot_requests (
+                id TEXT PRIMARY KEY,
+                project TEXT NOT NULL,
+                root_path TEXT,
+                topic TEXT,
+                requester_agent TEXT,
+                requester_host TEXT,
+                target_agent TEXT,
+                target_model TEXT,
+                question TEXT,
+                scope TEXT,
+                max_tokens INTEGER,
+                status TEXT NOT NULL,
+                claimed_by TEXT,
+                claimed_at TEXT,
+                snapshot_id TEXT,
+                created_by TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS context_snapshots (
+                id TEXT PRIMARY KEY,
+                request_id TEXT,
+                project TEXT NOT NULL,
+                root_path TEXT,
+                topic TEXT,
+                target_agent TEXT,
+                source_surface TEXT,
+                model TEXT,
+                content TEXT NOT NULL,
+                confidence TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS surface_heartbeats (
+                host TEXT PRIMARY KEY,
+                project TEXT,
+                root_path TEXT,
+                visible_app TEXT,
+                capabilities TEXT,
+                open_tabs TEXT,
+                cdp_port INTEGER,
+                last_snapshot_source TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_events_project_topic_id ON agent_events(project, topic, id)"
         )
         conn.execute(
@@ -502,6 +586,15 @@ def init_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_model_defaults_project_topic ON model_defaults(project, topic, model_family)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_snapshot_requests_status ON context_snapshot_requests(status, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_snapshot_requests_project_topic ON context_snapshot_requests(project, topic, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_context_snapshots_project_topic ON context_snapshots(project, topic, created_at)"
         )
 
 
@@ -2651,6 +2744,14 @@ def get_context_pack(project: str | None, topic: str | None = None, budget: int 
             break
 
     append_budgeted(lines, "", context_budget)
+    try:
+        for line in latest_context_snapshots_section(project_info, topic, 3):
+            if not append_budgeted(lines, line, context_budget):
+                break
+    except Exception as exc:  # noqa: BLE001
+        log(f"context-pack snapshot section failed: {exc}")
+
+    append_budgeted(lines, "", context_budget)
     append_budgeted(lines, "## Recent Topic Timeline", context_budget)
 
     if events:
@@ -3387,7 +3488,9 @@ def _ledger_oneline(value: Any, limit: int = 90) -> str:
 
 def _iso_epoch(value: Any) -> int | None:
     try:
-        return int(time.mktime(time.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ")))
+        # Parse the 'Z' UTC stamp as UTC (timegm), not local time (mktime), so age/latency
+        # math is timezone- and DST-independent.
+        return int(calendar.timegm(time.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ")))
     except Exception:  # noqa: BLE001
         return None
 
@@ -3404,6 +3507,71 @@ def _latency(created: Any, completed: Any) -> str:
     return f"{secs // 3600}h{(secs % 3600) // 60}m"
 
 
+# ---------------------------------------------------------------------------
+# Request lifecycle adapter (internal view). Per-table status columns keep their
+# own raw values on the wire (no rename, no migration); this maps any raw status
+# onto ONE canonical vocabulary and centralizes the terminal-state test so new
+# code (claude reply ingestion, doctor, future status/result/cancel) does not
+# re-encode table-specific quirks. Existing inline SQL guards are left as-is;
+# migrating them onto this constant is a separate mechanical follow-up.
+# ---------------------------------------------------------------------------
+TERMINAL_REQUEST_STATES = ("completed", "error", "cancelled", "canceled", "expired", "failed")
+
+_CANONICAL_STATE_MAP = {
+    "queued": "queued",
+    "notified": "delivered",
+    "in_progress": "claimed",
+    "claimed": "claimed",
+    "awaiting_model_selection": "blocked",
+    "needs_model_selection": "blocked",
+    "completed": "completed",
+    "recorded": "completed",
+    "ok": "completed",
+    "resolved": "completed",
+    "matched": "completed",
+    "error": "failed",
+    "failed": "failed",
+    "unavailable": "failed",
+    "cancelled": "cancelled",
+    "canceled": "cancelled",
+    "expired": "expired",
+}
+
+
+def is_terminal_state(status: Any) -> bool:
+    return str(status or "").strip().lower() in TERMINAL_REQUEST_STATES
+
+
+def canonical_request_state(raw_status: Any) -> str:
+    key = str(raw_status or "").strip().lower()
+    return _CANONICAL_STATE_MAP.get(key, key or "unknown")
+
+
+def _terminal_sql() -> str:
+    """SQL `IN (...)` body for the terminal states, sourced from the one constant."""
+    return ", ".join(f"'{state}'" for state in TERMINAL_REQUEST_STATES)
+
+
+# All Q&A request tables share id/project/topic/prompt/status/response/created_at/
+# completed_at/responder/responder_model/target_model, so status/result/cancel/reap
+# operate over them uniformly.
+_REQUEST_TABLES = ("codex_requests", "antigravity_requests", "claude_requests")
+_REQUEST_KIND = {"codex_requests": "codex", "antigravity_requests": "antigravity", "claude_requests": "claude"}
+
+
+def _find_request(rid: str) -> tuple[str, dict[str, Any]] | None:
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        for table in _REQUEST_TABLES:
+            try:
+                row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (rid,)).fetchone()
+            except sqlite3.OperationalError:
+                continue
+            if row:
+                return (table, dict(row))
+    return None
+
+
 def render_request_ledger(project: str | None, topic: str | None) -> dict[str, Any]:
     """Render a per-topic, human-readable request->answer->timing ledger from SQLite (the
     broker is the SINGLE writer, so there is no concurrent-edit corruption). SQLite stays the
@@ -3413,7 +3581,7 @@ def render_request_ledger(project: str | None, topic: str | None) -> dict[str, A
     entries: list[tuple[str, dict[str, Any]]] = []
     with db_connect() as conn:
         conn.row_factory = sqlite3.Row
-        for table, kind in (("codex_requests", "codex"), ("antigravity_requests", "antigravity")):
+        for table, kind in (("codex_requests", "codex"), ("antigravity_requests", "antigravity"), ("claude_requests", "claude")):
             try:
                 rows = conn.execute(
                     f"SELECT * FROM {table} WHERE lower(project) = lower(?) "
@@ -3487,7 +3655,7 @@ def respond_to_request(
     found: tuple[str, dict[str, Any]] | None = None
     with db_connect() as conn:
         conn.row_factory = sqlite3.Row
-        for table in ("codex_requests", "antigravity_requests"):
+        for table in ("codex_requests", "antigravity_requests", "claude_requests"):
             row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (rid,)).fetchone()
             if not row:
                 continue
@@ -3530,6 +3698,362 @@ def respond_to_request(
 def get_request_ledger(project: str | None, topic: str | None) -> dict[str, Any]:
     """Render + return the per-topic request ledger (and write topics/<project>/<topic>/ledger.md)."""
     return render_request_ledger(project, topic)
+
+
+def request_status(request_id: str) -> dict[str, Any]:
+    """Read-only lookup of any routed request across all tables, normalized to the
+    canonical lifecycle. Never mutates state."""
+    init_db()
+    rid = str(request_id or "").strip()
+    if not rid:
+        raise ValueError("request_id is required")
+    found = _find_request(rid)
+    if not found:
+        return {"id": rid, "found": False, "error": "unknown request id"}
+    table, row = found
+    raw = row.get("status")
+    return {
+        "id": rid,
+        "found": True,
+        "kind": _REQUEST_KIND.get(table, table),
+        "state": canonical_request_state(raw),
+        "raw_status": raw,
+        "terminal": is_terminal_state(raw),
+        "answered": bool(row.get("response")),
+        "project": row.get("project"),
+        "topic": row.get("topic"),
+        "target_model": row.get("target_model"),
+        "responder": row.get("responder"),
+        "responder_model": row.get("responder_model"),
+        "created_at": row.get("created_at"),
+        "completed_at": row.get("completed_at"),
+        "latency": _latency(row.get("created_at"), row.get("completed_at")),
+    }
+
+
+def request_result(request_id: str) -> dict[str, Any]:
+    """Read-only: return the recorded answer for a request, or its current state if
+    it has not been answered yet."""
+    init_db()
+    rid = str(request_id or "").strip()
+    if not rid:
+        raise ValueError("request_id is required")
+    found = _find_request(rid)
+    if not found:
+        return {"id": rid, "found": False, "error": "unknown request id"}
+    table, row = found
+    response = row.get("response")
+    state = canonical_request_state(row.get("status"))
+    return {
+        "id": rid,
+        "found": True,
+        "kind": _REQUEST_KIND.get(table, table),
+        "state": state,
+        "answered": bool(response),
+        "responder": row.get("responder"),
+        "responder_model": row.get("responder_model"),
+        "completed_at": row.get("completed_at"),
+        "response": response or None,
+        "note": None if response else f"No answer recorded yet; the request is still {state}.",
+    }
+
+
+def cancel_request(request_id: str, reason: str | None = None) -> dict[str, Any]:
+    """Mark a non-terminal request cancelled. Idempotent: a request already in a
+    terminal state is left unchanged and reported as-is."""
+    init_db()
+    rid = str(request_id or "").strip()
+    if not rid:
+        raise ValueError("request_id is required")
+    found = _find_request(rid)
+    if not found:
+        return {"id": rid, "found": False, "error": "unknown request id"}
+    table, row = found
+    kind = _REQUEST_KIND.get(table, table)
+    if is_terminal_state(row.get("status")):
+        return {"id": rid, "found": True, "kind": kind, "cancelled": False,
+                "state": canonical_request_state(row.get("status")),
+                "note": "already terminal; left unchanged"}
+    now = utc_now()
+    note = f"cancelled: {reason}" if reason else "cancelled via broker"
+    with db_connect() as conn:
+        conn.execute(
+            f"""
+            UPDATE {table}
+            SET status = 'cancelled', completed_at = COALESCE(completed_at, ?),
+                error = COALESCE(error, ?)
+            WHERE id = ? AND status NOT IN ({_terminal_sql()})
+            """,
+            (now, note, rid),
+        )
+    try:
+        render_request_ledger(row.get("project"), row.get("topic"))
+    except Exception as exc:  # noqa: BLE001
+        log(f"ledger refresh after cancel failed: {exc}")
+    return {"id": rid, "found": True, "kind": kind, "cancelled": True, "state": "cancelled"}
+
+
+def reap_stale_requests(max_age_hours: float = 24.0) -> dict[str, Any]:
+    """Mark clearly-abandoned non-terminal requests as 'expired' so they stop sitting
+    in pending views forever. NEVER re-queues (avoids double-delivery) and NEVER
+    touches a terminal row. `awaiting_model_selection` is left alone (its own flow)."""
+    init_db()
+    cutoff = (_iso_epoch(utc_now()) or 0) - int(max(0.0, float(max_age_hours)) * 3600)
+    now = utc_now()
+    expired: dict[str, int] = {}
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        for table in _REQUEST_TABLES:
+            try:
+                rows = conn.execute(
+                    f"SELECT id, created_at FROM {table} "
+                    f"WHERE status NOT IN ({_terminal_sql()}) AND status != 'awaiting_model_selection'"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                continue
+            stale = [r["id"] for r in rows if (_iso_epoch(r["created_at"]) or 0) < cutoff]
+            for rid in stale:
+                conn.execute(
+                    f"UPDATE {table} SET status = 'expired', completed_at = COALESCE(completed_at, ?) "
+                    f"WHERE id = ? AND status NOT IN ({_terminal_sql()})",
+                    (now, rid),
+                )
+            if stale:
+                expired[_REQUEST_KIND.get(table, table)] = len(stale)
+    return {"max_age_hours": max_age_hours, "expired": expired, "count": sum(expired.values())}
+
+
+# ---------------------------------------------------------------------------
+# Cross-model debate engine. Both debaters run HEADLESS on the user's existing
+# subscriptions (no API key) and keep real memory across rounds via the CLIs'
+# own session-resume primitives (verified 2026-06-19):
+#   Codex:  `codex exec --json -` (capture thread_id) -> `codex exec resume <id> --json -`
+#   Claude: `claude -p --output-format json` (capture session_id) -> `... --resume <id>`
+# Every turn is a clean bounded subprocess — no daemon, no app-server, no port.
+# ---------------------------------------------------------------------------
+DEBATE_MAX_ROUNDS = 6
+DEBATE_TURN_TIMEOUT = 360  # seconds per model turn
+
+
+def _debate_resolve(side: str, config: dict[str, Any]) -> tuple[str, str | None]:
+    s = str(side or "").strip().lower()
+    if s in ("codex", "gpt", "openai", "chatgpt"):
+        return ("codex", discover_codex(config))
+    if s in ("claude", "opus", "sonnet", "anthropic"):
+        return ("claude", find_executable(config, "claude_path", ["claude", "claude.cmd", "claude.ps1"]))
+    raise ValueError(f"unsupported debate side: {side!r} (use 'codex' or 'claude')")
+
+
+def _debate_default_model(family: str) -> str | None:
+    # Claude defaults to its flagship; Codex defaults to the CLI's latest (so a new
+    # release like a future gpt-5.6 is picked up automatically without a code change).
+    return "opus" if family == "claude" else None
+
+
+def _debate_turn(family: str, path: str, work_dir: str, prompt: str,
+                 model: str | None, effort: str | None,
+                 session: str | None) -> tuple[str, str | None]:
+    """One debater turn. Returns (answer_text, session_id). A non-None session_id
+    carries the debater's memory into the next call via its CLI's resume primitive.
+    `effort` = reasoning level (codex: model_reasoning_effort; claude: --effort)."""
+    if family == "codex":
+        if session:
+            # resume rejects --sandbox/-C; -c/--config and -m DO apply on resume.
+            cmd = [path, "exec", "resume", session, "--json"]
+        else:
+            cmd = [path, "exec", "--json", "--sandbox", "read-only", "--skip-git-repo-check", "-C", work_dir]
+        if effort:
+            cmd += ["-c", f"model_reasoning_effort={effort}"]
+        if model:
+            cmd += ["-m", model]
+        cmd += ["-"]
+        _code, out, err = run_process(cmd, work_dir, prompt, timeout=DEBATE_TURN_TIMEOUT)
+        answer, sid = "", session
+        for line in (out or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if event.get("type") == "thread.started" and event.get("thread_id"):
+                sid = event["thread_id"]
+            item = event.get("item")
+            if event.get("type") == "item.completed" and isinstance(item, dict) and item.get("type") == "agent_message":
+                answer = item.get("text", "") or answer
+        return (answer.strip() or (err or "").strip()[:600] or "(no answer returned)", sid)
+    # claude: model/effort are session settings, so set them only when creating the
+    # session; on --resume the session already carries them.
+    cmd = [path, "-p", "--output-format", "json", "--permission-mode", "plan"]
+    if session:
+        cmd += ["--resume", session]
+    else:
+        if model:
+            cmd += ["--model", model]
+        if effort:
+            cmd += ["--effort", effort]
+    _code, out, err = run_process(cmd, work_dir, prompt, timeout=DEBATE_TURN_TIMEOUT)
+    try:
+        payload = json.loads(out)
+        text = str(payload.get("result") or "").strip()
+        return (text or "(no answer returned)", payload.get("session_id") or session)
+    except Exception:  # noqa: BLE001
+        return ((out or "").strip()[:600] or (err or "").strip()[:600] or "(no answer returned)", session)
+
+
+def run_debate(
+    project: str | None,
+    proposition: str,
+    topic: str | None = None,
+    side_a: str = "codex",
+    side_b: str = "claude",
+    model_a: str | None = None,
+    model_b: str | None = None,
+    rounds: int = 2,
+    synthesis_side: str | None = None,
+    synthesis_model: str | None = None,
+    effort_a: str | None = None,
+    effort_b: str | None = None,
+    synthesis_effort: str | None = None,
+) -> dict[str, Any]:
+    """Run an N-round headless debate between two subscription-backed CLIs, then a
+    synthesis pass that writes a verdict. Each debater keeps its own memory via the
+    CLI's resume primitive; each turn only needs the OPPONENT's latest argument.
+
+    Defaults (overridable per side): debaters use the flagship model at *extra-high*
+    reasoning (`xhigh`) — Codex's latest model + `model_reasoning_effort=xhigh`,
+    Claude `opus` + `--effort xhigh`; the synthesis judge runs at `high` to save
+    tokens. Token discipline (no file/command exploration, concise replies, only the
+    opponent's last message per turn) keeps cost down without lowering reasoning."""
+    init_db()
+    if not proposition or not str(proposition).strip():
+        raise ValueError("a debate proposition is required")
+    rounds = max(1, min(int(rounds or 2), DEBATE_MAX_ROUNDS))
+    config = load_config()
+    fam_a, path_a = _debate_resolve(side_a, config)
+    fam_b, path_b = _debate_resolve(side_b, config)
+    missing = []
+    if not path_a:
+        missing.append(f"{fam_a} CLI (side A)")
+    if not path_b:
+        missing.append(f"{fam_b} CLI (side B)")
+    if missing:
+        return {
+            "ok": False,
+            "error": "debate not runnable: missing " + ", ".join(missing)
+            + ". Run `bridge doctor` to see what is installed on this machine.",
+            "proposition": str(proposition).strip(),
+        }
+    project_info = resolve_project(project)
+    work_dir = project_info.root_path
+    # Effective per-side model + reasoning effort. Defaults: flagship model at
+    # extra-high reasoning for debaters (Codex latest, Claude opus); user overrides win.
+    eff_model_a = model_a or _debate_default_model(fam_a)
+    eff_model_b = model_b or _debate_default_model(fam_b)
+    eff_effort_a = (effort_a or "xhigh").strip().lower()
+    eff_effort_b = (effort_b or "xhigh").strip().lower()
+    debate_budget = TASK_BUDGETS.get("debate", 4500)
+    # Self-contained debate instructions. Deliberately NOT task_contract_text(), whose
+    # broker ground-rules ("respond via respond_to_request", "## Answer for <id>")
+    # are noise here and derail a headless debater into looking for a request to answer.
+    # The token-economy line is the broker's cost discipline applied to a debate
+    # WITHOUT the callback noise: high reasoning, lean output, no file/command exploration.
+    debate_rules = "\n".join(f"- {bullet}" for bullet in TASK_CONTRACTS.get("debate", []))
+    contract = (
+        "You are in a SELF-CONTAINED debate between two AI models, mediated by a local broker. "
+        "Reply with ONLY your argument as plain prose. Do NOT call tools, do NOT read or write files, "
+        "do NOT run shell commands, do NOT look for a request to answer or emit an 'Answer for <id>' header - "
+        "reason only from this prompt and make your case in your reply.\n\n"
+        f"Token economy: keep each reply focused and under ~500 words (hard budget ~{debate_budget} tokens). "
+        "Do not restate points already agreed.\n\n"
+        "Debate style:\n" + debate_rules
+    )
+    prop = str(proposition).strip()
+
+    def _label(fam: str, model: str | None, effort: str | None) -> str:
+        return f"{fam}/{model or 'latest'}" + (f" ({effort})" if effort else "")
+
+    transcript: list[dict[str, Any]] = []
+    sess_a = sess_b = None
+    last_a = last_b = ""
+    for rnd in range(1, rounds + 1):
+        if rnd == 1:
+            pa = (f"{contract}\n\nDEBATE PROPOSITION:\n{prop}\n\n"
+                  f"You are debater A ({_label(fam_a, eff_model_a, eff_effort_a)}). Open the debate with your strongest, "
+                  f"specific technical case. Be concrete. End with your current recommendation + confidence.")
+        else:
+            pa = (f"Your opponent (debater B) just argued:\n\n{last_b}\n\n"
+                  f"Counter their strongest points directly and advance your own case. Stay specific. "
+                  f"End with your updated recommendation + confidence.")
+        last_a, sess_a = _debate_turn(fam_a, path_a, work_dir, pa, eff_model_a, eff_effort_a, sess_a)
+        transcript.append({"round": rnd, "side": "A", "family": fam_a, "model": eff_model_a, "effort": eff_effort_a, "text": last_a})
+        if rnd == 1:
+            pb = (f"{contract}\n\nDEBATE PROPOSITION:\n{prop}\n\n"
+                  f"You are debater B ({_label(fam_b, eff_model_b, eff_effort_b)}). Your opponent (debater A) opened with:\n\n{last_a}\n\n"
+                  f"Rebut their case and argue your strongest counter-position. Be concrete. "
+                  f"End with your current recommendation + confidence.")
+        else:
+            pb = (f"Your opponent (debater A) just argued:\n\n{last_a}\n\n"
+                  f"Counter their strongest points directly and advance your own case. Stay specific. "
+                  f"End with your updated recommendation + confidence.")
+        last_b, sess_b = _debate_turn(fam_b, path_b, work_dir, pb, eff_model_b, eff_effort_b, sess_b)
+        transcript.append({"round": rnd, "side": "B", "family": fam_b, "model": eff_model_b, "effort": eff_effort_b, "text": last_b})
+
+    syn_fam, syn_path = _debate_resolve(synthesis_side or side_b, config)
+    if not syn_path:
+        syn_fam, syn_path = fam_b, path_b
+    eff_syn_model = synthesis_model or _debate_default_model(syn_fam)
+    eff_syn_effort = (synthesis_effort or "high").strip().lower()
+    convo = "\n\n".join(
+        f"[Round {t['round']} - Debater {t['side']} ({t['family']}/{t.get('model') or 'latest'})]\n{t['text']}" for t in transcript
+    )
+    syn_prompt = (
+        "You are a neutral judge in a self-contained debate. Reply with ONLY your verdict as plain prose - "
+        "do NOT call tools, read/write files, or look for a request to answer.\n\n"
+        f"Two AI debaters argued this proposition:\n\n{prop}\n\n"
+        f"Full transcript:\n\n{convo}\n\n"
+        f"Write a concise verdict: (1) the strongest point each side made, (2) your recommendation, "
+        f"(3) a confidence level (low/medium/high), and (4) the single thing that would most change it. Decide; do not just restate."
+    )
+    verdict, _ = _debate_turn(syn_fam, syn_path, work_dir, syn_prompt, eff_syn_model, eff_syn_effort, None)
+
+    now = utc_now()
+    result = {
+        "ok": True,
+        "proposition": prop,
+        "project": project_info.name,
+        "topic": topic,
+        "rounds": rounds,
+        "sides": {"A": _label(fam_a, eff_model_a, eff_effort_a), "B": _label(fam_b, eff_model_b, eff_effort_b)},
+        "transcript": transcript,
+        "verdict": verdict,
+        "verdict_by": _label(syn_fam, eff_syn_model, eff_syn_effort),
+        "created_at": now,
+    }
+    try:
+        debates_dir = BROKER_DIR / "debates"
+        debates_dir.mkdir(parents=True, exist_ok=True)
+        stamp = now.replace(":", "").replace("-", "")
+        md = [
+            f"# Debate - {project_info.name} / {topic or '(none)'}", "",
+            f"*{now} - {rounds} rounds - A={result['sides']['A']} vs B={result['sides']['B']} - verdict by {result['verdict_by']}*",
+            "", "## Proposition", "", prop, "",
+        ]
+        for t in transcript:
+            md.append(f"## Round {t['round']} - Debater {t['side']} ({t['family']}/{t.get('model') or 'latest'}, {t.get('effort')})\n\n{t['text']}\n")
+        md.append(f"## Verdict (by {result['verdict_by']})\n\n{verdict}\n")
+        fpath = debates_dir / f"debate-{safe_slug(topic or prop)[:40]}-{stamp}.md"
+        fpath.write_text("\n".join(md), encoding="utf-8")
+        result["transcript_path"] = str(fpath)
+    except Exception as exc:  # noqa: BLE001
+        log(f"debate transcript write failed: {exc}")
+    try:
+        record_agent_event(project_info.name, topic, "agent-broker", "debate_completed",
+                           f"Debate on: {prop[:80]}", verdict[:1000])
+    except Exception as exc:  # noqa: BLE001
+        log(f"debate event record failed: {exc}")
+    return result
 
 
 def mark_codex_request_notified(request_id: str) -> dict[str, Any]:
@@ -3619,9 +4143,11 @@ def surface_available(family: str, surface: str) -> bool:
 
 
 def resolve_surface(args: dict[str, Any]) -> str:
-    """Decide extension vs visible app vs CLI. Default is extension."""
+    """Decide the delivery surface. Returns 'cli', 'extension' (in-app chat panel),
+    'app' (visible desktop app), or 'auto' (no explicit intent -> the family picks
+    its default: Codex/Claude -> headless CLI, Gemini/Antigravity -> in-app automation)."""
     explicit = str(args.get("surface") or "").strip().lower()
-    if explicit in {"extension", "ext", "panel", "ide"}:
+    if explicit in {"extension", "ext", "panel", "ide", "chat", "in_app", "inapp", "in-app"}:
         return "extension"
     if explicit in {"app", "desktop", "gui", "standalone", "standalone_app"}:
         return "app"
@@ -3631,11 +4157,15 @@ def resolve_surface(args: dict[str, Any]) -> str:
         str(args.get(key) or "")
         for key in ("target_agent", "agent", "target_model", "model", "surface")
     ).lower()
-    if any(token in blob for token in ("_cli", " cli", "headless", "terminal")):
-        return "cli"
+    # Explicit in-app / chat / extension intent in any hint field is respected.
+    if any(token in blob for token in ("in app", "in-app", "extension", "chat panel", "webview")):
+        return "extension"
     if any(token in blob for token in ("desktop app", "standalone app", "visible app", "gui app")):
         return "app"
-    return "extension"
+    if any(token in blob for token in ("_cli", " cli", "headless", "terminal")):
+        return "cli"
+    # Nothing explicit -> let the family default decide.
+    return "auto"
 
 
 def queue_claude_request(
@@ -3675,8 +4205,9 @@ def queue_claude_request(
         f"Created by: {created_by}\n"
         f"Created at: {now}\n\n"
         f"> Open this in the Claude Code extension panel. To reply through the broker, "
-        f"call queue_codex_request / complete_antigravity_request, or write a response file "
-        f"under .agent-broker/claude-responses/.\n\n"
+        f"call respond_to_request(request_id=\"{request_id}\", response=<your answer>). "
+        f"If broker tools are unavailable, write the answer to "
+        f".agent-broker/claude-responses/{request_id}.md and the bridge will ingest it.\n\n"
         f"---\n\n"
         f"Requested Claude model: {model_label}\n"
         f"Broker topic: {topic or '(none)'}\n"
@@ -3697,6 +4228,26 @@ def queue_claude_request(
     with db_connect() as conn:
         conn.execute(
             """
+            INSERT INTO claude_requests (
+                id, project, root_path, topic, prompt, status, created_by, created_at,
+                target_model, task_kind, token_budget
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                project_info.name,
+                project_info.root_path,
+                topic,
+                prompt.strip(),
+                created_by,
+                now,
+                model_label,
+                normalize_task_kind(task_kind),
+                int(token_budget or 0) or None,
+            ),
+        )
+        conn.execute(
+            """
             INSERT INTO agent_events (
                 project, root_path, topic, agent, event_type, summary, details, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -3712,6 +4263,10 @@ def queue_claude_request(
                 now,
             ),
         )
+    try:
+        render_request_ledger(project_info.name, topic)
+    except Exception as exc:  # noqa: BLE001
+        log(f"ledger refresh after queue-claude failed: {exc}")
     return {
         "id": request_id,
         "project": project_info.name,
@@ -3725,6 +4280,66 @@ def queue_claude_request(
         "status": "queued",
         "note": "Queued for the bridge to open/submit in Claude Code. The inbox file is the durable fallback; CLI is the headless fallback.",
     }
+
+
+def _archive_processed(path: Path) -> None:
+    try:
+        dest = path.parent / "processed"
+        dest.mkdir(parents=True, exist_ok=True)
+        path.replace(dest / path.name)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def ingest_claude_responses(project: str | None = None) -> dict[str, Any]:
+    """Fallback for the Claude-extension surface (no programmatic completion API):
+    scan `.agent-broker/claude-responses/` for reply files and record them via
+    respond_to_request so they land on the claude_requests row + ledger.
+
+    A file named `<request-id>.md` (or one containing a `## Answer for <request-id>`
+    marker) is matched to a queued claude_requests row. Idempotent: rows that are
+    already answered/terminal are skipped; every scanned file is moved to
+    `processed/` so it is not re-ingested."""
+    init_db()
+    scanned = 0
+    ingested: list[str] = []
+    dirs = [BROKER_DIR / "claude-responses"]
+    if project:
+        try:
+            dirs.append(Path(resolve_project(project).root_path) / ".agent-broker" / "claude-responses")
+        except Exception:  # noqa: BLE001
+            pass
+    for directory in dirs:
+        try:
+            if not directory.exists():
+                continue
+            for path in sorted(directory.glob("*.md")):
+                scanned += 1
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    continue
+                rid = path.stem.strip()
+                marker = re.search(r"##\s*Answer for\s+([0-9a-fA-F-]{8,})", text)
+                if marker:
+                    rid = marker.group(1).strip()
+                with db_connect() as conn:
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute(
+                        "SELECT id, project, topic, status, response FROM claude_requests WHERE id = ?",
+                        (rid,),
+                    ).fetchone()
+                if not row:
+                    continue  # leave unmatched files in place for inspection
+                if row["response"] or is_terminal_state(row["status"]):
+                    _archive_processed(path)
+                    continue
+                respond_to_request(row["project"], row["topic"], rid, text, agent="claude-extension", model=None)
+                ingested.append(rid)
+                _archive_processed(path)
+        except Exception as exc:  # noqa: BLE001
+            log(f"claude-responses ingest failed for {directory}: {exc}")
+    return {"scanned": scanned, "ingested": ingested, "count": len(ingested)}
 
 
 def prompt_budget_notice(
@@ -3851,26 +4466,56 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         family = intent_family
     surface_note: str | None = None
     ide_host = resolve_ide_host(args, target_agent)
+    cfg = load_config()
+    # Default surface is the headless CLI for Codex/Claude (reliable, model-switchable,
+    # and what the user routes to most). Explicit 'extension'/'in app' or 'app' is
+    # always honored. Gemini and Antigravity stay on in-app automation by default
+    # (the Gemini CLI on Pro plans only serves lesser models, and the CLI cannot reach
+    # Antigravity-hosted Claude/Gemini at all).
     if family == "claude":
-        if surface == "cli":
+        if surface == "app":
+            target_agent = "claude_app"
+        elif surface == "extension":
+            if surface_available("claude", "extension"):
+                target_agent = "claude_ext"
+            else:
+                target_agent = "claude_app"
+                surface_note = "Claude extension not detected; fell back to visible Claude app handoff."
+        elif surface == "cli":
             target_agent = "claude_code"
-        elif surface == "app":
-            target_agent = "claude_app"
-        elif surface_available("claude", "extension"):
-            target_agent = "claude_ext"
-        else:
-            target_agent = "claude_app"
-            surface_note = "Claude extension not detected; fell back to visible Claude app handoff."
+        else:  # auto: prefer headless CLI, degrade to in-app if the CLI is absent
+            if find_executable(cfg, "claude_path", ["claude", "claude.cmd", "claude.ps1"]):
+                target_agent = "claude_code"
+            elif surface_available("claude", "extension"):
+                target_agent = "claude_ext"
+                surface_note = "Claude CLI not found; routed to the in-app extension instead."
+            else:
+                target_agent = "claude_app"
+                surface_note = "Claude CLI/extension not found; fell back to visible Claude app handoff."
     elif family == "codex":
-        if surface == "cli":
+        if surface == "app":
+            target_agent = "codex_app"
+        elif surface == "extension":
+            if surface_available("codex", "extension"):
+                target_agent = "codex"
+            else:
+                target_agent = "codex_app"
+                surface_note = "Codex extension not detected; fell back to visible Codex app handoff."
+        elif surface == "cli":
             target_agent = "codex_cli"
-        elif surface == "app":
-            target_agent = "codex_app"
-        elif surface_available("codex", "extension"):
-            target_agent = "codex"
-        else:
-            target_agent = "codex_app"
-            surface_note = "Codex extension not detected; fell back to visible Codex app handoff."
+        else:  # auto: prefer headless CLI, degrade to in-app if the CLI is absent
+            if discover_codex(cfg):
+                target_agent = "codex_cli"
+            elif surface_available("codex", "extension"):
+                target_agent = "codex"
+                surface_note = "Codex CLI not found; routed to the in-app extension instead."
+            else:
+                target_agent = "codex_app"
+                surface_note = "Codex CLI not found; fell back to visible Codex app handoff."
+    elif family == "gemini":
+        # Gemini defaults to the Antigravity in-app automation (Antigravity hosts Gemini
+        # natively); only an explicit 'cli' request uses the standalone Gemini CLI.
+        target_agent = "gemini_cli" if surface == "cli" else "antigravity"
 
     # Antigravity hosts a separate, subscription-backed Claude/Gemini. Never
     # silently use whatever is selected: require an explicit model choice.
@@ -4168,7 +4813,7 @@ TOOLS = [
     },
     {
         "name": "route_agent_task",
-        "description": "Route a task to Antigravity, Codex, Claude, or Gemini. Defaults to the IDE extension surface; 'app' opens a visible desktop app handoff; 'cli' runs the headless backend. Sending to Antigravity requires naming a specific Antigravity model. KEEP `prompt` SHORT: write a brief instruction and let the receiver read the files/work-memory itself; do NOT inline large context — stash it with store_shared_context and pass the context_ref. Oversized prompts trip a token-economy notice (`prompt_notice`).",
+        "description": "Route a task to Antigravity, Codex, Claude, or Gemini. SURFACE DEFAULTS: Codex/Claude default to the headless CLI (reliable, model-switchable, returns the answer inline); pass surface='extension' (or say 'in app'/'in the chat') to use the in-app IDE panel instead, or surface='app' for a visible desktop-app handoff. Gemini defaults to the Antigravity in-app automation (the Gemini CLI on Pro plans only serves lesser models); pass surface='cli' to force the standalone Gemini CLI. Antigravity-hosted models (e.g. Antigravity's Opus/Gemini) ALWAYS use Antigravity automation, never a CLI, and require naming a specific Antigravity model. KEEP `prompt` SHORT: write a brief instruction and let the receiver read the files/work-memory itself; do NOT inline large context — stash it with store_shared_context and pass the context_ref. Oversized prompts trip a token-economy notice (`prompt_notice`).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4517,6 +5162,97 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "request_context_snapshot",
+        "description": "Ask the best available open surface for a COMPACT snapshot of what another agent's current chat knows (objective, plan, files, checks, risks, next step) - not a full transcript. For Codex the broker reads the live session transcript on disk and returns immediately; other targets are queued for a capable bridge host. Then read get_latest_context_snapshot. Opt-in and local; no silent chat scraping.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "topic": {"type": "string"},
+                "requester_agent": {"type": "string"},
+                "requester_host": {"type": "string"},
+                "target_agent": {"type": "string", "description": "Which chat to peek at, e.g. 'codex', 'claude'/'opus', 'antigravity', 'gemini'."},
+                "target_model": {"type": "string"},
+                "question": {"type": "string"},
+                "scope": {"type": "string"},
+                "max_tokens": {"type": "integer", "minimum": 120, "maximum": 4000},
+                "prefer_cached_age": {"type": "integer", "description": "If a completed snapshot newer than this many seconds exists, return it immediately."},
+            },
+            "required": ["project", "target_agent"],
+        },
+    },
+    {
+        "name": "claim_context_snapshot_request",
+        "description": "Bridge-host call: claim the oldest queued snapshot request this host can actually serve. capabilities lists the target families/surfaces reachable from this host (e.g. ['antigravity','claude','codex']). Returns the request plus the strict snapshot prompt and fallback file path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "consumer": {"type": "string"},
+                "host": {"type": "string"},
+                "capabilities": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "name": "complete_context_snapshot_request",
+        "description": "Return a completed context snapshot to the broker. Stores it in context_snapshots, marks the request done (idempotent), and mirrors a short summary into work memory. Fallback when tools are unavailable: write the response to .agent-broker/context-snapshots/<request-id>.md and let the bridge complete it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "request_id": {"type": "string"},
+                "source_surface": {"type": "string"},
+                "model": {"type": "string"},
+                "response": {"type": "string"},
+                "status": {"type": "string", "enum": ["ok", "error", "cancelled", "unavailable"]},
+                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            },
+            "required": ["request_id", "response"],
+        },
+    },
+    {
+        "name": "get_latest_context_snapshot",
+        "description": "Return the most recent completed context snapshot for a project/topic (optionally filtered by target agent/model), with its age in seconds. Use after request_context_snapshot to read what the other open chat reported.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "topic": {"type": "string"},
+                "target_agent": {"type": "string"},
+                "target_model": {"type": "string"},
+                "max_age_seconds": {"type": "integer"},
+            },
+            "required": ["project"],
+        },
+    },
+    {
+        "name": "list_live_surfaces",
+        "description": "List recent surface heartbeats (which IDE hosts are live and what they can serve: Claude/Codex/Antigravity panels, CDP port). Used to pick the best target for a snapshot.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "max_age_seconds": {"type": "integer"},
+            },
+        },
+    },
+    {
+        "name": "record_surface_heartbeat",
+        "description": "Bridge-host call: report this host's capabilities so the broker can route snapshot requests quickly. Send every 10-30s while active.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string"},
+                "project": {"type": "string"},
+                "capabilities": {"type": "array", "items": {"type": "string"}},
+                "visible_app": {"type": "string"},
+                "open_tabs": {"type": "array", "items": {"type": "string"}},
+                "cdp_port": {"type": "integer"},
+                "last_snapshot_source": {"type": "string"},
+            },
+            "required": ["host"],
+        },
+    },
 ]
 
 
@@ -4581,6 +5317,8 @@ def get_topic_status(project: str | None, topic: str | None) -> dict[str, Any]:
         counts["codex_requests"] = scalar("select count(*) from codex_requests where project=? and topic=?") or 0
         counts["antigravity_requests"] = scalar("select count(*) from antigravity_requests where project=? and topic=?") or 0
         counts["context_blobs"] = scalar("select count(*) from shared_context_blobs where project=? and topic=?") or 0
+        counts["context_snapshots"] = scalar("select count(*) from context_snapshots where project=? and topic=?") or 0
+        counts["snapshot_requests"] = scalar("select count(*) from context_snapshot_requests where project=? and topic=?") or 0
         times = [
             scalar("select max(created_at) from agent_events where project=? and topic=?"),
             scalar("select max(created_at) from codex_requests where project=? and topic=?"),
@@ -4608,10 +5346,32 @@ def get_topic_status(project: str | None, topic: str | None) -> dict[str, Any]:
                 (pname, topic),
             ).fetchall()
         }
+        snap_status = {
+            r["status"]: r["c"]
+            for r in conn.execute(
+                "select status, count(*) c from context_snapshot_requests where project=? and topic=? group by status",
+                (pname, topic),
+            ).fetchall()
+        }
+        latest_snap = conn.execute(
+            "select source_surface, model, created_at from context_snapshots where project=? and topic=? order by created_at desc limit 1",
+            (pname, topic),
+        ).fetchone()
     counts["claude_sessions"] = count_claude_sessions(workspace)
     counts["routes"] = counts["codex_requests"] + counts["antigravity_requests"] + counts["claude_sessions"]
-    pending = any(s in open_states for s in list(ag_status) + list(cx_status))
+    pending = any(s in open_states for s in list(ag_status) + list(cx_status) + list(snap_status))
     status = "in_progress" if pending else ("active" if counts["routes"] else "empty")
+    snapshot_ttl = _env_int("AGENT_BROKER_SNAPSHOT_TTL_SECONDS", 600)
+    latest_snapshot = None
+    if latest_snap:
+        snap_age = _snapshot_age_seconds(latest_snap["created_at"])
+        latest_snapshot = {
+            "source_surface": latest_snap["source_surface"],
+            "model": latest_snap["model"],
+            "created_at": latest_snap["created_at"],
+            "age_seconds": snap_age,
+            "stale": snap_age is not None and snap_age > snapshot_ttl,
+        }
     result = {
         "project": pname,
         "topic": topic or "all",
@@ -4621,7 +5381,8 @@ def get_topic_status(project: str | None, topic: str | None) -> dict[str, Any]:
         "last_model": last_model,
         "last_activity": last_activity,
         "status": status,
-        "request_status": {"antigravity": ag_status, "codex": cx_status},
+        "request_status": {"antigravity": ag_status, "codex": cx_status, "snapshots": snap_status},
+        "snapshots": {"requests_by_status": snap_status, "latest": latest_snapshot, "ttl_seconds": snapshot_ttl},
         "generated_at": utc_now(),
     }
     try:
@@ -4708,6 +5469,462 @@ def compacted_topic_handoff_section(project_info: ProjectInfo, topic: str | None
         if not pack:
             return ""
         return f"## Shared Context Pack\n\n{pack}\n\n"
+
+
+# --- active context snapshots (peek at what another open chat currently knows) ------
+def _codex_rollout_path_for(root_path: str | None) -> Path | None:
+    """Newest ~/.codex rollout transcript whose session cwd matches this project."""
+    base = Path.home() / ".codex" / "sessions"
+    if not base.exists():
+        return None
+    try:
+        candidates = sorted(base.rglob("rollout-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    want = os.path.normcase(os.path.abspath(str(root_path))) if root_path and str(root_path).strip() else ""
+    if not want:
+        # No project root => no safe match. Returning the newest rollout of ANY project
+        # would leak another project's transcript, so refuse.
+        return None
+    for path in candidates:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                first = handle.readline()
+            meta = json.loads(first)
+            cwd = (meta.get("payload") or {}).get("cwd") or ""
+            if not str(cwd).strip():
+                continue
+            if os.path.normcase(os.path.abspath(cwd)) == want:
+                return path
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _codex_rollout_turns(path: Path, last_n: int = 8) -> list[tuple[str, str]]:
+    """Clean conversational turns from a Codex rollout: the user_message / agent_message
+    events only (skips the system/AGENTS boilerplate carried in raw response items)."""
+    turns: list[tuple[str, str]] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if obj.get("type") != "event_msg":
+                    continue
+                payload = obj.get("payload") or {}
+                kind = payload.get("type")
+                if kind == "user_message":
+                    msg = str(payload.get("message") or "").strip()
+                    if msg:
+                        turns.append(("user", msg))
+                elif kind == "agent_message":
+                    msg = str(payload.get("message") or "").strip()
+                    if msg:
+                        turns.append(("assistant", msg))
+    except Exception:  # noqa: BLE001
+        return []
+    return turns[-max(1, int(last_n)):]
+
+
+def codex_rollout_snapshot(
+    project_info: "ProjectInfo", topic: str | None = None, last_n: int = 8, max_chars: int = 4000
+) -> dict[str, Any] | None:
+    """Broker-side snapshot source for Codex: read the recent turns of the live Codex
+    session transcript on disk, redacted + truncated. No agent cooperation or CDP needed.
+    This is raw recent turns, not an LLM summary, and is only used on explicit request."""
+    path = _codex_rollout_path_for(project_info.root_path)
+    if not path:
+        return None
+    turns = _codex_rollout_turns(path, last_n)
+    if not turns:
+        return None
+    # Per-turn budget must fit within max_chars after a ~200-char header, so a small
+    # max_tokens doesn't blow past the cap and drop the later turns at the final cut.
+    per = max(80, (int(max_chars) - 200) // max(1, len(turns)))
+    lines = [
+        f"Source: Codex session transcript on disk ({path.name})",
+        f"Captured: {utc_now()} | last {len(turns)} turn(s)",
+        "Note: raw recent turns from the ~/.codex rollout, redacted + truncated; not an LLM summary.",
+        "",
+    ]
+    for role, text in turns:
+        lines.append(f"[{role}] {compact_text(text, per)}")
+    content = "\n".join(lines)
+    if len(content) > int(max_chars):
+        content = content[: int(max_chars)].rstrip() + " ... [truncated]"
+    return {"content": content, "model": "gpt (codex)", "source": "codex_rollout_file", "path": str(path)}
+
+
+def _snapshot_fallback_path(request_id: str, root_path: str | None) -> Path:
+    base = Path(root_path) if root_path else BROKER_DIR
+    return base / ".agent-broker" / "context-snapshots" / f"{request_id}.md"
+
+
+def snapshot_prompt_contract(req: dict[str, Any]) -> str:
+    """Strict snapshot prompt: ask for a compact continuation state, not a transcript."""
+    fallback = _snapshot_fallback_path(req["id"], req.get("root_path"))
+    return (
+        "Agent Broker Context Snapshot Request\n\n"
+        f"Request ID: {req['id']}\n"
+        f"Project: {req.get('project')}\n"
+        f"Topic: {req.get('topic') or '(none)'}\n"
+        f"Requester: {req.get('requester_agent') or 'agent'} / {req.get('requester_host') or 'host'}\n"
+        f"Target requested: {req.get('target_agent') or 'this chat'} {req.get('target_model') or ''}\n"
+        f"Question: {req.get('question') or 'What does this chat currently know / where is it?'}\n"
+        "Scope: current open chat if visible; otherwise say unavailable.\n\n"
+        "Return a COMPACT snapshot only. Do not dump the full transcript. Include:\n"
+        "- active/visible model if known\n- current user objective\n- current plan or decision state\n"
+        "- files changed or inspected\n- checks run\n- risks/blockers\n- next useful step\n"
+        "- confidence: high/medium/low\n\n"
+        f"Complete via complete_context_snapshot_request(request_id=\"{req['id']}\") if broker tools are available.\n"
+        f"Fallback: write the same response to {fallback}\n"
+    )
+
+
+def _store_context_snapshot(
+    conn: sqlite3.Connection,
+    req_row: sqlite3.Row,
+    snap_id: str,
+    source_surface: str,
+    model: str | None,
+    response: str,
+    status: str,
+    confidence: str | None,
+    now: str,
+) -> str:
+    conn.execute(
+        """
+        INSERT INTO context_snapshots (
+            id, request_id, project, root_path, topic, target_agent,
+            source_surface, model, content, confidence, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            snap_id,
+            req_row["id"],
+            req_row["project"],
+            req_row["root_path"],
+            req_row["topic"],
+            req_row["target_agent"],
+            source_surface,
+            model,
+            redact_text(response or ""),
+            confidence,
+            status,
+            now,
+        ),
+    )
+    return snap_id
+
+
+def _snapshot_age_seconds(created_at: Any) -> int | None:
+    now_epoch = _iso_epoch(utc_now())
+    made = _iso_epoch(created_at)
+    if now_epoch is None or made is None:
+        return None
+    return max(0, now_epoch - made)
+
+
+def get_latest_context_snapshot(
+    project: str | None,
+    topic: str | None = None,
+    target_agent: str | None = None,
+    target_model: str | None = None,
+    max_age_seconds: Any = None,
+) -> dict[str, Any]:
+    init_db()
+    project_info = resolve_project(project)
+    clauses = ["(lower(project) = lower(?) OR root_path = ?)", "status = 'completed'"]
+    params: list[Any] = [project_info.name, project_info.root_path]
+    if topic:
+        clauses.append("topic = ?")
+        params.append(topic)
+    if target_agent:
+        fam = model_family_for(target_agent, target_model)
+        clauses.append("(lower(target_agent) = lower(?) OR lower(target_agent) = lower(?))")
+        params.extend([str(target_agent), fam])
+    where = " AND ".join(clauses)
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            f"SELECT * FROM context_snapshots WHERE {where} ORDER BY created_at DESC LIMIT 1",
+            params,
+        ).fetchone()
+    if not row:
+        return {"status": "none", "project": project_info.name, "topic": topic}
+    snap = dict(row)
+    age = _snapshot_age_seconds(snap["created_at"])
+    snap["age_seconds"] = age
+    if max_age_seconds:
+        snap["fresh"] = age is not None and age <= int(max_age_seconds)
+    return {"status": "found", "snapshot": snap}
+
+
+def complete_context_snapshot_request(
+    request_id: str,
+    source_surface: str = "unknown",
+    model: str | None = None,
+    response: str = "",
+    status: str = "ok",
+    confidence: str | None = None,
+) -> dict[str, Any]:
+    init_db()
+    if not request_id or not str(request_id).strip():
+        raise ValueError("request_id is required")
+    rid = str(request_id).strip()
+    final = "completed" if status not in {"error", "cancelled", "unavailable"} else status
+    now = utc_now()
+    snap_id = str(uuid.uuid4())
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        # BEGIN IMMEDIATE + UPDATE-first: only the winner inserts the snapshot row, so a
+        # concurrent loser can't commit an orphan/duplicate snapshot.
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM context_snapshot_requests WHERE id = ?", (rid,)).fetchone()
+        if not row:
+            conn.commit()
+            raise ValueError(f"unknown snapshot request: {request_id}")
+        if row["status"] in {"completed", "error", "cancelled", "unavailable"}:
+            conn.commit()
+            return {"id": rid, "status": row["status"], "already_completed": True,
+                    "note": "Request was already terminal; no side effects re-run."}
+        cur = conn.execute(
+            """
+            UPDATE context_snapshot_requests
+            SET status = ?, completed_at = ?, snapshot_id = ?
+            WHERE id = ? AND status NOT IN ('completed', 'error', 'cancelled', 'unavailable')
+            """,
+            (final, now, snap_id, rid),
+        )
+        if cur.rowcount == 0:
+            raced = conn.execute("SELECT status FROM context_snapshot_requests WHERE id = ?", (rid,)).fetchone()
+            conn.commit()
+            return {"id": rid, "status": raced["status"] if raced else final, "already_completed": True,
+                    "note": "Request was already completed concurrently; no side effects re-run."}
+        _store_context_snapshot(conn, row, snap_id, source_surface, model, response, final, confidence, now)
+        conn.commit()
+    # Mirror the snapshot into work memory so the next agent sees it without re-asking.
+    if final == "completed" and response and str(response).strip():
+        try:
+            record_work_memory(
+                row["project"], row["topic"], f"snapshot:{source_surface}",
+                f"Context snapshot of {row['target_agent'] or 'target'} ({source_surface}): {compact_text(response, 240)}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log(f"snapshot work-memory mirror failed: {exc}")
+    return {"id": rid, "status": final, "snapshot_id": snap_id,
+            "source_surface": source_surface, "model": model}
+
+
+def snapshot_release_request(request_id: str) -> dict[str, Any]:
+    """Put a claimed-but-undeliverable snapshot request back to 'queued' so another
+    capable host can serve it. No-op unless the row is currently in_progress."""
+    init_db()
+    rid = str(request_id or "").strip()
+    if not rid:
+        raise ValueError("request_id is required")
+    with db_connect() as conn:
+        cur = conn.execute(
+            "UPDATE context_snapshot_requests SET status = 'queued', claimed_by = NULL, claimed_at = NULL "
+            "WHERE id = ? AND status = 'in_progress'",
+            (rid,),
+        )
+        conn.commit()
+    return {"id": rid, "status": "queued" if cur.rowcount else "unchanged", "released": bool(cur.rowcount)}
+
+
+def request_context_snapshot(
+    project: str | None,
+    topic: str | None = None,
+    requester_agent: str | None = None,
+    requester_host: str | None = None,
+    target_agent: str | None = None,
+    target_model: str | None = None,
+    question: str | None = None,
+    scope: str | None = None,
+    max_tokens: int | None = None,
+    prefer_cached_age: Any = None,
+) -> dict[str, Any]:
+    """Ask the best available open surface for a compact snapshot of what it currently knows.
+    Fast path: for Codex, the broker reads the live session transcript on disk and completes
+    immediately. Otherwise the request is queued for a capable bridge host to serve."""
+    init_db()
+    project_info = resolve_project(project)
+    rid = str(uuid.uuid4())
+    now = utc_now()
+    created_by = os.environ.get("AGENT_BROKER_CALLER") or "mcp-client"
+    fam = model_family_for(target_agent, target_model)
+    mtok = max(120, int(max_tokens or 600))
+    if prefer_cached_age:
+        cached = get_latest_context_snapshot(project_info.name, topic, target_agent, target_model, prefer_cached_age)
+        if cached.get("status") == "found" and cached["snapshot"].get("fresh"):
+            return {"status": "cached", "request_id": None, "snapshot": cached["snapshot"]}
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO context_snapshot_requests (
+                id, project, root_path, topic, requester_agent, requester_host,
+                target_agent, target_model, question, scope, max_tokens, status, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+            """,
+            (rid, project_info.name, project_info.root_path, topic, requester_agent, requester_host,
+             target_agent, target_model, question, scope, mtok, created_by, now),
+        )
+    record_agent_event(
+        project_info.name, topic, requester_agent or created_by, "requested_context_snapshot",
+        f"Requested context snapshot of {target_agent or fam}", question,
+    )
+    # Broker-side source: the Codex transcript on disk needs no agent/CDP cooperation.
+    if fam == "codex":
+        snap = codex_rollout_snapshot(project_info, topic, last_n=8, max_chars=mtok * 4)
+        if snap:
+            done = complete_context_snapshot_request(rid, "codex_rollout_file", snap.get("model"), snap["content"], "ok", "medium")
+            return {"status": "completed", "request_id": rid, "source_surface": "codex_rollout_file",
+                    "snapshot_id": done.get("snapshot_id"), "snapshot": snap}
+    return {"status": "pending", "request_id": rid, "project": project_info.name, "topic": topic,
+            "target_agent": target_agent, "family": fam,
+            "note": "Queued for a capable bridge host to claim and complete; poll get_latest_context_snapshot."}
+
+
+def claim_context_snapshot_request(
+    consumer: str = "snapshot-bridge", host: str | None = None, capabilities: Any = None
+) -> dict[str, Any]:
+    """A bridge host claims the oldest queued snapshot request it can actually serve.
+    capabilities is the set of target families/surfaces this host can reach."""
+    init_db()
+    caps: set[str] = set()
+    if isinstance(capabilities, str):
+        caps = {c.strip().lower() for c in capabilities.split(",") if c.strip()}
+    elif isinstance(capabilities, (list, tuple)):
+        caps = {str(c).strip().lower() for c in capabilities if str(c).strip()}
+    now = utc_now()
+    ttl = _env_int("AGENT_BROKER_SNAPSHOT_CLAIM_TTL_SECONDS", 120)
+    stale_cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - ttl))
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        # Stale-claim reaper: re-queue requests a host claimed but never completed (delivery
+        # failed / host died) so they don't strand 'in_progress' forever.
+        conn.execute(
+            "UPDATE context_snapshot_requests SET status = 'queued', claimed_by = NULL, claimed_at = NULL "
+            "WHERE status = 'in_progress' AND (claimed_at IS NULL OR claimed_at < ?)",
+            (stale_cutoff,),
+        )
+        rows = conn.execute(
+            "SELECT * FROM context_snapshot_requests WHERE status = 'queued' ORDER BY created_at ASC LIMIT 20"
+        ).fetchall()
+        chosen = None
+        for r in rows:
+            # Match on the RESOLVED family only, so claim and bridge delivery (which
+            # dispatches by family) use the same key and can't strand a mismatched row.
+            fam = model_family_for(r["target_agent"], r["target_model"])
+            if not caps or fam in caps:
+                chosen = r
+                break
+        if not chosen:
+            conn.commit()
+            return {"status": "empty"}
+        conn.execute(
+            "UPDATE context_snapshot_requests SET status = 'in_progress', claimed_by = ?, claimed_at = ? WHERE id = ?",
+            (consumer, now, chosen["id"]),
+        )
+        updated = conn.execute("SELECT * FROM context_snapshot_requests WHERE id = ?", (chosen["id"],)).fetchone()
+        conn.commit()
+    req = dict(updated)
+    req["snapshot_prompt"] = snapshot_prompt_contract(req)
+    req["fallback_file"] = str(_snapshot_fallback_path(req["id"], req.get("root_path")))
+    req["family"] = model_family_for(req.get("target_agent"), req.get("target_model"))
+    return {"status": "claimed", "request": req}
+
+
+def record_surface_heartbeat(
+    host: str,
+    project: str | None = None,
+    capabilities: Any = None,
+    visible_app: str | None = None,
+    open_tabs: Any = None,
+    cdp_port: Any = None,
+    last_snapshot_source: str | None = None,
+) -> dict[str, Any]:
+    init_db()
+    if not host or not str(host).strip():
+        raise ValueError("host is required")
+    project_info = resolve_project(project) if project else None
+    caps = capabilities if isinstance(capabilities, str) else json.dumps(coerce_string_list(capabilities), ensure_ascii=False)
+    tabs = open_tabs if isinstance(open_tabs, str) else json.dumps(coerce_string_list(open_tabs), ensure_ascii=False)
+    now = utc_now()
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO surface_heartbeats (
+                host, project, root_path, visible_app, capabilities, open_tabs,
+                cdp_port, last_snapshot_source, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(host) DO UPDATE SET
+                project = excluded.project, root_path = excluded.root_path,
+                visible_app = excluded.visible_app, capabilities = excluded.capabilities,
+                open_tabs = excluded.open_tabs, cdp_port = excluded.cdp_port,
+                last_snapshot_source = excluded.last_snapshot_source, updated_at = excluded.updated_at
+            """,
+            (
+                str(host),
+                project_info.name if project_info else None,
+                project_info.root_path if project_info else None,
+                visible_app, caps, tabs,
+                int(cdp_port) if str(cdp_port or "").strip().isdigit() else None,
+                last_snapshot_source, now,
+            ),
+        )
+    return {"status": "recorded", "host": str(host), "updated_at": now}
+
+
+def list_live_surfaces(project: str | None = None, max_age_seconds: int = 180) -> dict[str, Any]:
+    init_db()
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM surface_heartbeats ORDER BY updated_at DESC").fetchall()
+    surfaces: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        age = _snapshot_age_seconds(d.get("updated_at"))
+        d["age_seconds"] = age
+        d["live"] = age is not None and age <= int(max_age_seconds)
+        surfaces.append(d)
+    return {"surfaces": surfaces, "live_window_seconds": int(max_age_seconds)}
+
+
+def latest_context_snapshots_section(project_info: "ProjectInfo", topic: str | None, limit: int = 3) -> list[str]:
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        topic_filter = "AND topic = ?" if topic else ""
+        params: list[Any] = [project_info.name, project_info.root_path]
+        if topic:
+            params.append(topic)
+        params.append(limit)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM context_snapshots
+            WHERE (lower(project) = lower(?) OR root_path = ?) {topic_filter} AND status = 'completed'
+            ORDER BY created_at DESC LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    out = ["## Latest Context Snapshots"]
+    if not rows:
+        out.append("- No context snapshots captured yet. Use request_context_snapshot to peek at another open chat.")
+        return out
+    for r in rows:
+        out.append(
+            f"- {r['created_at']} | source={r['source_surface']} | model={r['model'] or 'unknown'} | "
+            f"confidence={r['confidence'] or 'n/a'}: {compact_text(r['content'], 240)}"
+        )
+    return out
 
 
 def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -4859,6 +6076,30 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             str(args.get("response") or ""), args.get("agent"), args.get("model")))
     if name == "get_request_ledger":
         return text_content(get_request_ledger(args.get("project"), args.get("topic")))
+    if name == "request_context_snapshot":
+        return text_content(request_context_snapshot(
+            args.get("project"), args.get("topic"), args.get("requester_agent"), args.get("requester_host"),
+            args.get("target_agent"), args.get("target_model"), args.get("question"), args.get("scope"),
+            int(args.get("max_tokens") or 0) or None, args.get("prefer_cached_age")))
+    if name == "claim_context_snapshot_request":
+        return text_content(claim_context_snapshot_request(
+            str(args.get("consumer") or "snapshot-bridge"), args.get("host"), args.get("capabilities")))
+    if name == "complete_context_snapshot_request":
+        return text_content(complete_context_snapshot_request(
+            str(args.get("request_id") or ""), str(args.get("source_surface") or "unknown"),
+            args.get("model"), str(args.get("response") or ""), str(args.get("status") or "ok"),
+            args.get("confidence")))
+    if name == "get_latest_context_snapshot":
+        return text_content(get_latest_context_snapshot(
+            args.get("project"), args.get("topic"), args.get("target_agent"),
+            args.get("target_model"), args.get("max_age_seconds")))
+    if name == "list_live_surfaces":
+        return text_content(list_live_surfaces(args.get("project"), int(args.get("max_age_seconds") or 180)))
+    if name == "record_surface_heartbeat":
+        return text_content(record_surface_heartbeat(
+            str(args.get("host") or ""), args.get("project"), args.get("capabilities"),
+            args.get("visible_app"), args.get("open_tabs"), args.get("cdp_port"),
+            args.get("last_snapshot_source")))
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -4907,6 +6148,276 @@ def handle_message(message: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# doctor: read-only capability detector. Reports EXACTLY what works on this
+# machine per surface (CLI binary + smoke test, extension, CDP, delivery route,
+# reply path) and whether a headless cross-model debate can run. Never mutates
+# broker state. Exposed as `bridge doctor [--json]` and top-level `doctor`.
+# ---------------------------------------------------------------------------
+
+def _smoke_test_cli(path: str | None) -> tuple[bool, str | None]:
+    """Run `<path> --version` with a short timeout. Returns (ok, version_line)."""
+    if not path:
+        return (False, None)
+    try:
+        code, out, err = run_process([path, "--version"], str(Path.home()), None, timeout=15)
+        text = (out or err or "").strip()
+        first = text.splitlines()[0].strip() if text else ""
+        return (code == 0, (first[:80] or None))
+    except Exception as exc:  # noqa: BLE001
+        return (False, f"error: {type(exc).__name__}")
+
+
+def _probe_extension_binary(family: str) -> str | None:
+    """Best-effort search for a CLI binary bundled inside an installed extension.
+
+    Detection-only: a found path is still smoke-tested before anything relies on
+    it (never a blind promise). Bounded so a large extension tree can't stall.
+    """
+    hints = CODEX_EXTENSION_HINTS if family == "codex" else CLAUDE_EXTENSION_HINTS
+    bin_names = {"codex", "codex.exe"} if family == "codex" else {"claude", "claude.exe"}
+    for directory in _extension_scan_dirs():
+        try:
+            if not directory.exists():
+                continue
+            for child in directory.iterdir():
+                if not child.is_dir() or not any(h in child.name.lower() for h in hints):
+                    continue
+                count = 0
+                for path in child.rglob("*"):
+                    count += 1
+                    if count > 5000:
+                        break
+                    try:
+                        if path.name.lower() in bin_names and path.is_file():
+                            return str(path)
+                    except OSError:
+                        continue
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _bridge_package_version() -> str | None:
+    # Source layout: the bridge package.json sits next to this file.
+    candidate = (
+        Path(__file__).resolve().parent
+        / "extensions" / "antigravity-agent-broker-bridge" / "package.json"
+    )
+    try:
+        if candidate.exists():
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            if data.get("version"):
+                return str(data["version"])
+    except Exception:  # noqa: BLE001
+        pass
+    # Bundled exe: the bridge ships as an embedded .vsix (a zip); read its manifest.
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        try:
+            import zipfile
+            vsixes = list((Path(base) / "extensions" / "antigravity-agent-broker-bridge").glob("*.vsix"))
+            if vsixes:
+                with zipfile.ZipFile(vsixes[0]) as zf:
+                    name = next((n for n in zf.namelist() if n.endswith("extension/package.json")), None)
+                    if name:
+                        data = json.loads(zf.read(name).decode("utf-8"))
+                        if data.get("version"):
+                            return str(data["version"])
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
+def _cli_probe(config: dict[str, Any], family: str) -> dict[str, Any]:
+    if family == "codex":
+        path = discover_codex(config)
+    elif family == "claude":
+        path = find_executable(config, "claude_path", ["claude", "claude.cmd", "claude.ps1"])
+    elif family == "gemini":
+        path = find_executable(config, "gemini_path", ["gemini", "gemini.cmd"])
+    else:
+        path = None
+    from_bundle = False
+    if not path and family in ("codex", "claude"):
+        bundled = _probe_extension_binary(family)
+        if bundled:
+            path, from_bundle = bundled, True
+    ok, version = _smoke_test_cli(path)
+    return {
+        "found": bool(path),
+        "path": path,
+        "source": ("extension_bundle" if from_bundle else ("path/config" if path else None)),
+        "smoke_ok": ok,
+        "version": version,
+    }
+
+
+def broker_doctor() -> dict[str, Any]:
+    """Assemble a read-only, per-surface capability report for this machine."""
+    config = load_config()
+    detected = detect_agent_surfaces()
+    node_path = find_executable(config, "node_path", ["node", "node.exe"])
+    node_ok, node_ver = _smoke_test_cli(node_path)
+    antigravity_cdp = int(config.get("antigravity_cdp_port") or 9000)
+    vscode_cdp = int(config.get("vscode_cdp_port") or 9010)
+
+    surfaces: dict[str, Any] = {}
+    recommendations: list[str] = []
+
+    # --- Codex ---
+    codex_cli = _cli_probe(config, "codex")
+    codex_ext = detected.get("codex", {}).get("extension")
+    codex_full = bool(codex_cli["found"] and codex_cli["smoke_ok"])
+    codex_routes: list[str] = []
+    if codex_full:
+        codex_routes.append("codex_cli (full headless round-trip)")
+    if codex_ext is not False:
+        codex_routes.append("codex_inbox (extension; reply via respond_to_request)")
+    codex_routes.append("codex_app (clipboard handoff; no return path)")
+    surfaces["codex"] = {
+        "cli": codex_cli,
+        "extension": codex_ext,
+        "cdp_port": vscode_cdp,
+        "routes": codex_routes,
+        "reply_path": ("stdout" if codex_full else ("respond_to_request" if codex_ext is not False else "none")),
+        "best_quality": ("full" if codex_full else ("partial" if codex_ext is not False else "handoff")),
+    }
+    if codex_cli["found"] and not codex_cli["smoke_ok"]:
+        recommendations.append("Codex binary found but `--version` failed; verify the install.")
+    if not codex_cli["found"]:
+        recommendations.append(
+            "Codex CLI not found on PATH - install it for a full headless round-trip "
+            "(the extension still delivers, but auto-submit is best-effort)."
+        )
+
+    # --- Claude ---
+    claude_cli = _cli_probe(config, "claude")
+    claude_ext = detected.get("claude", {}).get("extension")
+    claude_full = bool(claude_cli["found"] and claude_cli["smoke_ok"])
+    claude_routes: list[str] = []
+    if claude_full:
+        claude_routes.append("claude_code (full headless round-trip)")
+    if claude_ext is not False:
+        claude_routes.append("claude_inbox (extension; reply via respond_to_request or claude-responses)")
+    claude_routes.append("claude_app (clipboard handoff; no return path)")
+    surfaces["claude"] = {
+        "cli": claude_cli,
+        "extension": claude_ext,
+        "cdp_port": vscode_cdp,
+        "routes": claude_routes,
+        "reply_path": ("stdout" if claude_full else ("respond_to_request / claude-responses" if claude_ext is not False else "none")),
+        "best_quality": ("full" if claude_full else ("partial" if claude_ext is not False else "handoff")),
+    }
+    if not claude_cli["found"]:
+        recommendations.append(
+            "Claude Code CLI not found on PATH - install it for a full headless round-trip and for headless debates."
+        )
+
+    # --- Gemini (CLI only) ---
+    gemini_cli = _cli_probe(config, "gemini")
+    gemini_full = bool(gemini_cli["found"] and gemini_cli["smoke_ok"])
+    surfaces["gemini"] = {
+        "cli": gemini_cli,
+        "best_quality": ("full" if gemini_full else "none"),
+        "reply_path": ("stdout" if gemini_full else "none"),
+    }
+
+    # --- Antigravity (only true in-app structured round-trip) ---
+    surfaces["antigravity"] = {
+        "extension": "driven via antigravity.sendPromptToAgentPanel (only true in-app structured round-trip)",
+        "cdp_port": antigravity_cdp,
+        "needs_node_cdp": True,
+        "reply_path": "complete_antigravity_request",
+        "best_quality": "full (structured) when Antigravity is running",
+    }
+
+    # --- Debate readiness: a headless autonomous debate needs BOTH sides headless ---
+    codex_side = (
+        "ready (cli)" if codex_full
+        else ("extension-only: not headless (manual rounds)" if codex_ext is not False else "unavailable")
+    )
+    claude_side = "ready (cli)" if claude_full else "unavailable for headless debate (needs claude CLI)"
+    runnable = bool(codex_full and claude_full)
+    debate = {
+        "codex_side": codex_side,
+        "claude_side": claude_side,
+        "headless_autonomous_runnable": runnable,
+        "note": (
+            "Both debaters available headless - an autonomous run_debate can run."
+            if runnable else
+            "Headless multi-round debate needs BOTH the codex and claude CLIs. "
+            "The one-shot task_kind=debate still works via whatever route is available."
+        ),
+    }
+    if not runnable:
+        recommendations.append("For an autonomous headless debate, install BOTH the Codex and Claude Code CLIs.")
+    if not node_path:
+        recommendations.append("Node.js not found - CDP auto-submit and Antigravity model auto-select are disabled without it.")
+
+    bridge_version = _bridge_package_version()
+    version_note = None
+    if bridge_version and bridge_version != BROKER_VERSION:
+        version_note = f"broker {BROKER_VERSION} != bridge {bridge_version} - version drift."
+
+    return {
+        "broker_version": BROKER_VERSION,
+        "bridge_version": bridge_version,
+        "version_note": version_note,
+        "node": {"found": bool(node_path), "path": node_path, "version": node_ver, "ok": node_ok},
+        "surfaces": surfaces,
+        "debate": debate,
+        "recommendations": recommendations or ["All core surfaces look healthy."],
+    }
+
+
+def render_doctor(report: dict[str, Any]) -> str:
+    lines: list[str] = []
+    lines.append("Agent Switchboard - doctor (agent-broker compatibility)")
+    lines.append("=" * 44)
+    lines.append(f"broker version : {report['broker_version']}")
+    lines.append(f"bridge version : {report.get('bridge_version') or 'unknown'}")
+    if report.get("version_note"):
+        lines.append(f"  ! {report['version_note']}")
+    node = report["node"]
+    lines.append(f"node.js        : {'yes' if node['found'] else 'NO'}" + (f" ({node['version']})" if node.get("version") else ""))
+    lines.append("")
+    for fam in ("codex", "claude", "gemini", "antigravity"):
+        s = report["surfaces"].get(fam)
+        if not s:
+            continue
+        lines.append(f"[{fam}]  best: {s.get('best_quality')}")
+        cli = s.get("cli")
+        if cli is not None:
+            if cli["found"]:
+                tag = "smoke-ok" if cli["smoke_ok"] else "smoke-FAIL"
+                src = f", {cli['source']}" if cli.get("source") else ""
+                lines.append(f"  cli        : {cli['version'] or 'found'} [{tag}{src}]")
+            else:
+                lines.append("  cli        : not found")
+        if "extension" in s:
+            ext = s["extension"]
+            ext_label = ("yes" if ext is True else ("unknown (not scanned)" if ext is None else ("no" if ext is False else ext)))
+            lines.append(f"  extension  : {ext_label}")
+        if s.get("cdp_port"):
+            lines.append(f"  cdp_port   : {s['cdp_port']}")
+        for route in s.get("routes", []):
+            lines.append(f"  route      : {route}")
+        lines.append(f"  reply_path : {s.get('reply_path')}")
+        lines.append("")
+    d = report["debate"]
+    lines.append("[debate readiness]")
+    lines.append(f"  codex side : {d['codex_side']}")
+    lines.append(f"  claude side: {d['claude_side']}")
+    lines.append(f"  headless autonomous debate runnable: {'YES' if d['headless_autonomous_runnable'] else 'no'}")
+    lines.append(f"  {d['note']}")
+    lines.append("")
+    lines.append("[recommendations]")
+    for rec in report["recommendations"]:
+        lines.append(f"  - {rec}")
+    return "\n".join(lines)
+
+
 def handle_bridge_cli(argv: list[str]) -> int:
     if not argv or argv[0] in {"help", "-h", "--help"}:
         print(
@@ -4917,6 +6428,9 @@ def handle_bridge_cli(argv: list[str]) -> int:
             "complete <request_id> <model> <response> | complete-file <request_id> <model> <path> | "
             "codex-inbox [project] [limit] | queue-codex <project> <topic> <prompt> | "
             "respond <project> <topic> <request_id> <response> [agent] [model] | ledger [project] [topic] | "
+            "claude-responses [project] | status <request_id> | result <request_id> | "
+            "cancel <request_id> [reason] | reap [max_age_hours] | "
+            "debate <project> <topic> <proposition> [rounds] [sideA[:model[:effort]]] [sideB[:model[:effort]]] | "
             "codex-notified <request_id> | completed-unnotified [limit] | completion-notified <request_id> | "
             "context-pack [project] [topic] [budget] | context-retrieve <ref> [query] [limit] | "
             "context-stats [project] [topic] | chat-bootstrap [project] [topic] [target_agent] [budget] | "
@@ -4924,10 +6438,24 @@ def handle_bridge_cli(argv: list[str]) -> int:
             "models [agent] [project] [topic] | resolve-model <project> <topic> <target_agent> <target_model> | "
             "set-model-default <project> <topic> <model_family> <target_agent> <target_model> | "
             "model-defaults [project] [topic] | topic-status [project] [topic] | "
-            "compact-topic [project] [topic] [budget_tokens])"
+            "compact-topic [project] [topic] [budget_tokens] | "
+            "snapshot-request <project> <topic> <target_agent> [target_model] [question] | "
+            "snapshot-claim [consumer] [host] [capabilities-csv] | "
+            "snapshot-complete <request_id> <source_surface> <model> <response> [confidence] | "
+            "snapshot-complete-file <request_id> <source_surface> <path> [model] | snapshot-release <request_id> | "
+            "snapshot-latest [project] [topic] [target_agent] | live-surfaces [project] [max_age] | "
+            "heartbeat <host> [project] [capabilities-csv] [visible_app] [cdp_port] | "
+            "doctor [--json])"
         )
         return 0
     command = argv[0]
+    if command == "doctor":
+        report = broker_doctor()
+        if "--json" in argv[1:]:
+            print(json.dumps(report, ensure_ascii=True, indent=2))
+        else:
+            print(render_doctor(report))
+        return 0
     if command == "claim":
         result = claim_antigravity_request(argv[1] if len(argv) > 1 else "antigravity-bridge")
     elif command == "requests":
@@ -5006,6 +6534,41 @@ def handle_bridge_cli(argv: list[str]) -> int:
         project = argv[1] if len(argv) > 1 else None
         topic = argv[2] if len(argv) > 2 and argv[2] != "*" else None
         result = get_request_ledger(project, topic)
+    elif command == "claude-responses":
+        project = argv[1] if len(argv) > 1 and argv[1] != "*" else None
+        result = ingest_claude_responses(project)
+    elif command == "status":
+        if len(argv) < 2:
+            raise ValueError("status requires <request_id>")
+        result = request_status(argv[1])
+    elif command == "result":
+        if len(argv) < 2:
+            raise ValueError("result requires <request_id>")
+        result = request_result(argv[1])
+    elif command == "cancel":
+        if len(argv) < 2:
+            raise ValueError("cancel requires <request_id> [reason]")
+        result = cancel_request(argv[1], argv[2] if len(argv) > 2 else None)
+    elif command == "reap":
+        result = reap_stale_requests(float(argv[1]) if len(argv) > 1 else 24.0)
+    elif command == "debate":
+        if len(argv) < 4:
+            raise ValueError("debate requires <project> <topic> <proposition> [rounds] [sideA[:model[:effort]]] [sideB[:model[:effort]]]")
+        d_topic = None if argv[2] == "*" else argv[2]
+        d_rounds = int(argv[4]) if len(argv) > 4 and str(argv[4]).isdigit() else 2
+
+        def _spec(raw: str, default_family: str) -> tuple[str, str | None, str | None]:
+            parts = [p.strip() for p in str(raw or default_family).split(":")]
+            return (
+                parts[0] or default_family,
+                parts[1] if len(parts) > 1 and parts[1] else None,
+                parts[2] if len(parts) > 2 and parts[2] else None,
+            )
+
+        a_fam, a_model, a_effort = _spec(argv[5] if len(argv) > 5 else "codex", "codex")
+        b_fam, b_model, b_effort = _spec(argv[6] if len(argv) > 6 else "claude", "claude")
+        result = run_debate(argv[1], argv[3], topic=d_topic, side_a=a_fam, side_b=b_fam,
+                            model_a=a_model, model_b=b_model, effort_a=a_effort, effort_b=b_effort, rounds=d_rounds)
     elif command == "codex-notified":
         if len(argv) < 2:
             raise ValueError("codex-notified requires <request_id>")
@@ -5083,6 +6646,54 @@ def handle_bridge_cli(argv: list[str]) -> int:
         topic = argv[2] if len(argv) > 2 and argv[2] != "*" else None
         budget = int(argv[3]) if len(argv) > 3 else 2000
         result = compact_topic(project, topic, budget)
+    elif command == "snapshot-request":
+        if len(argv) < 4:
+            raise ValueError("snapshot-request requires <project> <topic> <target_agent> [target_model] [question]")
+        result = request_context_snapshot(
+            argv[1], None if argv[2] == "*" else argv[2], "bridge-cli", None,
+            argv[3], argv[4] if len(argv) > 4 and argv[4] != "*" else None,
+            argv[5] if len(argv) > 5 else None,
+        )
+    elif command == "snapshot-claim":
+        consumer = argv[1] if len(argv) > 1 else "snapshot-bridge"
+        host = argv[2] if len(argv) > 2 and argv[2] != "*" else None
+        caps = argv[3] if len(argv) > 3 else None
+        result = claim_context_snapshot_request(consumer, host, caps)
+    elif command == "snapshot-complete":
+        if len(argv) < 5:
+            raise ValueError("snapshot-complete requires <request_id> <source_surface> <model> <response> [confidence]")
+        result = complete_context_snapshot_request(
+            argv[1], argv[2], argv[3] if argv[3] != "*" else None, argv[4],
+            "ok", argv[5] if len(argv) > 5 else None,
+        )
+    elif command == "snapshot-release":
+        if len(argv) < 2:
+            raise ValueError("snapshot-release requires <request_id>")
+        result = snapshot_release_request(argv[1])
+    elif command == "snapshot-complete-file":
+        if len(argv) < 4:
+            raise ValueError("snapshot-complete-file requires <request_id> <source_surface> <path> [model]")
+        snap_path = Path(argv[3]).expanduser()
+        result = complete_context_snapshot_request(
+            argv[1], argv[2], argv[4] if len(argv) > 4 else None,
+            snap_path.read_text(encoding="utf-8", errors="replace"), "ok", None,
+        )
+    elif command == "snapshot-latest":
+        project = argv[1] if len(argv) > 1 else None
+        topic = argv[2] if len(argv) > 2 and argv[2] != "*" else None
+        target = argv[3] if len(argv) > 3 and argv[3] != "*" else None
+        result = get_latest_context_snapshot(project, topic, target)
+    elif command == "live-surfaces":
+        project = argv[1] if len(argv) > 1 else None
+        result = list_live_surfaces(project, int(argv[2]) if len(argv) > 2 else 180)
+    elif command == "heartbeat":
+        if len(argv) < 2:
+            raise ValueError("heartbeat requires <host> [project] [capabilities-csv] [visible_app] [cdp_port]")
+        result = record_surface_heartbeat(
+            argv[1], argv[2] if len(argv) > 2 and argv[2] != "*" else None,
+            argv[3] if len(argv) > 3 else None, argv[4] if len(argv) > 4 else None,
+            None, argv[5] if len(argv) > 5 else None, None,
+        )
     else:
         raise ValueError(f"unknown bridge command: {command}")
     print(json.dumps(result, ensure_ascii=True, indent=2))

@@ -1,10 +1,20 @@
-# Agent Broker
+# Agent Switchboard
 
-Working in Codex and want a second opinion from Claude Opus? Stuck in Claude Code and want Gemini to write the implementation plan? Want your AI coding assistants to debate each other — **without paying for API keys**? This tool routes prompts between the AI assistants you already have installed (Codex, Claude Code, Antigravity, Gemini), using their existing **subscriptions**. No API keys, no extra billing, no cloud — everything runs locally over a small MCP server.
+Local MCP switchboard for Claude Code, Codex, Gemini, Antigravity, and VS Code. It routes tasks, runs cross-model debates, shares compact context snapshots, and returns answers using the assistant subscriptions you already have. No API keys, no extra billing, no cloud.
+
+The recommended GitHub repo slug is **`mcp-agent-switchboard`**. The v1 command, binary, and MCP server key still use `agent-broker` / `agent-broker.exe` for compatibility.
+
+Working in Codex and want a second opinion from Claude Opus? Stuck in Claude Code and want Gemini to write the implementation plan? Agent Switchboard connects the assistants already installed on your machine and keeps their shared state local.
 
 > Built for [Antigravity](https://antigravity.google) and VS Code users. Antigravity is a VS Code fork, so the same bridge extension installs in both.
 
-> **Honest scope:** only **Antigravity** has a true programmatic in-app send *and* a structured reply back to the broker. Claude/Codex are reached through a CLI round-trip or an auto-opened inbox file — see [Delivery, honestly](#delivery-honestly). This is a power-user tool for people who already run these assistants; it drives logged-in subscription UIs, so read [Terms & risk](#terms--risk) first.
+> **Honest scope:** only **Antigravity** has a true programmatic in-app send *and* a structured reply back to the broker. Claude/Codex are reached through a CLI round-trip or an auto-opened inbox file - see [Delivery, honestly](#delivery-honestly). This is a power-user tool for people who already run these assistants; it drives logged-in subscription UIs, so read [Terms & risk](#terms--risk) first.
+
+## Who this is for
+
+- Developers who already use two or more of Codex, Claude Code, Gemini, Antigravity, or VS Code assistant surfaces.
+- Users who want second opinions, audits, planning, and debates without copying context between chats.
+- Power users who prefer local state and existing subscriptions over new hosted orchestration or API-key billing.
 
 ---
 
@@ -37,7 +47,8 @@ Other notes:
 
    Either way the installer detects which assistants you have (Codex, Claude Code, Antigravity, VS Code), **registers the MCP server with each**, installs the bridge extension (VSIX embedded in the exe; auto-built/located from source), writes config, and (optionally) patches Antigravity shortcuts to start with a debug port. Every config it edits is backed up first.
 3. **Open Antigravity / VS Code again** so the `Agent Broker Bridge` extension activates.
-4. **Try it.** In any registered assistant: *"Use Agent Broker to ask Claude Opus to audit this function."*
+4. **Try it.** In any registered assistant: *"Use Agent Switchboard to ask Claude Opus to audit this function."* If your client still shows the MCP server by its compatibility key, *"Use Agent Broker..."* works too.
+5. **Check what actually works on your machine:** run `agent-broker.exe doctor` (or `python agent_broker_mcp.py bridge doctor`). It's read-only and tells you, per assistant, whether a CLI/extension is present, which delivery route you'll get, and whether a headless debate can run — see [Diagnostics: `doctor`](#diagnostics-doctor).
 
 **Uninstall / rollback (both paths):** run `agent-broker.exe uninstall` (or `python setup.py uninstall`), or pick **Uninstall** from the menu. It reverses MCP registration in all four hosts, **removes the bridge extension**, and removes the installed broker exe. Add `--remove-data` to also delete `~/.agent-broker`. The broker uses whatever subscriptions your assistants are already logged into.
 
@@ -52,9 +63,12 @@ Other notes:
 | Keep all shared state **local** (SQLite), never scrape private chat history | ✅ |
 | **Compress** handoffs so cross-agent calls don't burn context | ✅ lossy summarization with a locally-stored, retrievable original (Headroom-style *retrieval*, not a reversible codec) |
 | Keep a short per-topic **work memory** so the next model sees what changed, where, why, checks, risks, and next step | ✅ |
-| Route to the **extension** by default, the **app/CLI** only when asked | ✅ |
-| Fall back to the app automatically when an extension isn't installed | ✅ (positive detection; see caveats in the docs) |
-| Send a prompt straight into Antigravity's chat panel | ✅ (`antigravity.sendPromptToAgentPanel`) |
+| **Peek at another open chat** — fetch a *compact snapshot* of what another agent's session knows, on request (opt-in, local, never silent scraping) | ✅ active context snapshots (`request_context_snapshot` → `get_latest_context_snapshot`) |
+| **Cross-model debate** — two assistants debate N rounds headless on your subscriptions, then a synthesis judge writes a verdict | ✅ (`agent-broker debate`) |
+| Route Codex/Claude to the **headless CLI** by default; the **in-app chat** ("in app") or **desktop app** only when asked | ✅ |
+| Keep **Gemini** + **Antigravity-hosted** models on in-app automation by default, with the Gemini CLI available when explicitly requested | ✅ |
+| Fall back to the in-app extension / app automatically when a CLI isn't installed | ✅ (see caveats in the docs) |
+| Send a prompt straight into Antigravity's chat panel + get a structured reply back | ✅ (`antigravity.sendPromptToAgentPanel`, the only full in-app round-trip) |
 | Pick the Antigravity model automatically | 🧪 Experimental, **off by default** (CDP UI automation) |
 
 ---
@@ -65,9 +79,22 @@ The broker is a dependency-free Python MCP server. Each assistant talks to it ov
 
 **Routing priority:**
 
-1. **Surface** — default is the in-IDE **extension**; the standalone **app/CLI** is used only when you say so ("app", "CLI", "headless") or set `surface: app`. If the target extension is detected as absent, the broker falls back to the app.
+1. **Surface** — Codex/Claude default to the **headless CLI** (reliable, model-switchable via `-m`, answer returned inline); say **"in app"** (or `surface: extension`) for the IDE chat panel, or "app" for a visible desktop-app handoff. **Gemini** and **Antigravity-hosted** models stay on **in-app automation** by default; only an explicit "gemini cli" uses the standalone Gemini CLI. Antigravity-hosted Claude/Gemini never use a CLI. If a CLI is absent, auto-routing degrades to the extension, then the app.
 2. **Model** — vague requests ("ask Opus") resolve against a per-topic default; explicit requests ("claude opus") become the new default. Sending to **Antigravity always requires naming a model** (it hosts a separate, subscription-backed Claude/Gemini). Versioned names that the CLI can't pin (e.g. "opus 4.8") still resolve to the CLI's `opus` alias but now carry a **`note`** warning that the running version may differ.
 3. **Token budget** — every routed task carries a task contract (`implementation_plan`, `co_audit`, `debate`, `review`, …) with a word budget, and a compressed context pack instead of raw history. If a caller inlines a bloated `prompt` (over a soft token limit), the broker stashes the full text as a retrievable `context_ref` and returns a `prompt_notice` nudging it to send a short instruction + ref next time — so token discipline is enforced by the system, not left to each agent.
+
+---
+
+## See what another chat knows (active context snapshots)
+
+Working in one assistant but need the *current* state another open chat is holding? Ask for a **context snapshot** — a COMPACT continuation state (objective, plan, touched files, checks, risks, next step), **not** a full transcript, and **never** silent scraping (it's opt-in and local).
+
+- **`request_context_snapshot(project, topic, target_agent)`** asks the best available open surface for that compact state.
+- **Codex fast path:** the broker reads the live `~/.codex` session transcript on disk (redacted + truncated, scoped to the session whose `cwd` matches the project — no cross-project leak) and returns **immediately**, with no agent cooperation needed.
+- **Other surfaces:** the request is queued for a capable bridge host (`claim_context_snapshot_request` / `complete_context_snapshot_request`, race-safe + idempotent, with a stale-claim reaper), or picked up from a `.agent-broker/context-snapshots/` fallback file.
+- Read it back with **`get_latest_context_snapshot`** — it also folds into `get_context_pack` ("Latest Context Snapshots") and `get_topic_status`, so the next model picks it up automatically. Live-host routing uses `record_surface_heartbeat` / `list_live_surfaces`.
+
+This is the cross-chat "peek" layer: agents and IDEs can see what another agent's session currently knows and fetch it on request, without copy-pasting transcripts.
 
 ---
 
@@ -78,7 +105,7 @@ There is a real difference between **delivered** (a file/prompt reached the surf
 | Target | Mechanism | How far it gets |
 |---|---|---|
 | **Antigravity** (in-app Gemini/Claude) | `antigravity.sendPromptToAgentPanel` (+ optional CDP model select) | delivered → submitted → **completed back to broker** (`complete_antigravity_request`) — the only structured round-trip |
-| **Claude extension** | `claude-inbox` markdown, **auto-opened** + best-effort CDP auto-submit | delivered → auto-opened → (often) submitted. Replies are written to `claude-responses/`; there is **no** symmetric `complete` API |
+| **Claude extension** | `claude-inbox` markdown, **auto-opened** + best-effort CDP auto-submit | delivered → auto-opened → (often) submitted → **recorded back to broker**: the request now has a durable `claude_requests` row, so a reply via `respond_to_request` lands on it, or a file written to `claude-responses/` is ingested by `bridge claude-responses` |
 | **Claude CLI** | `claude -p` headless (prompt via stdin) | **completed** — full headless round-trip |
 | **Codex extension** | `codex-inbox` markdown, **auto-opened** | delivered → auto-opened → (with `respond_to_request`) **completed back to broker** |
 | **Codex CLI** | `codex exec` headless | **completed** — full headless round-trip |
@@ -92,7 +119,55 @@ There is a real difference between **delivered** (a file/prompt reached the surf
 
 ---
 
+## Diagnostics: `doctor`
+
+Because "what works" depends on **what you have installed**, the broker ships a
+read-only `doctor` that probes this machine and tells you the truth — no state is
+changed.
+
+```powershell
+agent-broker.exe doctor          # rendered report
+agent-broker.exe doctor --json   # machine-readable
+# from source:  python agent_broker_mcp.py bridge doctor
+```
+
+For each assistant it reports: whether the **CLI** is found (and a live
+`--version` smoke test), whether the **extension** is installed, the **CDP port**,
+the **delivery route** you'll actually get, the **reply path**, and whether a
+**headless debate** can run. It also flags broker/bridge version drift and prints
+actionable next steps.
+
+**What each install combination gets you** (this is what `doctor` checks):
+
+| You have… | Codex / Claude result |
+|---|---|
+| **CLI on PATH** | full headless round-trip (best); answer returns inline |
+| **Extension only, no CLI** | the broker still *delivers* into the extension (auto-opened inbox + best-effort CDP auto-submit), but it's **semi-manual** and not a silent headless round-trip. `doctor` reports this as `partial` / `delivery-only` |
+| **Desktop app only** | clipboard hand-off only — no programmatic return path |
+| **Neither** | `doctor` tells you exactly what to install |
+
+> **Headless debate** (running both sides automatically) needs **both** the Codex
+> **and** Claude CLIs present — `doctor` reports `headless autonomous debate
+> runnable: YES/no` before you try. Extension-only setups can still get a one-shot
+> second opinion, just not an autonomous multi-round run.
+
+---
+
 ## Changelog
+
+### v1.0.0 (diagnostics + Claude reply path + CLI-default routing + debate)
+- **Headless CLI is now the default route for Codex/Claude.** `route_agent_task` sends Codex/Claude work to the headless CLI by default (reliable, model-switchable via `-m`, answer returned inline). Say **"in app"** / `surface=extension` for the in-app IDE chat panel, or `surface=app` for a visible desktop-app handoff — both honored. **Exceptions:** **Gemini** defaults to Antigravity in-app automation unless you explicitly request `surface=cli`; and **Antigravity-hosted models** (e.g. Antigravity's Opus/Gemini) **always** use Antigravity automation, never a CLI. If the CLI is missing, auto-routing degrades to the in-app extension, then the app handoff.
+- **Antigravity automation is a true round-trip (verified).** From any driver (e.g. the Claude app) you can route to a *named* Antigravity model — the bridge **auto-selects that model** (switching away from whatever was active) over CDP, sends the prompt into the live Antigravity agent panel, and the structured reply returns to the broker (`complete_antigravity_request`). Confirmed working end-to-end: "send to Antigravity Gemini 3.5 (High) and reply" auto-switched the model and returned the answer. This remains the **only** surface with a fully programmatic in-app send *and* structured reply.
+- **`doctor` — read-only capability report.** `agent-broker.exe doctor` (or `bridge doctor [--json]`) probes this machine per assistant: CLI present + live `--version` smoke test, extension installed, CDP port, the delivery route you'll actually get, the reply path, and whether a headless debate can run. Flags broker/bridge version drift and prints next steps. **No new MCP tool** (CLI-only — keeps the 36-tool context budget unchanged). Also probes for a CLI binary bundled inside an installed extension as a *detected-and-smoke-tested* fallback, never an assumed one.
+- **Claude-extension replies are now first-class.** Added a durable `claude_requests` table (mirrors `codex_requests`): `queue_claude_request` records a row, `respond_to_request` and `ledger.md` now recognize Claude requests, and a new `bridge claude-responses [project]` verb ingests answer files written under `.agent-broker/claude-responses/` (idempotent; archives to `processed/`). Previously a Claude-extension reply had no row to attach to. Still no MCP tool added (36 unchanged).
+- **Internal request-lifecycle adapter.** One canonical state map + `is_terminal_state()` so terminal-state logic lives in a single place for new code (reply ingestion, `doctor`, `status`/`result`/`cancel`). Existing per-table status values are unchanged on the wire — no migration.
+- **Request inspection + maintenance verbs.** `bridge status <id>` and `result <id>` (read-only, normalized to the canonical lifecycle across codex/antigravity/claude requests), `cancel <id> [reason]` (terminal-guarded, idempotent), and `reap [max_age_hours]` (marks abandoned non-terminal requests `expired` — never re-queues, so no double-delivery; never touches terminal or `awaiting_model_selection` rows). CLI-only; 36 MCP tools unchanged.
+- **Cross-model debate engine** (`bridge debate <project> <topic> "<proposition>" [rounds] [sideA[:model[:effort]]] [sideB[:model[:effort]]]`). Two assistants debate **headless on your subscriptions** (no API key) for N rounds, then a synthesis judge writes a verdict; the transcript + verdict are saved under `.agent-broker/debates/`. Each debater keeps real memory across rounds via its CLI's own resume primitive (`codex exec resume`, `claude -p --resume`) — **no daemon, no app-server, no network port**; every turn is a clean bounded subprocess. Defaults: Codex latest + `xhigh` reasoning vs Claude `opus` + `xhigh`, synthesis at `high`; the transcript labels each side as e.g. `codex/latest (xhigh)` so you always see which model+effort argued. Token discipline (no file/command exploration, ~500-word cap, only the opponent's last message per turn) keeps cost down without lowering reasoning. CLI-only; 36 MCP tools unchanged.
+
+### v0.6.0 (active context snapshots)
+- **Peek at what another open chat knows.** New `request_context_snapshot` asks the best available surface for a COMPACT continuation state (objective, plan, files, checks, risks, next step) - not a full transcript. Read it back with `get_latest_context_snapshot`; it also lands in `get_context_pack` under "Latest Context Snapshots" and in `get_topic_status`. Opt-in and local - no silent chat scraping.
+- **Codex fast path:** for Codex the broker reads the live `~/.codex` session transcript on disk (redacted + truncated) and returns immediately - no agent cooperation or CDP needed. Strictly scoped to the session whose `cwd` matches the project (no cross-project leak).
+- **Cooperative delivery for other surfaces:** `claim_context_snapshot_request` (capability-gated, stale-claim reaper), `complete_context_snapshot_request` (race-safe, idempotent), `snapshot-release` for undeliverable claims, plus `record_surface_heartbeat`/`list_live_surfaces` so the bridge can route to a live host. Bridge polls snapshots first and scans a `.agent-broker/context-snapshots/` fallback dir. 36 MCP tools.
 
 ### v0.5.0 (model enforcement + one-file install)
 - **Strict model guard on non-switchable surfaces.** When a specific model is requested for the Codex/Claude *extension* (or app) — surfaces the broker can't switch — the delivered prompt now leads with a self-check: state your model; if you're not the requested one, **STOP and tell the user to switch**. The bridge also shows a "select `<model>`" notification. A lesser/default model can no longer silently answer in the requested model's place. Codex requests carry `target_model` + `strict_model`.
@@ -161,7 +236,7 @@ Register it with an MCP client by pointing the client's MCP config at:
 }
 ```
 
-**MCP tools exposed (30):**
+**MCP tools exposed (36):**
 
 ```text
 register_project, route_agent_task, resolve_model_request, list_agent_models,
@@ -174,7 +249,9 @@ respond_to_request, get_request_ledger,
 get_work_memory, record_work_memory,
 get_context_pack, record_context_event, compact_topic,
 store_shared_context, retrieve_shared_context, get_shared_context_stats,
-get_chat_bootstrap
+get_chat_bootstrap,
+request_context_snapshot, claim_context_snapshot_request, complete_context_snapshot_request,
+get_latest_context_snapshot, list_live_surfaces, record_surface_heartbeat
 ```
 
 **Antigravity model auto-selection (experimental, off by default)** requires launching Antigravity with a debug port so the bridge can drive the model picker over Chrome DevTools Protocol, then enabling `agentBrokerBridge.useCdpModelSelection`:

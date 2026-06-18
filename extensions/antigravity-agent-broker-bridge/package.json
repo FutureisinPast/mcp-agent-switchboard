@@ -2,7 +2,7 @@
   "name": "antigravity-agent-broker-bridge",
   "displayName": "Agent Broker Bridge",
   "description": "Routes queued Agent Broker requests into Antigravity's in-app agent panel.",
-  "version": "0.5.0",
+  "version": "1.0.0",
   "publisher": "futureisinpast",
   "engines": {
     "vscode": "^1.68.0"

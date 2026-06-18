@@ -18,8 +18,8 @@ probes/
 shortcut-backups/
 tmp/
 
-# --- internal dev docs (handoff/status/review/coop) — keep private, not for the public repo ---
-docs/
+# --- internal dev docs (handoff/status/review/coop/research/plans) — keep private, not for the public repo ---
+docs/*
 
 # --- backups & build cache ---
 setup-backups/

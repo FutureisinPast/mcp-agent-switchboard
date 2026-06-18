@@ -116,6 +116,9 @@ function config() {
     claudeAutoSubmit: cfg.get('claudeAutoSubmit', true),
     claudeAutoSubmitDelayMs: cfg.get('claudeAutoSubmitDelayMs', 1200),
     claudeInboxStartupMaxAgeMs: cfg.get('claudeInboxStartupMaxAgeMs', 10 * 60 * 1000),
+    snapshotPolling: cfg.get('snapshotPolling', true),
+    snapshotConsumer: cfg.get('snapshotConsumer', 'snapshot-bridge'),
+    snapshotClaudeCapable: cfg.get('snapshotClaudeCapable', true),
   };
 }
 
@@ -911,6 +914,126 @@ async function hasAntigravitySendCommand() {
   return antigravitySendSupported;
 }
 
+// --- active context snapshots (Phase 2 delivery) ----------------------------------
+const snapshotFallbackProcessed = new Set();
+const snapshotHeartbeat = { at: 0 };
+
+async function snapshotCapabilities() {
+  const caps = [];
+  if (await hasAntigravitySendCommand()) caps.push('antigravity');
+  if (config().snapshotClaudeCapable) caps.push('claude');
+  return caps;
+}
+
+async function snapshotHostKind() {
+  return (await hasAntigravitySendCommand()) ? 'antigravity' : 'vscode';
+}
+
+function currentProjectPath() {
+  const folders = vscode.workspace.workspaceFolders || [];
+  return folders.length ? folders[0].uri.fsPath : '';
+}
+
+async function sendSnapshotHeartbeat() {
+  const now = Date.now();
+  if (now - snapshotHeartbeat.at < 12000) return;
+  snapshotHeartbeat.at = now;
+  try {
+    const hostKind = await snapshotHostKind();
+    const proj = currentProjectPath();
+    // Unique host id per window so two windows of the same kind don't overwrite each
+    // other's heartbeat row (host is the PK). Carry the real project for routing.
+    const hostId = `${hostKind}:${proj || (vscode.env && vscode.env.sessionId) || 'default'}`;
+    const caps = (await snapshotCapabilities()).join(',') || '-';
+    await runBroker(['heartbeat', hostId, proj || '*', caps, hostKind, String(config().cdpPort || '')]);
+  } catch (err) {
+    log(`snapshot heartbeat failed: ${err.message || err}`);
+  }
+}
+
+function snapshotFallbackDirs() {
+  const dirs = [path.join(os.homedir(), '.agent-broker', 'context-snapshots')];
+  for (const folder of (vscode.workspace.workspaceFolders || [])) {
+    dirs.push(path.join(folder.uri.fsPath, '.agent-broker', 'context-snapshots'));
+  }
+  return dirs;
+}
+
+async function scanSnapshotFallbacks() {
+  for (const dir of snapshotFallbackDirs()) {
+    let names;
+    try {
+      names = fs.readdirSync(dir).filter(n => n.toLowerCase().endsWith('.md'));
+    } catch {
+      continue;
+    }
+    const processedDir = path.join(dir, 'processed');
+    for (const name of names) {
+      const full = path.join(dir, name);
+      if (snapshotFallbackProcessed.has(full)) continue;
+      const id = path.basename(name, '.md');
+      try {
+        const res = await runBroker(['snapshot-complete-file', id, 'fallback_file', full]);
+        log(`snapshot fallback ${name} -> ${JSON.stringify(res && res.status)}`);
+        // Mark processed only AFTER success, so a transient broker error is retried.
+        snapshotFallbackProcessed.add(full);
+        fs.mkdirSync(processedDir, { recursive: true });
+        fs.renameSync(full, path.join(processedDir, name));
+      } catch (err) {
+        const msg = String((err && (err.message || err)) || '');
+        if (/unknown snapshot request/i.test(msg)) {
+          // Not a real request id (stray file): stop retrying it.
+          snapshotFallbackProcessed.add(full);
+          log(`snapshot fallback ${name} is not a valid request id; skipping`);
+        } else {
+          log(`snapshot fallback ${name} complete failed (will retry): ${msg}`);
+        }
+      }
+    }
+  }
+}
+
+async function pollContextSnapshots() {
+  if (!config().snapshotPolling) return false;
+  await sendSnapshotHeartbeat();
+  await scanSnapshotFallbacks();
+  const caps = await snapshotCapabilities();
+  if (!caps.length) return false;
+  let result;
+  try {
+    result = await runBroker(['snapshot-claim', config().snapshotConsumer, await snapshotHostKind(), caps.join(',')]);
+  } catch (err) {
+    log(`snapshot-claim failed: ${err.message || err}`);
+    return false;
+  }
+  if (!result || result.status !== 'claimed' || !result.request) return false;
+  const req = result.request;
+  const prompt = req.snapshot_prompt || '';
+  const fam = String(req.family || '').toLowerCase();
+  const release = async (why) => {
+    log(`snapshot ${req.id} ${why}; releasing back to queued`);
+    try { await runBroker(['snapshot-release', req.id]); }
+    catch (e) { log(`snapshot release failed: ${e.message || e}`); }
+  };
+  try {
+    if (fam === 'antigravity' && (await hasAntigravitySendCommand())) {
+      await vscode.commands.executeCommand('antigravity.sendPromptToAgentPanel', prompt);
+      log(`snapshot ${req.id} delivered to Antigravity panel`);
+    } else if (fam === 'claude') {
+      const sent = await injectClaudePrompt(prompt, null);
+      log(`snapshot ${req.id} delivered to Claude: ${JSON.stringify(sent && sent.ok)}`);
+      if (!sent || !sent.ok) {
+        try { await openTextDocument(req.fallback_file || ''); } catch {}
+      }
+    } else {
+      await release(`family ${fam} not deliverable from this host`);
+    }
+  } catch (err) {
+    await release(`delivery failed: ${err.message || err}`);
+  }
+  return true;
+}
+
 async function pollOnce() {
   const cfg = config();
   if (!cfg.enabled || busy) {
@@ -921,6 +1044,7 @@ async function pollOnce() {
   try {
     await completeFallbackFiles();
     await notifyCompletions();
+    await pollContextSnapshots();
     await notifyCodexInbox();
     await pollClaudeInbox();
     let claimed = false;
