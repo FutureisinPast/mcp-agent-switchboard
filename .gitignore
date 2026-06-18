@@ -1,0 +1,42 @@
+# --- runtime state & logs (never publish: contains real prompts/responses/paths) ---
+state.sqlite
+state.sqlite-*
+*.log
+agent-broker.log
+
+# --- local machine config (ship config.example.json instead) ---
+config.json
+
+# --- runtime artifacts / user data ---
+codex-inbox/
+claude-inbox/
+claude-app-inbox/
+claude-responses/
+antigravity-responses/
+topics/
+probes/
+shortcut-backups/
+tmp/
+
+# --- internal dev docs (handoff/status/review/coop) — keep private, not for the public repo ---
+docs/
+
+# --- backups & build cache ---
+setup-backups/
+*.bak
+*.bak-*
+__pycache__/
+*.pyc
+
+# --- built / packaged artifacts & deps ---
+# Never commit prebuilt VSIX binaries. They are release artifacts: build with
+# `vsce package` from extensions/antigravity-agent-broker-bridge/ and attach the
+# .vsix to a GitHub Release. (The old negation here shipped stale 0.4.15-0.4.17 builds.)
+*.vsix
+node_modules/
+dist/
+build/
+# PyInstaller auto-generates *.spec, but agent-broker.spec is a hand-written build
+# input (needed by build-release.ps1), so keep it tracked.
+*.spec
+!agent-broker.spec

@@ -1,0 +1,27 @@
+{
+  "_comment": "Copy to config.json. Leave paths empty to auto-detect via PATH. No personal paths are required.",
+  "codex_path": "",
+  "antigravity_path": "",
+  "vscode_path": "",
+  "claude_path": "",
+  "claude_model": "sonnet",
+  "gemini_model": "gemini-2.5-pro",
+
+  "app_autopaste": false,
+  "app_autosubmit": false,
+  "app_paste_click_composer": true,
+  "app_paste_delay_ms": 2500,
+  "app_paste_cold_delay_ms": 7000,
+  "app_paste_composer_offset_px": 70,
+
+  "handoff_auto_compact": true,
+  "handoff_compact_budget_tokens": 1800,
+
+  "_comment_contract": "compact_task_contract keeps the per-message ground-rules block out of the chat: it writes the full rules once to ~/.agent-broker/AGENT_GROUND_RULES.md and the delivered message only references that path. Set false for the legacy inline rules.",
+  "compact_task_contract": true,
+
+  "antigravity_cdp_port": 9000,
+  "vscode_cdp_port": 9010,
+  "_comment_cdp": "CDP model auto-selection is off by default; the debug port is unauthenticated. Opt in only after launching the IDE with --remote-debugging-port.",
+  "antigravity_cdp_autoselect": false
+}

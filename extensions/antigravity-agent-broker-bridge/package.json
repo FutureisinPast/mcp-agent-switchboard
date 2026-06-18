@@ -1,0 +1,186 @@
+{
+  "name": "antigravity-agent-broker-bridge",
+  "displayName": "Agent Broker Bridge",
+  "description": "Routes queued Agent Broker requests into Antigravity's in-app agent panel.",
+  "version": "0.5.0",
+  "publisher": "futureisinpast",
+  "engines": {
+    "vscode": "^1.68.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "*"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentBrokerBridge.pollNow",
+        "title": "Agent Broker Bridge: Poll Now"
+      },
+      {
+        "command": "agentBrokerBridge.openOutput",
+        "title": "Agent Broker Bridge: Open Output"
+      },
+      {
+        "command": "agentBrokerBridge.startCompressedChat",
+        "title": "Agent Broker Bridge: Start Compressed Chat"
+      },
+      {
+        "command": "agentBrokerBridge.resumeModelSelection",
+        "title": "Agent Broker Bridge: Resume Model Selection Request"
+      }
+    ],
+    "configuration": {
+      "title": "Agent Broker Bridge",
+      "properties": {
+        "agentBrokerBridge.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Poll Agent Broker for Antigravity requests."
+        },
+        "agentBrokerBridge.pollIntervalMs": {
+          "type": "number",
+          "default": 3000,
+          "minimum": 1000,
+          "description": "How often to poll the Agent Broker queue."
+        },
+        "agentBrokerBridge.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Python executable used to run the Agent Broker."
+        },
+        "agentBrokerBridge.brokerPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Agent Broker Python script. Leave empty to auto-detect ~/.agent-broker/agent_broker_mcp.py."
+        },
+        "agentBrokerBridge.showCompletionNotifications": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show popups for completed Antigravity broker requests. Completion state is still recorded when disabled."
+        },
+        "agentBrokerBridge.showCodexInboxNotifications": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show popups when a queued Codex inbox request is written."
+        },
+        "agentBrokerBridge.autoOpenCodexInbox": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically open queued Codex inbox requests instead of waiting for a notification click."
+        },
+        "agentBrokerBridge.autoSendCodexInboxToChat": {
+          "type": "boolean",
+          "default": true,
+          "description": "Attempt to deliver queued Codex inbox callbacks directly into the OpenAI/Codex chat webview before falling back to opening the inbox file."
+        },
+        "agentBrokerBridge.autoOpenCodexSidebar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Try to open the Codex sidebar before opening a queued Codex inbox request."
+        },
+        "agentBrokerBridge.codexSidebarCommands": {
+          "type": "array",
+          "default": [
+            "chatgpt.openSidebar",
+            "openai.chatgpt.openSidebar",
+            "codex.openSidebar",
+            "workbench.view.extension.chatgpt",
+            "workbench.view.extension.openai-chatgpt"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "VS Code command IDs to try when opening the Codex sidebar."
+        },
+        "agentBrokerBridge.confirmStrictModelRequests": {
+          "type": "boolean",
+          "default": true,
+          "description": "Before sending a strict target-model request, ask the user to select the requested Antigravity model."
+        },
+        "agentBrokerBridge.autoSelectStrictModel": {
+          "type": "boolean",
+          "default": true,
+          "description": "Attempt to select the requested Antigravity model automatically before sending strict requests."
+        },
+        "agentBrokerBridge.useCdpModelSelection": {
+          "type": "boolean",
+          "default": false,
+          "description": "Use Antigravity's Chrome DevTools Protocol debug port for stricter automatic model selection. OFF by default: the CDP port is an unauthenticated local debug surface — only enable it after deliberately launching Antigravity with --remote-debugging-port."
+        },
+        "agentBrokerBridge.cdpPort": {
+          "type": "number",
+          "default": 9000,
+          "minimum": 1,
+          "description": "Local Chrome DevTools Protocol port used for Antigravity UI model selection."
+        },
+        "agentBrokerBridge.cdpSelectTimeoutMs": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 1000,
+          "description": "Timeout for CDP model-selection attempts."
+        },
+        "agentBrokerBridge.cdpSelectorPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override path for the CDP model-selection helper script."
+        },
+        "agentBrokerBridge.nodePath": {
+          "type": "string",
+          "default": "node",
+          "description": "Node executable used to run local helper scripts."
+        },
+        "agentBrokerBridge.strictModelAutoSendDelayMs": {
+          "type": "number",
+          "default": 1500,
+          "minimum": 0,
+          "description": "Delay after an automatic model-selection attempt before sending the strict request."
+        },
+        "agentBrokerBridge.autoOpenStrictModelSelector": {
+          "type": "boolean",
+          "default": true,
+          "description": "If automatic strict model selection is disabled, open the model selector automatically and pause the request."
+        },
+        "agentBrokerBridge.strictModelAutoResumeDelayMs": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Optional delay for automatically resuming a paused strict-model request after opening the selector. Zero disables auto-resume."
+        },
+        "agentBrokerBridge.antigravityAutoSubmit": {
+          "type": "boolean",
+          "default": true,
+          "description": "After Antigravity fills the agent panel composer, press Enter to submit the draft."
+        },
+        "agentBrokerBridge.antigravityAutoSubmitDelayMs": {
+          "type": "number",
+          "default": 1800,
+          "minimum": 0,
+          "description": "Delay before pressing Enter after Antigravity fills the agent panel composer."
+        },
+        "agentBrokerBridge.claudeUseTopicSession": {
+          "type": "boolean",
+          "default": true,
+          "description": "Route Claude extension requests for the same project/topic into a stable Claude session instead of a new request-id session."
+        },
+        "agentBrokerBridge.claudeAutoSubmit": {
+          "type": "boolean",
+          "default": true,
+          "description": "After opening a Claude extension draft, attempt to submit it automatically."
+        },
+        "agentBrokerBridge.claudeAutoSubmitDelayMs": {
+          "type": "number",
+          "default": 1200,
+          "minimum": 0,
+          "description": "Delay before attempting to submit an opened Claude draft."
+        },
+        "agentBrokerBridge.claudeInboxStartupMaxAgeMs": {
+          "type": "number",
+          "default": 600000,
+          "minimum": 0,
+          "description": "On extension startup, process Claude inbox files newer than this age instead of treating them as stale."
+        }
+      }
+    }
+  }
+}
