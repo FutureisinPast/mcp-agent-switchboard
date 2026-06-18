@@ -36,6 +36,9 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
 BROKER_VERSION = "1.0.0"
 
+# The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
+MCP_SERVER_KEY = "agent-switchboard"
+
 # How long to wait for the SQLite write lock before raising "database is locked".
 DB_TIMEOUT_SECONDS = 30
 
@@ -5561,6 +5564,150 @@ def codex_rollout_snapshot(
     return {"content": content, "model": "gpt (codex)", "source": "codex_rollout_file", "path": str(path)}
 
 
+def _claude_session_cwd(path: Path, scan_lines: int = 60) -> str | None:
+    """First recorded cwd in a Claude Code transcript (normcase+abspath), or None.
+    Scans the first few lines because the leading rows can be summaries/queue ops
+    without a cwd; the real message rows carry one."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for _ in range(max(1, int(scan_lines))):
+                line = handle.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not isinstance(obj, dict):
+                    continue  # a bare array/number/string line must not abort the scan
+                cwd = obj.get("cwd")
+                if cwd and str(cwd).strip():
+                    return os.path.normcase(os.path.abspath(str(cwd)))
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _claude_session_path_for(root_path: str | None) -> Path | None:
+    """Newest ~/.claude/projects session transcript whose recorded cwd matches this
+    project. Mirrors _codex_rollout_path_for. Claude Code buckets sessions by the
+    slugified working dir, so we narrow to the matching bucket(s) (case-insensitively,
+    since the drive-letter case can differ between buckets) and then CONFIRM the cwd
+    recorded INSIDE the file before returning it, so we never leak another project's
+    transcript. Note: this reads the Claude *Code* CLI's on-disk sessions only — the
+    Claude desktop app stores chats in Electron leveldb/server-side and is not here."""
+    if not root_path or not str(root_path).strip():
+        # No project root => no safe match (returning any session would leak another
+        # project's chat), so refuse — same stance as the Codex reader.
+        return None
+    projects = Path.home() / ".claude" / "projects"
+    if not projects.exists():
+        return None
+    want = os.path.normcase(os.path.abspath(str(root_path)))
+    slug = claude_bucket_name(str(root_path)).lower()
+    try:
+        buckets = [d for d in projects.iterdir() if d.is_dir() and d.name.lower() == slug]
+    except OSError:
+        return None
+    candidates: list[Path] = []
+    for bucket in buckets:
+        try:
+            candidates.extend(bucket.glob("*.jsonl"))
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    try:
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    for path in candidates:
+        if _claude_session_cwd(path) == want:
+            return path
+    return None
+
+
+def _claude_text_from_content(content: Any) -> str:
+    """Human-readable text from a Claude message `content` (string or block list).
+    Keeps `text` blocks; drops thinking/tool_use/tool_result so the snapshot stays
+    a clean conversation, not a tool-call dump."""
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            t = str(block.get("text") or "").strip()
+            if t:
+                parts.append(t)
+    return "\n".join(parts).strip()
+
+
+def _claude_session_turns(path: Path, last_n: int = 8) -> list[tuple[str, str]]:
+    """Clean conversational turns from a Claude Code transcript: the user/assistant
+    TEXT only. Skips sub-agent sidechain turns and the tool-result/boilerplate user
+    rows (which carry no text block), the Claude analogue of the Codex event filter."""
+    turns: list[tuple[str, str]] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                # One odd row (a non-object line, or a row whose `message` isn't a dict) must
+                # be SKIPPED, not abort the whole file — these are large, externally-written,
+                # evolving transcripts, so a single malformed row can't cost us every good turn.
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("type") not in ("user", "assistant") or obj.get("isSidechain"):
+                    continue
+                msg = obj.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                text = _claude_text_from_content(msg.get("content"))
+                if text:
+                    role = "assistant" if (msg.get("role") or obj.get("type")) == "assistant" else "user"
+                    turns.append((role, text))
+    except Exception:  # noqa: BLE001
+        return []
+    return turns[-max(1, int(last_n)):]
+
+
+def claude_session_snapshot(
+    project_info: "ProjectInfo", topic: str | None = None, last_n: int = 8, max_chars: int = 4000
+) -> dict[str, Any] | None:
+    """Broker-side snapshot source for Claude Code: read recent turns of the live Claude
+    Code session transcript on disk (~/.claude/projects), redacted + truncated. No agent
+    cooperation or CDP needed — the symmetric counterpart to codex_rollout_snapshot."""
+    path = _claude_session_path_for(project_info.root_path)
+    if not path:
+        return None
+    turns = _claude_session_turns(path, last_n)
+    if not turns:
+        return None
+    per = max(80, (int(max_chars) - 200) // max(1, len(turns)))
+    lines = [
+        f"Source: Claude Code session transcript on disk ({path.name})",
+        f"Captured: {utc_now()} | last {len(turns)} turn(s)",
+        "Note: raw recent turns from ~/.claude/projects, redacted + truncated; not an LLM summary.",
+        "",
+    ]
+    for role, text in turns:
+        lines.append(f"[{role}] {compact_text(text, per)}")
+    content = "\n".join(lines)
+    if len(content) > int(max_chars):
+        content = content[: int(max_chars)].rstrip() + " ... [truncated]"
+    return {"content": content, "model": "claude (claude code)", "source": "claude_session_file", "path": str(path)}
+
+
 def _snapshot_fallback_path(request_id: str, root_path: str | None) -> Path:
     base = Path(root_path) if root_path else BROKER_DIR
     return base / ".agent-broker" / "context-snapshots" / f"{request_id}.md"
@@ -5780,15 +5927,38 @@ def request_context_snapshot(
         project_info.name, topic, requester_agent or created_by, "requested_context_snapshot",
         f"Requested context snapshot of {target_agent or fam}", question,
     )
-    # Broker-side source: the Codex transcript on disk needs no agent/CDP cooperation.
+    # Broker-side sources: a CLI session transcript on disk needs no agent/CDP cooperation.
+    # Both Codex and Claude Code persist their live sessions to disk, so the broker can
+    # read the recent turns and complete the snapshot immediately for either family.
     if fam == "codex":
         snap = codex_rollout_snapshot(project_info, topic, last_n=8, max_chars=mtok * 4)
         if snap:
             done = complete_context_snapshot_request(rid, "codex_rollout_file", snap.get("model"), snap["content"], "ok", "medium")
             return {"status": "completed", "request_id": rid, "source_surface": "codex_rollout_file",
                     "snapshot_id": done.get("snapshot_id"), "snapshot": snap}
+    if fam == "claude":
+        snap = claude_session_snapshot(project_info, topic, last_n=8, max_chars=mtok * 4)
+        if snap:
+            done = complete_context_snapshot_request(rid, "claude_session_file", snap.get("model"), snap["content"], "ok", "medium")
+            return {"status": "completed", "request_id": rid, "source_surface": "claude_session_file",
+                    "snapshot_id": done.get("snapshot_id"), "snapshot": snap}
+    # No on-disk fast path applied. The request is queued for a live bridge host
+    # (Antigravity/VS Code) to claim. Degrade usefully: if NO surface is heartbeating,
+    # nothing will ever pick this up, so tell the caller plainly instead of leaving them
+    # to poll a request with no claimer. (Disconnected apps like the Claude desktop app
+    # are invisible to the nerve system — see `doctor`.)
+    live_servers = [s for s in list_live_surfaces(project_info.name).get("surfaces", []) if s.get("live")]
+    if not live_servers:
+        return {"status": "pending", "request_id": rid, "project": project_info.name, "topic": topic,
+                "target_agent": target_agent, "family": fam, "no_live_surface": True, "live_surfaces": 0,
+                "note": ("Queued, but NO live bridge surface is heartbeating right now, so nothing can "
+                         "serve it. On-disk fast paths exist only for Codex and Claude Code (open one of "
+                         "those in this project), or open the target IDE with the bridge running. Run "
+                         "`doctor` to see which surfaces can feed the nerve system. Disconnected apps "
+                         "(e.g. the Claude desktop app) cannot be snapshotted on demand.")}
     return {"status": "pending", "request_id": rid, "project": project_info.name, "topic": topic,
-            "target_agent": target_agent, "family": fam,
+            "target_agent": target_agent, "family": fam, "no_live_surface": False,
+            "live_surfaces": len(live_servers),
             "note": "Queued for a capable bridge host to claim and complete; poll get_latest_context_snapshot."}
 
 
@@ -6122,7 +6292,7 @@ def handle_message(message: dict[str, Any]) -> dict[str, Any] | None:
             {
                 "protocolVersion": params.get("protocolVersion") or "2025-06-18",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "agent-switchboard", "version": BROKER_VERSION},
+                "serverInfo": {"name": MCP_SERVER_KEY, "version": BROKER_VERSION},
             },
         )
     if method == "notifications/initialized":
@@ -6253,6 +6423,75 @@ def _cli_probe(config: dict[str, Any], family: str) -> dict[str, Any]:
     }
 
 
+def claude_desktop_config_path() -> Path:
+    """Where the Claude *desktop app* reads its MCP servers (separate from Claude Code)."""
+    appdata = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    return appdata / "Claude" / "claude_desktop_config.json"
+
+
+def _nerve_system_report() -> dict[str, Any]:
+    """Which surfaces can actually feed the context-snapshot 'nerve system', so the
+    blind spots (e.g. a disconnected Claude desktop app) are VISIBLE, not surprising.
+    A surface contributes only if it is either (a) readable on disk on demand, or
+    (b) a live, heartbeating bridge — OR (c) it proactively records via broker tools.
+    A disconnected helper that does neither is invisible: that is the core limitation."""
+    home = Path.home()
+    codex_disk = (home / ".codex" / "sessions").exists()
+    claude_disk = (home / ".claude" / "projects").exists()
+    live = [s for s in list_live_surfaces().get("surfaces", []) if s.get("live")]
+    live_hosts = sorted({str(s.get("host")) for s in live if s.get("host")})
+    # Claude desktop app: present? registered with the broker? (push-only; never on disk)
+    desktop_cfg = claude_desktop_config_path()
+    desktop_installed = desktop_cfg.parent.exists()
+    desktop_registered = False
+    if desktop_cfg.exists():
+        try:
+            data = json.loads(desktop_cfg.read_text(encoding="utf-8"))
+            desktop_registered = MCP_SERVER_KEY in (data.get("mcpServers") or {})
+        except Exception:  # noqa: BLE001
+            desktop_registered = False
+    contributors = [
+        {"surface": "codex", "mechanism": "disk fast-path (~/.codex)", "readable_on_demand": True,
+         "available": codex_disk, "detail": "Recent turns read on demand; no live agent needed."},
+        {"surface": "claude_code", "mechanism": "disk fast-path (~/.claude/projects)", "readable_on_demand": True,
+         "available": claude_disk, "detail": "Recent turns read on demand; no live agent needed."},
+        {"surface": "antigravity", "mechanism": "live bridge (heartbeat + claim)", "readable_on_demand": False,
+         "available": any("antigravity" in h.lower() for h in live_hosts),
+         "detail": "Contributes only while Antigravity runs with the bridge heartbeating."},
+        {"surface": "vscode", "mechanism": "live bridge (heartbeat + claim)", "readable_on_demand": False,
+         "available": any(("code" in h.lower() or "vscode" in h.lower()) for h in live_hosts),
+         "detail": "Contributes only while VS Code runs with the bridge heartbeating."},
+        {"surface": "claude_desktop_app", "mechanism": "push-only via MCP (if registered)", "readable_on_demand": False,
+         "available": desktop_registered,
+         "detail": ("Electron/leveldb + server-side chat; NEVER readable on disk. Can only PUSH to the "
+                    "nerve system via broker tools, and only when it proactively records — it is not a "
+                    "heartbeating, claimable surface."
+                    + ("" if desktop_installed else " (desktop app not detected here)"))},
+    ]
+    blind_spots: list[str] = []
+    if desktop_installed and not desktop_registered:
+        blind_spots.append(
+            "Claude desktop app is installed but NOT registered with the broker "
+            "(claude_desktop_config.json) - it cannot contribute. Re-run install to wire it up."
+        )
+    blind_spots.append(
+        "Any disconnected helper (a desktop app, a browser chat) that does not call "
+        "record_work_memory / complete_context_snapshot_request is invisible to the nerve system."
+    )
+    return {
+        "purpose": "Surfaces that can feed request_context_snapshot (the context-snapshot nerve system).",
+        "live_surfaces_now": len(live),
+        "live_hosts": live_hosts,
+        "claude_desktop": {
+            "installed": desktop_installed,
+            "registered": desktop_registered,
+            "config_path": str(desktop_cfg),
+        },
+        "contributors": contributors,
+        "blind_spots": blind_spots,
+    }
+
+
 def broker_doctor() -> dict[str, Any]:
     """Assemble a read-only, per-surface capability report for this machine."""
     config = load_config()
@@ -6360,6 +6599,13 @@ def broker_doctor() -> dict[str, Any]:
     if bridge_version and bridge_version != BROKER_VERSION:
         version_note = f"broker {BROKER_VERSION} != bridge {bridge_version} - version drift."
 
+    nerve = _nerve_system_report()
+    if nerve["claude_desktop"]["installed"] and not nerve["claude_desktop"]["registered"]:
+        recommendations.append(
+            "Claude desktop app detected but not wired to the broker - re-run install to register it "
+            "(it can then PUSH context, though it still can't be read on disk like Claude Code/Codex)."
+        )
+
     return {
         "broker_version": BROKER_VERSION,
         "bridge_version": bridge_version,
@@ -6367,6 +6613,7 @@ def broker_doctor() -> dict[str, Any]:
         "node": {"found": bool(node_path), "path": node_path, "version": node_ver, "ok": node_ok},
         "surfaces": surfaces,
         "debate": debate,
+        "nerve_system": nerve,
         "recommendations": recommendations or ["All core surfaces look healthy."],
     }
 
@@ -6412,6 +6659,20 @@ def render_doctor(report: dict[str, Any]) -> str:
     lines.append(f"  headless autonomous debate runnable: {'YES' if d['headless_autonomous_runnable'] else 'no'}")
     lines.append(f"  {d['note']}")
     lines.append("")
+    nerve = report.get("nerve_system")
+    if nerve:
+        lines.append("[nerve system: who can feed request_context_snapshot]")
+        lines.append(f"  live surfaces now: {nerve['live_surfaces_now']}"
+                     + (f" ({', '.join(nerve['live_hosts'])})" if nerve.get("live_hosts") else ""))
+        for c in nerve.get("contributors", []):
+            if c.get("readable_on_demand"):
+                state = "on-disk fast-path" if c.get("available") else "on-disk fast-path (no sessions yet)"
+            else:
+                state = "LIVE now" if c.get("available") else "needs a live/registered surface"
+            lines.append(f"  {c['surface']:<18}: {state}  [{c['mechanism']}]")
+        for spot in nerve.get("blind_spots", []):
+            lines.append(f"  ! blind spot: {spot}")
+        lines.append("")
     lines.append("[recommendations]")
     for rec in report["recommendations"]:
         lines.append(f"  - {rec}")

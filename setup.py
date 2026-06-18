@@ -58,6 +58,9 @@ def find_asset(rel: str) -> Path | None:
 
 CODEX_TOML = HOME / ".codex" / "config.toml"
 CLAUDE_JSON = HOME / ".claude.json"
+# The Claude DESKTOP app (separate product from Claude Code) reads its MCP servers here.
+# Wiring it up lets it PUSH into the broker's nerve system; it can't be read on disk.
+CLAUDE_DESKTOP_CONFIG = APPDATA / "Claude" / "claude_desktop_config.json"
 ANTIGRAVITY_USER_DIRS = [
     APPDATA / "Antigravity IDE" / "User",
     APPDATA / "Antigravity" / "User",
@@ -330,6 +333,15 @@ def detect() -> dict[str, dict]:
             "cli": which("claude"),
             "config": CLAUDE_JSON if CLAUDE_JSON.exists() else None,
         },
+        "claude_desktop": {
+            "label": "Claude Desktop",
+            "cli": None,
+            # Report "config found" off the ACTUAL file (consistent with the other JSON/TOML
+            # hosts), but treat the app as installed when its %APPDATA%/Claude data dir exists
+            # even before any mcpServers file is written (install will create/merge it then).
+            "config": CLAUDE_DESKTOP_CONFIG if CLAUDE_DESKTOP_CONFIG.exists() else None,
+            "installed": CLAUDE_DESKTOP_CONFIG.parent.exists(),
+        },
         "antigravity": {
             "label": "Antigravity IDE",
             "cli": antigravity_cli(),
@@ -342,7 +354,7 @@ def detect() -> dict[str, dict]:
         },
     }
     for h in hosts.values():
-        h["present"] = bool(h["cli"] or h["config"])
+        h["present"] = bool(h["cli"] or h["config"] or h.get("installed"))
     return hosts
 
 
@@ -416,6 +428,18 @@ def register_claude(command: str, args: list[str], dry: bool) -> str:
         # don't fabricate a fresh ~/.claude.json; let Claude create it on first run
         return "skipped (~/.claude.json not present yet — run Claude once, then re-install)"
     return _register_json(CLAUDE_JSON, "claude", command, args, dry)
+
+
+def register_claude_desktop(command: str, args: list[str], dry: bool) -> str:
+    # The Claude DESKTOP app (distinct from Claude Code) reads MCP servers from
+    # claude_desktop_config.json. Registering lets the desktop app CALL broker tools, so it
+    # can PUSH context into the nerve system — closing the gap where a disconnected desktop
+    # chat was invisible to every other agent. Caveat (honest): the desktop app still can't
+    # be READ on disk like Claude Code/Codex, and only contributes when it proactively
+    # records. Only touch the config if the desktop app is actually installed.
+    if not CLAUDE_DESKTOP_CONFIG.parent.exists():
+        return "skipped (not installed)"
+    return _register_json(CLAUDE_DESKTOP_CONFIG, "claude_desktop", command, args, dry)
 
 
 def register_antigravity(command: str, args: list[str], dry: bool) -> str:
@@ -644,13 +668,19 @@ def uninstall_bridge(host_cli: str, dry: bool) -> str:
 
 
 # --- high-level actions ----------------------------------------------------
-def do_status() -> None:
+def show_detected() -> None:
+    """Print the per-host detected/installed state. Shared by Status and the top of Install
+    so picking Install shows what's already on the machine before it changes anything."""
     head("Detected agents")
     for key, h in detect().items():
         mark = "[x]" if h["present"] else "[ ]"
         cli = h["cli"] or "-"
         cfg = "config found" if h["config"] else "no config"
-        print(f"  {mark} {h['label']:<12} cli={cli!s:<8} {cfg}")
+        print(f"  {mark} {h['label']:<14} cli={cli!s:<8} {cfg}")
+
+
+def do_status() -> None:
+    show_detected()
     head("Broker")
     cmd, cargs = broker_command()
     info(f"command: {' '.join([cmd, *cargs])}")
@@ -662,6 +692,9 @@ def do_status() -> None:
 
 def do_install(dry: bool, debug_port: bool) -> bool:
     head("Install" + (" (dry-run)" if dry else ""))
+    # Show what's already detected/installed BEFORE changing anything, so the user can
+    # see the current per-host state up front (then we proceed with the install).
+    show_detected()
     if not require_ide_windows_closed("install or repair", dry):
         return False
     # In source/Python mode the agents run the .py, so it must exist. When frozen, the
@@ -684,6 +717,7 @@ def do_install(dry: bool, debug_port: bool) -> bool:
     results.update({
         "Codex MCP": register_codex(command, cargs, dry),
         "Claude MCP": register_claude(command, cargs, dry),
+        "Claude Desktop MCP": register_claude_desktop(command, cargs, dry),
         "Antigravity MCP": register_antigravity(command, cargs, dry),
         "VS Code MCP": register_vscode(command, cargs, dry),
         "Antigravity bridge": install_bridge("antigravity", dry),
@@ -733,6 +767,7 @@ def do_uninstall(dry: bool, remove_data: bool) -> bool:
     results = {
         "Codex MCP": unregister_codex(dry),
         "Claude MCP": _unregister_json(CLAUDE_JSON, "mcpServers", dry),
+        "Claude Desktop MCP": _unregister_json(CLAUDE_DESKTOP_CONFIG, "mcpServers", dry),
         "Antigravity MCP": unregister_antigravity(dry),
         "VS Code MCP": _unregister_json(VSCODE_MCP, "servers", dry),
         "Antigravity bridge": uninstall_bridge("antigravity", dry),
@@ -813,23 +848,23 @@ def menu() -> int:
         print("\n" + "=" * 44)
         print("  Agent Switchboard - setup")
         print("=" * 44)
-        print("  1) Status (what's detected)")
-        print("  2) Install / repair")
-        print("  3) Install + enable Antigravity debug port")
+        print("  1) Install / repair")
+        print("  2) Install + enable Antigravity debug port")
+        print("  3) Preview install (dry-run)")
         print("  4) Uninstall (keep my data)")
         print("  5) Uninstall + remove all data")
-        print("  6) Preview install (dry-run)")
+        print("  6) Status (what's detected)")
         print("  0) Quit")
         try:
             choice = input("\n  Choose: ").strip()
         except (EOFError, KeyboardInterrupt):
             return 0
         if choice == "1":
-            do_status()
-        elif choice == "2":
             do_install(dry=False, debug_port=False)
-        elif choice == "3":
+        elif choice == "2":
             do_install(dry=False, debug_port=True)
+        elif choice == "3":
+            do_install(dry=True, debug_port=False)
         elif choice == "4":
             do_uninstall(dry=False, remove_data=False)
         elif choice == "5":
@@ -838,7 +873,7 @@ def menu() -> int:
             else:
                 info("cancelled")
         elif choice == "6":
-            do_install(dry=True, debug_port=False)
+            do_status()
         elif choice == "0":
             return 0
         else:

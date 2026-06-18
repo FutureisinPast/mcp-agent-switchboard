@@ -83,6 +83,51 @@ function Uninstall-BridgeExtension {
   }
 }
 
+function Resolve-AntigravityExe {
+  # Prefer the real .exe (the best target for a Start-Menu .lnk), then the bin launcher
+  # .cmd, then anything on PATH - so an Antigravity installed via .cmd / a PATH entry
+  # (exactly what start-antigravity-debug.ps1 itself resolves) can still be restored to,
+  # not only the two exe locations. Otherwise the fallback silently fails on such installs.
+  $local = [Environment]::GetFolderPath("LocalApplicationData")
+  $candidates = @(
+    (Join-Path $local "Programs\Antigravity IDE\Antigravity IDE.exe"),
+    (Join-Path $local "Programs\Antigravity\Antigravity.exe"),
+    (Join-Path $local "Programs\Antigravity IDE\bin\antigravity-ide.cmd"),
+    (Join-Path $local "Programs\Antigravity\bin\antigravity.cmd")
+  )
+  foreach ($candidate in $candidates) {
+    if (Test-Path -LiteralPath $candidate) { return $candidate }
+  }
+  foreach ($name in @("antigravity-ide", "antigravity-ide.cmd", "antigravity", "antigravity.cmd")) {
+    $command = Get-Command $name -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+  }
+  return $null
+}
+
+function Get-OriginalShortcutFromBackup {
+  param([string]$LinkPath, [object]$Shell)
+  # The enable script copies each shortcut to ~/.agent-broker/shortcut-backups/<ts>/<mangled>
+  # BEFORE replacing it. Return the EARLIEST backup whose target is a real exe (not the
+  # powershell wrapper) = the true pre-patch original. (A later backup may itself be an
+  # already-patched wrapper if the user enabled twice, so we skip powershell-target ones.)
+  # Sort by the timestamped PARENT DIR NAME (yyyyMMdd-HHmmss), not LastWriteTime: Copy-Item
+  # preserves the SOURCE .lnk's mtime on the backup, so file mtime is not the capture order.
+  $backupRoot = Join-Path $env:USERPROFILE ".agent-broker\shortcut-backups"
+  if (-not (Test-Path -LiteralPath $backupRoot)) { return $null }
+  $name = ($LinkPath -replace "[:\\\/]", "_")
+  $candidates = Get-ChildItem -Path $backupRoot -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { -not $_.PSIsContainer -and $_.Name -eq $name } |
+    Sort-Object { $_.Directory.Name }
+  foreach ($candidate in $candidates) {
+    try { $sc = $Shell.CreateShortcut($candidate.FullName) } catch { continue }
+    if ($sc.TargetPath -and $sc.TargetPath -notlike "*powershell*" -and $sc.TargetPath -notlike "*pwsh*") {
+      return $sc
+    }
+  }
+  return $null
+}
+
 function Restore-DebugShortcuts {
   param(
     [string]$HostName,
@@ -127,6 +172,53 @@ function Restore-DebugShortcuts {
       }
 
       $oldArgs = [string]$shortcut.Arguments
+      # Only Antigravity's enable patch REPLACES the shortcut with a powershell wrapper
+      # (VS Code's points straight at Code.exe), and that wrapper always invokes
+      # start-antigravity-debug.ps1. Gate strictly to the Antigravity host AND that script
+      # name, so we can never clobber an unrelated user shortcut that merely launches
+      # powershell with a -Port argument and happens to match the VS Code name patterns.
+      $isWrapper = ($HostName -eq 'Antigravity') -and `
+                   (($target -like "*powershell*") -or ($target -like "*pwsh*")) -and `
+                   ($oldArgs -like "*start-antigravity-debug*")
+      if ($isWrapper) {
+        # There are NO inline --remote-debugging flags to strip here (the old code did
+        # nothing, leaving Antigravity launching through the debug wrapper after uninstall).
+        # Restore the pre-patch original from backup; else repoint straight at the installed
+        # Antigravity launcher so it opens normally with no debug port.
+        $backup = Backup-File $link.FullName
+        $orig = Get-OriginalShortcutFromBackup -LinkPath $link.FullName -Shell $shell
+        # Trust the backup only if its target still exists (the user may have migrated from
+        # "Antigravity" to "Antigravity IDE"); otherwise fall back to the installed launcher.
+        $useBackup = $orig -and $orig.TargetPath -and (Test-Path -LiteralPath $orig.TargetPath)
+        $exe = if ($useBackup) { $null } else { Resolve-AntigravityExe }
+        if ($useBackup) {
+          if (-not $DryRun) {
+            $shortcut.TargetPath = $orig.TargetPath
+            $shortcut.Arguments = $orig.Arguments
+            $shortcut.WorkingDirectory = $orig.WorkingDirectory
+            if ($orig.IconLocation) { $shortcut.IconLocation = $orig.IconLocation }
+            $shortcut.Save()
+          }
+          $changed += 1
+          Add-Action "shortcuts" ($(if ($DryRun) { "dry-run" } else { "restored" })) "$HostName shortcut $($link.FullName) (restored from backup); backup $backup"
+        } elseif ($exe) {
+          if (-not $DryRun) {
+            $shortcut.TargetPath = $exe
+            $shortcut.Arguments = ""
+            $shortcut.WorkingDirectory = (Split-Path $exe)
+            $shortcut.IconLocation = "$exe,0"
+            $shortcut.Save()
+          }
+          $changed += 1
+          Add-Action "shortcuts" ($(if ($DryRun) { "dry-run" } else { "restored" })) "$HostName shortcut $($link.FullName) (repointed to Antigravity launcher); backup $backup"
+        } else {
+          # Neither a usable backup nor an installed Antigravity launcher: do NOT claim
+          # success (the old code falsely reported "restored" while changing nothing). Leave
+          # the now-defunct wrapper and tell the user to delete it manually.
+          Add-Action "shortcuts" "warning" "$HostName shortcut $($link.FullName) still points at the debug wrapper; no backup and no installed Antigravity found to restore to - delete this shortcut manually. backup $backup"
+        }
+        continue
+      }
       $newArgs = Remove-DebugFlags $oldArgs
       if ($newArgs -eq $oldArgs) {
         continue
