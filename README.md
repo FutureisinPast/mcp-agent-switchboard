@@ -52,7 +52,7 @@ Other notes:
    powershell -NoProfile -ExecutionPolicy Bypass -File .\install-agent-broker.ps1
    ```
 
-   Either way the installer detects which assistants you have (Codex, Claude Code, Antigravity, VS Code), **registers the MCP server with each**, installs the bridge extension (VSIX embedded in the exe; auto-built/located from source), writes config, and (optionally) patches Antigravity shortcuts to start with a debug port. Every config it edits is backed up first.
+   Either way the installer detects which assistants you have (Codex, Claude Code, Antigravity, VS Code), **registers the MCP server with each**, installs the bridge extension (VSIX embedded in the exe; auto-built/located from source), and writes config. If **Antigravity is installed**, it then **offers (default Yes) to enable automated in-app model selection** — press Enter to accept (it patches the Antigravity launcher to open a local debug port) or decline to skip. Every config it edits is backed up first.
 3. **Open Antigravity / VS Code again** so the `Agent Broker Bridge` extension activates.
 4. **Try it.** In any registered assistant: *"Use Agent Switchboard to ask Claude Opus to audit this function."* If your client still shows the MCP server by its compatibility key, *"Use Agent Broker..."* works too.
 5. **Check what actually works on your machine:** run `agent-broker.exe doctor` (or `python agent_broker_mcp.py bridge doctor`). It's read-only and tells you, per assistant, whether a CLI/extension is present, which delivery route you'll get, and whether a headless debate can run — see [Diagnostics: `doctor`](#diagnostics-doctor).
@@ -76,7 +76,7 @@ Other notes:
 | Keep **Gemini** + **Antigravity-hosted** models on in-app automation by default, with the Gemini CLI available when explicitly requested | ✅ |
 | Fall back to the in-app extension / app automatically when a CLI isn't installed | ✅ (see caveats in the docs) |
 | Send a prompt straight into Antigravity's chat panel + get a structured reply back | ✅ (`antigravity.sendPromptToAgentPanel`, the only full in-app round-trip) |
-| Pick the Antigravity model automatically | 🧪 Experimental, **off by default** (CDP UI automation) |
+| Pick the Antigravity model automatically | ✅ **Offered at install** (default on) when Antigravity is detected — patches the launcher to open a local CDP debug port so the broker auto-selects the model in-app; just decline at the prompt to skip |
 
 ---
 

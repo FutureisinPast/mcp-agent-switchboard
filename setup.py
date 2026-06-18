@@ -690,12 +690,39 @@ def do_install(dry: bool, debug_port: bool) -> bool:
         "VS Code bridge": install_bridge("code", dry),
         "config.json": write_config(dry),
     })
-    if debug_port:
+    # Antigravity automated in-app model selection (opt-in). The broker can auto-pick
+    # the model you ask for directly in Antigravity's panel, but that needs a LOCAL CDP
+    # debug port, which only exists if Antigravity is launched with --remote-debugging-port.
+    # `setup_debug_port` patches the launcher shortcut to do that. It is forced
+    # non-interactively by --debug-port; otherwise, when Antigravity is installed (we
+    # already detect it) and we're interactive, we offer it as a clear opt-in prompt.
+    want_debug = debug_port
+    if not want_debug and not dry and (antigravity_user_dir().exists() or antigravity_cli()):
+        try:
+            interactive = sys.stdin.isatty()
+        except Exception:  # noqa: BLE001
+            interactive = False
+        if interactive:
+            print()
+            print("  Antigravity detected. Enable AUTOMATED in-app model selection? (recommended)")
+            print("  - Lets the broker auto-pick the model you ask for (e.g. 'Gemini 3.5 Flash (High)')")
+            print("    right in Antigravity's panel, via a LOCAL debug port (127.0.0.1:9000).")
+            print("  - That port is an unauthenticated local debug surface; decline if you'd rather not.")
+            print("  - You can change this later with:  agent-broker install --debug-port")
+            try:
+                ans = input("  Enable automated Antigravity model selection? [Y/n] (Enter = yes): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "n"
+            # Default is YES: anything other than an explicit decline enables it.
+            want_debug = ans not in ("n", "no", "2")
+    if want_debug:
         results["Antigravity debug port"] = setup_debug_port(dry)
     for k, v in results.items():
         print(f"  {k:<22} : {v}")
     if not dry:
         print("\n  Done. Restart the agents you use so they pick up the broker.")
+        if want_debug:
+            print("  For automated Antigravity selection, relaunch Antigravity from its shortcut (opens the debug port).")
     return True
 
 
