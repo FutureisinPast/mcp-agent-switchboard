@@ -40,3 +40,6 @@ build/
 # input (needed by build-release.ps1), so keep it tracked.
 *.spec
 !agent-broker.spec
+
+# Release notes are pasted into the GitHub Release page, not tracked here
+RELEASE_NOTES*.md
