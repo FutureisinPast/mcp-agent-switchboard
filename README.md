@@ -6,7 +6,7 @@ A local nervous system for AI coding agents.
 
 Codex has context Claude needs. Gemini may be better for the plan. Antigravity may be where the answer should land. Agent Switchboard connects them through MCP so they can route work, debate, and share compact memory without another paid API layer.
 
-> **If this saves your agent workflow, please star the repo so others can find it!**
+> **⭐ If this saves your agent workflow, please star the repo so others can find it!**
 
 ## Fast Version
 
@@ -315,4 +315,4 @@ MIT.
 
 ---
 
-**If this saved you an API bill, star the repo** ⭐ — it helps other Antigravity and VS Code users find it.
+**⭐ If this saves your agent workflow, please star the repo so others can find it!**
