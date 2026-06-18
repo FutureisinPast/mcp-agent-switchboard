@@ -1,20 +1,27 @@
 # Agent Switchboard
 
-Local MCP switchboard for Claude Code, Codex, Gemini, Antigravity, and VS Code. It routes tasks, runs cross-model debates, shares compact context snapshots, and returns answers using the assistant subscriptions you already have. No API keys, no extra billing, no cloud.
+A local nervous system for AI coding agents.
 
-The recommended GitHub repo slug is **`mcp-agent-switchboard`**. The v1 command, binary, and MCP server key still use `agent-broker` / `agent-broker.exe` for compatibility.
+**MCP nervous system for Claude Code, Codex, Gemini, Antigravity, and VS Code.** Route tasks, run model debates, **compact token-heavy context**, and return answers locally.
 
-Working in Codex and want a second opinion from Claude Opus? Stuck in Claude Code and want Gemini to write the implementation plan? Agent Switchboard connects the assistants already installed on your machine and keeps their shared state local.
+Codex has context Claude needs. Gemini may be better for the plan. Antigravity may be where the answer should land. Agent Switchboard connects them through MCP so they can route work, debate, and share compact memory without another paid API layer.
+
+> **If this saves your agent workflow, please star the repo so others can find it!**
+
+## Fast Version
+
+- **Ask one assistant to use another** - from Codex, ask Claude Opus to audit; from Claude, ask Codex to implement; send Gemini/Antigravity-hosted models the planning work.
+- **Run cross-model debate** - Codex vs Claude for N rounds, then synthesize a verdict.
+- **Token compaction is built in** - compressed handoffs, compact context packs, work memory, and retrievable originals instead of dumping entire transcripts.
+- **Keep it local** - SQLite state under `~/.agent-broker`; no private chat scraping, no cloud broker.
+- **Use subscriptions you already pay for** - no required API keys or metered orchestration service.
+- **Know the truth** - `doctor` reports which routes are full, partial, or app-only on your machine.
+
+The v1 command, binary, and MCP server key still use `agent-broker` / `agent-broker.exe` for compatibility.
 
 > Built for [Antigravity](https://antigravity.google) and VS Code users. Antigravity is a VS Code fork, so the same bridge extension installs in both.
 
 > **Honest scope:** only **Antigravity** has a true programmatic in-app send *and* a structured reply back to the broker. Claude/Codex are reached through a CLI round-trip or an auto-opened inbox file - see [Delivery, honestly](#delivery-honestly). This is a power-user tool for people who already run these assistants; it drives logged-in subscription UIs, so read [Terms & risk](#terms--risk) first.
-
-## Who this is for
-
-- Developers who already use two or more of Codex, Claude Code, Gemini, Antigravity, or VS Code assistant surfaces.
-- Users who want second opinions, audits, planning, and debates without copying context between chats.
-- Power users who prefer local state and existing subscriptions over new hosted orchestration or API-key billing.
 
 ---
 
@@ -61,7 +68,7 @@ Other notes:
 | Let Codex, Claude Code, and Antigravity consult each other | ✅ |
 | Use existing **subscriptions** — no API keys, no extra billing | ✅ |
 | Keep all shared state **local** (SQLite), never scrape private chat history | ✅ |
-| **Compress** handoffs so cross-agent calls don't burn context | ✅ lossy summarization with a locally-stored, retrievable original (Headroom-style *retrieval*, not a reversible codec) |
+| **Token compaction** so cross-agent calls don't burn context | ✅ compressed handoffs + compact context packs with a locally-stored, retrievable original (Headroom-style *retrieval*, not a reversible codec) |
 | Keep a short per-topic **work memory** so the next model sees what changed, where, why, checks, risks, and next step | ✅ |
 | **Peek at another open chat** — fetch a *compact snapshot* of what another agent's session knows, on request (opt-in, local, never silent scraping) | ✅ active context snapshots (`request_context_snapshot` → `get_latest_context_snapshot`) |
 | **Cross-model debate** — two assistants debate N rounds headless on your subscriptions, then a synthesis judge writes a verdict | ✅ (`agent-broker debate`) |
