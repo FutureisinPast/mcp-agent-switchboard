@@ -4,6 +4,7 @@
   "description": "Routes queued Agent Broker requests into Antigravity's in-app agent panel.",
   "version": "1.0.0",
   "publisher": "futureisinpast",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "engines": {
     "vscode": "^1.68.0"
   },

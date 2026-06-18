@@ -311,7 +311,7 @@ A: The broker is plain Python and cross-platform; the installer, bridge model-se
 
 ## License
 
-MIT.
+PolyForm Noncommercial 1.0.0. Noncommercial use is allowed with the required copyright notice. Commercial use requires a separate written license from FutureisinPast. See [LICENSE](LICENSE).
 
 ---
 
