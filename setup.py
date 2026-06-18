@@ -12,8 +12,8 @@ the subcommands for automation/testing:
 
 Two supported install paths, both with a built-in uninstall/rollback:
   - Python 3.10+: `python setup.py install` (agents run `python agent_broker_mcp.py`).
-  - Self-contained `agent-broker.exe` (PyInstaller, no Python needed): the same exe is
-    dual-mode — run it for the install/uninstall menu, and agents run `agent-broker.exe
+  - Self-contained `agent-switchboard.exe` (PyInstaller, no Python needed): the same exe is
+    dual-mode — run it for the install/uninstall menu, and agents run `agent-switchboard.exe
     serve` as the MCP server. The bridge VSIX is embedded and installed automatically.
 
 Everything is idempotent and every edited file is backed up first under
@@ -39,7 +39,7 @@ LOCALAPPDATA = Path(os.environ.get("LOCALAPPDATA", HOME / "AppData" / "Local"))
 BROKER_HOME = Path(os.environ.get("AGENT_BROKER_HOME", HOME / ".agent-broker"))
 FROZEN = bool(getattr(sys, "frozen", False))
 # Source installer mode. The public install path is the PowerShell wrapper
-# calling this Python setup script, OR the self-contained agent-broker.exe.
+# calling this Python setup script, OR the self-contained agent-switchboard.exe.
 SETUP_DIR = Path(__file__).resolve().parent
 # When frozen by PyInstaller, bundled data files (the VSIX, helper scripts,
 # config.example.json) are extracted to sys._MEIPASS at runtime.
@@ -66,8 +66,8 @@ ANTIGRAVITY_MCP_CANDIDATES = [p / "mcp_config.json" for p in ANTIGRAVITY_USER_DI
 VSCODE_MCP = APPDATA / "Code" / "User" / "mcp.json"
 
 # MCP server key names per host (Codex uses an underscore; the rest use a hyphen).
-CODEX_KEY = "agent_broker"
-MCP_KEY = "agent-broker"
+CODEX_KEY = "agent_switchboard"
+MCP_KEY = "agent-switchboard"
 
 _backup_root: Path | None = None
 
@@ -117,7 +117,7 @@ def server_path() -> Path:
 def frozen_broker_exe() -> Path:
     """Stable home for the self-contained exe, so the registered command keeps working
     even if the user deletes the downloaded file."""
-    return BROKER_HOME / "agent-broker.exe"
+    return BROKER_HOME / "agent-switchboard.exe"
 
 
 def install_self_if_frozen(dry: bool) -> str | None:
@@ -135,7 +135,7 @@ def install_self_if_frozen(dry: bool) -> str | None:
             return f"already installed at {dest}"
         # Stage then atomically replace. os.replace can overwrite a target held open by
         # readers where copy-over-open can fail, and is atomic. If it's locked by a
-        # running `agent-broker.exe serve`, report a hard error so do_install aborts
+        # running `agent-switchboard.exe serve`, report a hard error so do_install aborts
         # rather than silently leaving the stale exe registered.
         tmp = dest.with_name(dest.stem + ".new" + dest.suffix)
         shutil.copy2(src, tmp)
@@ -143,7 +143,7 @@ def install_self_if_frozen(dry: bool) -> str | None:
             os.replace(tmp, dest)
         except OSError:
             return (
-                f"ERROR: {dest} is in use (a running 'agent-broker.exe serve'?). "
+                f"ERROR: {dest} is in use (a running 'agent-switchboard.exe serve'?). "
                 f"Close any Codex/Claude sessions using the broker and re-run. "
                 f"Staged the new exe at {tmp}."
             )
@@ -155,7 +155,7 @@ def install_self_if_frozen(dry: bool) -> str | None:
 def broker_command() -> tuple[str, list[str]]:
     """The (command, args) the agents should run to start the broker.
 
-    - Frozen (self-contained agent-broker.exe): the same exe is dual-mode, so agents
+    - Frozen (self-contained agent-switchboard.exe): the same exe is dual-mode, so agents
       run `<exe> serve` to start the MCP server — no Python required at runtime. Prefer
       the durable copy in BROKER_HOME once installed.
     - Source/Python mode: agents run `python agent_broker_mcp.py`.
@@ -365,7 +365,7 @@ def register_codex(command: str, args: list[str], dry: bool) -> str:
         f"AGENT_BROKER_CALLER = \"codex\"\n"
     )
     if dry:
-        return "would write [mcp_servers.agent_broker] to ~/.codex/config.toml"
+        return f"would write [mcp_servers.{CODEX_KEY}] to ~/.codex/config.toml"
     CODEX_TOML.parent.mkdir(parents=True, exist_ok=True)
     text = CODEX_TOML.read_text(encoding="utf-8") if CODEX_TOML.exists() else ""
     backup_file(CODEX_TOML)
@@ -457,7 +457,7 @@ def unregister_codex(dry: bool) -> str:
     if not CODEX_TOML.exists():
         return "nothing to remove"
     if dry:
-        return "would remove [mcp_servers.agent_broker] from config.toml"
+        return f"would remove [mcp_servers.{CODEX_KEY}] from config.toml"
     backup_file(CODEX_TOML)
     text = _remove_toml_sections(CODEX_TOML.read_text(encoding="utf-8"),
                                  [f"mcp_servers.{CODEX_KEY}", f"mcp_servers.{CODEX_KEY}.env"])
@@ -708,7 +708,7 @@ def do_install(dry: bool, debug_port: bool) -> bool:
             print("  - Lets the broker auto-pick the model you ask for (e.g. 'Gemini 3.5 Flash (High)')")
             print("    right in Antigravity's panel, via a LOCAL debug port (127.0.0.1:9000).")
             print("  - That port is an unauthenticated local debug surface; decline if you'd rather not.")
-            print("  - You can change this later with:  agent-broker install --debug-port")
+            print("  - You can change this later with:  agent-switchboard install --debug-port")
             try:
                 ans = input("  Enable automated Antigravity model selection? [Y/n] (Enter = yes): ").strip().lower()
             except (EOFError, KeyboardInterrupt):

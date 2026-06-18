@@ -67,7 +67,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="agent-broker",
+    name="agent-switchboard",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

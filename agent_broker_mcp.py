@@ -6122,7 +6122,7 @@ def handle_message(message: dict[str, Any]) -> dict[str, Any] | None:
             {
                 "protocolVersion": params.get("protocolVersion") or "2025-06-18",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "agent-broker", "version": BROKER_VERSION},
+                "serverInfo": {"name": "agent-switchboard", "version": BROKER_VERSION},
             },
         )
     if method == "notifications/initialized":

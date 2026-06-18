@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Single entry point for the self-contained agent-broker.exe (PyInstaller).
+"""Single entry point for the self-contained agent-switchboard.exe (PyInstaller).
 
 The one binary is dual-mode so a GitHub user needs no Python at all:
 
-  agent-broker.exe                 -> interactive install / uninstall menu (setup.py)
-  agent-broker.exe install ...     -> setup subcommands (install/uninstall/status)
-  agent-broker.exe uninstall ...   -> rollback everything this tool changed
-  agent-broker.exe serve           -> run the MCP server over stdio (what agents launch)
-  agent-broker.exe doctor [--json] -> read-only capability report for this machine
-  agent-broker.exe bridge <args>   -> broker CLI used by the bridge extension
+  agent-switchboard.exe                 -> interactive install / uninstall menu (setup.py)
+  agent-switchboard.exe install ...     -> setup subcommands (install/uninstall/status)
+  agent-switchboard.exe uninstall ...   -> rollback everything this tool changed
+  agent-switchboard.exe serve           -> run the MCP server over stdio (what agents launch)
+  agent-switchboard.exe doctor [--json] -> read-only capability report for this machine
+  agent-switchboard.exe bridge <args>   -> broker CLI used by the bridge extension
 
 `broker_command()` in setup.py registers `<this-exe> serve` with every host, so the
 exact same binary that installs the broker is also the broker server.

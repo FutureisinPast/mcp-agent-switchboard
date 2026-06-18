@@ -17,7 +17,7 @@ Codex has context Claude needs. Gemini may be better for the plan. Antigravity m
 - **Use subscriptions you already pay for** - no required API keys or metered orchestration service.
 - **Know the truth** - `doctor` reports which routes are full, partial, or app-only on your machine.
 
-The v1 command, binary, and MCP server key still use `agent-broker` / `agent-broker.exe` for compatibility.
+Everything user-facing — the `agent-switchboard.exe` binary, the command, and the MCP server key — is `agent-switchboard`. Internally, local state stays in `~/.agent-broker` and the Python entrypoint is `agent_broker_mcp.py`.
 
 > Built for [Antigravity](https://antigravity.google) and VS Code users. Antigravity is a VS Code fork, so the same bridge extension installs in both.
 
@@ -29,7 +29,7 @@ The v1 command, binary, and MCP server key still use `agent-broker` / `agent-bro
 
 Two supported install paths — pick one:
 
-- **Self-contained `agent-broker.exe`** (no Python needed). One file from the [Releases](../../releases) page does everything: installs the MCP server into every assistant, installs the bridge extension (the VSIX is **embedded**), and runs the MCP server itself (`agent-broker.exe serve`). Has a built-in uninstall.
+- **Self-contained `agent-switchboard.exe`** (no Python needed). One file from the [Releases](../../releases) page does everything: installs the MCP server into every assistant, installs the bridge extension (the VSIX is **embedded**), and runs the MCP server itself (`agent-switchboard.exe serve`). Has a built-in uninstall.
 - **Python 3.10+** (run from source). The broker is one dependency-free Python file; agents launch it as `python agent_broker_mcp.py`.
 
 Other notes:
@@ -44,7 +44,7 @@ Other notes:
 1. **Close Antigravity and VS Code.** The installer refuses to run while either IDE is open, so extensions and debug flags can't be left half-updated.
 2. **Install** one of two ways:
 
-   **A — Self-contained exe (no Python):** download `agent-broker.exe` from the Releases page and run it. Pick **Install** from the menu (or `agent-broker.exe install`).
+   **A — Self-contained exe (no Python):** download `agent-switchboard.exe` from the Releases page and run it. Pick **Install** from the menu (or `agent-switchboard.exe install`).
 
    **B — From source (Python 3.10+):**
 
@@ -53,11 +53,11 @@ Other notes:
    ```
 
    Either way the installer detects which assistants you have (Codex, Claude Code, Antigravity, VS Code), **registers the MCP server with each**, installs the bridge extension (VSIX embedded in the exe; auto-built/located from source), and writes config. If **Antigravity is installed**, it then **offers (default Yes) to enable automated in-app model selection** — press Enter to accept (it patches the Antigravity launcher to open a local debug port) or decline to skip. Every config it edits is backed up first.
-3. **Open Antigravity / VS Code again** so the `Agent Broker Bridge` extension activates.
-4. **Try it.** In any registered assistant: *"Use Agent Switchboard to ask Claude Opus to audit this function."* If your client still shows the MCP server by its compatibility key, *"Use Agent Broker..."* works too.
-5. **Check what actually works on your machine:** run `agent-broker.exe doctor` (or `python agent_broker_mcp.py bridge doctor`). It's read-only and tells you, per assistant, whether a CLI/extension is present, which delivery route you'll get, and whether a headless debate can run — see [Diagnostics: `doctor`](#diagnostics-doctor).
+3. **Open Antigravity / VS Code again** so the `Agent Switchboard Bridge` extension activates.
+4. **Try it.** In any registered assistant: *"Use Agent Switchboard to ask Claude Opus to audit this function."*
+5. **Check what actually works on your machine:** run `agent-switchboard.exe doctor` (or `python agent_broker_mcp.py bridge doctor`). It's read-only and tells you, per assistant, whether a CLI/extension is present, which delivery route you'll get, and whether a headless debate can run — see [Diagnostics: `doctor`](#diagnostics-doctor).
 
-**Uninstall / rollback (both paths):** run `agent-broker.exe uninstall` (or `python setup.py uninstall`), or pick **Uninstall** from the menu. It reverses MCP registration in all four hosts, **removes the bridge extension**, and removes the installed broker exe. Add `--remove-data` to also delete `~/.agent-broker`. The broker uses whatever subscriptions your assistants are already logged into.
+**Uninstall / rollback (both paths):** run `agent-switchboard.exe uninstall` (or `python setup.py uninstall`), or pick **Uninstall** from the menu. It reverses MCP registration in all four hosts, **removes the bridge extension**, and removes the installed broker exe. Add `--remove-data` to also delete `~/.agent-broker`. The broker uses whatever subscriptions your assistants are already logged into.
 
 ---
 
@@ -71,7 +71,7 @@ Other notes:
 | **Token compaction** so cross-agent calls don't burn context | ✅ compressed handoffs + compact context packs with a locally-stored, retrievable original (Headroom-style *retrieval*, not a reversible codec) |
 | Keep a short per-topic **work memory** so the next model sees what changed, where, why, checks, risks, and next step | ✅ |
 | **Peek at another open chat** — fetch a *compact snapshot* of what another agent's session knows, on request (opt-in, local, never silent scraping) | ✅ active context snapshots (`request_context_snapshot` → `get_latest_context_snapshot`) |
-| **Cross-model debate** — two assistants debate N rounds headless on your subscriptions, then a synthesis judge writes a verdict | ✅ (`agent-broker debate`) |
+| **Cross-model debate** — two assistants debate N rounds headless on your subscriptions, then a synthesis judge writes a verdict | ✅ (`agent-switchboard debate`) |
 | Route Codex/Claude to the **headless CLI** by default; the **in-app chat** ("in app") or **desktop app** only when asked | ✅ |
 | Keep **Gemini** + **Antigravity-hosted** models on in-app automation by default, with the Gemini CLI available when explicitly requested | ✅ |
 | Fall back to the in-app extension / app automatically when a CLI isn't installed | ✅ (see caveats in the docs) |
@@ -133,8 +133,8 @@ read-only `doctor` that probes this machine and tells you the truth — no state
 changed.
 
 ```powershell
-agent-broker.exe doctor          # rendered report
-agent-broker.exe doctor --json   # machine-readable
+agent-switchboard.exe doctor          # rendered report
+agent-switchboard.exe doctor --json   # machine-readable
 # from source:  python agent_broker_mcp.py bridge doctor
 ```
 
@@ -165,7 +165,7 @@ actionable next steps.
 ### v1.0.0 (diagnostics + Claude reply path + CLI-default routing + debate)
 - **Headless CLI is now the default route for Codex/Claude.** `route_agent_task` sends Codex/Claude work to the headless CLI by default (reliable, model-switchable via `-m`, answer returned inline). Say **"in app"** / `surface=extension` for the in-app IDE chat panel, or `surface=app` for a visible desktop-app handoff — both honored. **Exceptions:** **Gemini** defaults to Antigravity in-app automation unless you explicitly request `surface=cli`; and **Antigravity-hosted models** (e.g. Antigravity's Opus/Gemini) **always** use Antigravity automation, never a CLI. If the CLI is missing, auto-routing degrades to the in-app extension, then the app handoff.
 - **Antigravity automation is a true round-trip (verified).** From any driver (e.g. the Claude app) you can route to a *named* Antigravity model — the bridge **auto-selects that model** (switching away from whatever was active) over CDP, sends the prompt into the live Antigravity agent panel, and the structured reply returns to the broker (`complete_antigravity_request`). Confirmed working end-to-end: "send to Antigravity Gemini 3.5 (High) and reply" auto-switched the model and returned the answer. This remains the **only** surface with a fully programmatic in-app send *and* structured reply.
-- **`doctor` — read-only capability report.** `agent-broker.exe doctor` (or `bridge doctor [--json]`) probes this machine per assistant: CLI present + live `--version` smoke test, extension installed, CDP port, the delivery route you'll actually get, the reply path, and whether a headless debate can run. Flags broker/bridge version drift and prints next steps. **No new MCP tool** (CLI-only — keeps the 36-tool context budget unchanged). Also probes for a CLI binary bundled inside an installed extension as a *detected-and-smoke-tested* fallback, never an assumed one.
+- **`doctor` — read-only capability report.** `agent-switchboard.exe doctor` (or `bridge doctor [--json]`) probes this machine per assistant: CLI present + live `--version` smoke test, extension installed, CDP port, the delivery route you'll actually get, the reply path, and whether a headless debate can run. Flags broker/bridge version drift and prints next steps. **No new MCP tool** (CLI-only — keeps the 36-tool context budget unchanged). Also probes for a CLI binary bundled inside an installed extension as a *detected-and-smoke-tested* fallback, never an assumed one.
 - **Claude-extension replies are now first-class.** Added a durable `claude_requests` table (mirrors `codex_requests`): `queue_claude_request` records a row, `respond_to_request` and `ledger.md` now recognize Claude requests, and a new `bridge claude-responses [project]` verb ingests answer files written under `.agent-broker/claude-responses/` (idempotent; archives to `processed/`). Previously a Claude-extension reply had no row to attach to. Still no MCP tool added (36 unchanged).
 - **Internal request-lifecycle adapter.** One canonical state map + `is_terminal_state()` so terminal-state logic lives in a single place for new code (reply ingestion, `doctor`, `status`/`result`/`cancel`). Existing per-table status values are unchanged on the wire — no migration.
 - **Request inspection + maintenance verbs.** `bridge status <id>` and `result <id>` (read-only, normalized to the canonical lifecycle across codex/antigravity/claude requests), `cancel <id> [reason]` (terminal-guarded, idempotent), and `reap [max_age_hours]` (marks abandoned non-terminal requests `expired` — never re-queues, so no double-delivery; never touches terminal or `awaiting_model_selection` rows). CLI-only; 36 MCP tools unchanged.
@@ -179,7 +179,7 @@ actionable next steps.
 ### v0.5.0 (model enforcement + one-file install)
 - **Strict model guard on non-switchable surfaces.** When a specific model is requested for the Codex/Claude *extension* (or app) — surfaces the broker can't switch — the delivered prompt now leads with a self-check: state your model; if you're not the requested one, **STOP and tell the user to switch**. The bridge also shows a "select `<model>`" notification. A lesser/default model can no longer silently answer in the requested model's place. Codex requests carry `target_model` + `strict_model`.
 - **Conservative prompt-model detection.** "Get Opus's opinion" with no explicit model arg resolves to Opus (so the topic's Sonnet default doesn't win), as a one-off that doesn't rewrite the stored default. Tightly anchored so ordinary prose ("the *user*…", "*budget*…", "magnum *opus*") never misfires.
-- **Self-contained `agent-broker.exe`.** One dual-mode binary (PyInstaller) that installs everything (the bridge **VSIX is embedded**) and runs the MCP server via `agent-broker.exe serve` — no Python required. Both the exe and `python setup.py` expose a built-in **uninstall** that now also **removes the bridge extension** and the installed exe.
+- **Self-contained `agent-switchboard.exe`.** One dual-mode binary (PyInstaller) that installs everything (the bridge **VSIX is embedded**) and runs the MCP server via `agent-switchboard.exe serve` — no Python required. Both the exe and `python setup.py` expose a built-in **uninstall** that now also **removes the bridge extension** and the installed exe.
 - **Installer fixes:** `latest_vsix()` is recursive + version-aware (a fresh clone could previously ship no usable VSIX); frozen self-install uses an atomic replace and **aborts** instead of silently keeping a stale exe.
 
 ### v0.4.22 (request ledger + answer return-path)
@@ -229,10 +229,10 @@ python agent_broker_mcp.py bridge ... # CLI helpers used by the bridge extension
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build-release.ps1
 # -> extensions/antigravity-agent-broker-bridge/antigravity-agent-broker-bridge-<ver>.vsix
-# -> dist/agent-broker.exe   (embeds the VSIX; dual-mode install + `serve`)
+# -> dist/agent-switchboard.exe   (embeds the VSIX; dual-mode install + `serve`)
 ```
 
-Needs Node.js (for `vsce`) and Python (PyInstaller is installed automatically if missing). Upload `dist/agent-broker.exe` to the GitHub Release.
+Needs Node.js (for `vsce`) and Python (PyInstaller is installed automatically if missing). Upload `dist/agent-switchboard.exe` to the GitHub Release.
 
 Register it with an MCP client by pointing the client's MCP config at:
 
@@ -299,7 +299,7 @@ A: Closer than it used to. The bridge **auto-opens** the Claude inbox file and b
 A: Through Antigravity's in-app Gemini, yes. A standalone `gemini` CLI is also honored (the requested model is passed with `-m`). It is optional and not bundled.
 
 **Q: Do I need Python, or can I just run the `.exe`?**
-A: Either works. The **self-contained `agent-broker.exe`** from Releases needs no Python — it installs everything (the bridge VSIX is embedded) and is itself the MCP server (`agent-broker.exe serve`). Or run from source with Python 3.10+. Both have a built-in uninstall.
+A: Either works. The **self-contained `agent-switchboard.exe`** from Releases needs no Python — it installs everything (the bridge VSIX is embedded) and is itself the MCP server (`agent-switchboard.exe serve`). Or run from source with Python 3.10+. Both have a built-in uninstall.
 
 **Q: I asked Codex/Claude for a specific model — does it switch automatically?**
 A: On Antigravity (CDP) and the CLIs (`--model`/`-m`), yes. The broker **cannot** switch the Codex/Claude *extension* pickers, so instead it tells the receiving agent to **state its model and STOP if it isn't the requested one**, and the bridge notifies you to select it — so a lesser/default model never silently answers. A model named only in the prompt ("get Opus's opinion") is detected as a one-off and doesn't change your topic default.

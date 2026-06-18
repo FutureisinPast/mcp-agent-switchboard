@@ -1,6 +1,6 @@
 {
   "name": "antigravity-agent-broker-bridge",
-  "displayName": "Agent Broker Bridge",
+  "displayName": "Agent Switchboard Bridge",
   "description": "Routes queued Agent Broker requests into Antigravity's in-app agent panel.",
   "version": "1.0.0",
   "publisher": "futureisinpast",
@@ -16,23 +16,23 @@
     "commands": [
       {
         "command": "agentBrokerBridge.pollNow",
-        "title": "Agent Broker Bridge: Poll Now"
+        "title": "Agent Switchboard Bridge: Poll Now"
       },
       {
         "command": "agentBrokerBridge.openOutput",
-        "title": "Agent Broker Bridge: Open Output"
+        "title": "Agent Switchboard Bridge: Open Output"
       },
       {
         "command": "agentBrokerBridge.startCompressedChat",
-        "title": "Agent Broker Bridge: Start Compressed Chat"
+        "title": "Agent Switchboard Bridge: Start Compressed Chat"
       },
       {
         "command": "agentBrokerBridge.resumeModelSelection",
-        "title": "Agent Broker Bridge: Resume Model Selection Request"
+        "title": "Agent Switchboard Bridge: Resume Model Selection Request"
       }
     ],
     "configuration": {
-      "title": "Agent Broker Bridge",
+      "title": "Agent Switchboard Bridge",
       "properties": {
         "agentBrokerBridge.enabled": {
           "type": "boolean",
