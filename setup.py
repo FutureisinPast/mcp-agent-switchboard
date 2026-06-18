@@ -777,18 +777,32 @@ def do_uninstall(dry: bool, remove_data: bool) -> bool:
 
 
 def setup_debug_port(dry: bool) -> str:
-    script = find_asset("enable-antigravity-debug-shortcuts.ps1")
-    if not script:
+    enable = find_asset("enable-antigravity-debug-shortcuts.ps1")
+    wrapper = find_asset("start-antigravity-debug.ps1")
+    if not enable or not wrapper:
         return "skipped (helper script missing)"
     if dry:
-        return "would patch Antigravity shortcuts with --remote-debugging-port=9000"
+        return "would patch Antigravity shortcuts with --remote-debugging-port=9000 (scripts -> ~/.agent-broker)"
     ps = shutil.which("powershell") or shutil.which("pwsh")
     if not ps:
         return "skipped (PowerShell not found)"
+    # CRITICAL: the patched shortcut launches `powershell -File <dir>\start-antigravity-debug.ps1`,
+    # where <dir> is wherever enable-...ps1 runs from ($PSScriptRoot). When frozen, find_asset
+    # returns the PyInstaller TEMP bundle, which is DELETED when the installer exits — leaving the
+    # Antigravity shortcut pointing at a vanished script, so Antigravity won't launch. Copy BOTH
+    # scripts to a DURABLE location (BROKER_HOME) and run the durable copy, so the shortcut
+    # references a path that persists.
     try:
-        subprocess.run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+        BROKER_HOME.mkdir(parents=True, exist_ok=True)
+        durable_enable = BROKER_HOME / "enable-antigravity-debug-shortcuts.ps1"
+        shutil.copy2(enable, durable_enable)
+        shutil.copy2(wrapper, BROKER_HOME / "start-antigravity-debug.ps1")
+    except Exception as exc:  # noqa: BLE001
+        return f"ERROR copying debug scripts to {BROKER_HOME}: {exc}"
+    try:
+        subprocess.run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(durable_enable)],
                        capture_output=True, text=True, timeout=60, check=False)
-        return "patched shortcuts (port 9000)"
+        return "patched shortcuts (port 9000); debug scripts installed to ~/.agent-broker"
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: {exc}"
 
