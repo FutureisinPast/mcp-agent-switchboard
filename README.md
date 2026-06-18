@@ -311,7 +311,7 @@ A: The broker is plain Python and cross-platform; the installer, bridge model-se
 
 ## License
 
-PolyForm Noncommercial 1.0.0. Noncommercial use is allowed with the required copyright notice. Commercial use requires a separate written license from FutureisinPast. See [LICENSE](LICENSE).
+PolyForm Noncommercial 1.0.0. Noncommercial use is allowed with the required copyright notice. Commercial use requires a separate written license from FutureisinPast / ChartTrades (https://chartrades.com/). See [LICENSE](LICENSE).
 
 ---
 
