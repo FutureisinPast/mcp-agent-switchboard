@@ -34,7 +34,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.1"
+BROKER_VERSION = "1.0.2"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -263,6 +263,7 @@ TASK_CONTRACTS = {
         "Produce an exact implementation plan, not code edits.",
         "Use numbered steps with target files, functions, required checks, and rollback/risks.",
         "Do not invent architecture beyond the request.",
+        "Favor the smallest sufficient design: prefer the standard library, native platform features, or an already-installed dependency over new code or new dependencies -- without dropping required validation, error handling, security, or tests.",
         "If handing to a weaker/cheaper model, make the plan deterministic: include acceptance criteria and forbidden changes.",
         "Do not continue if critical context is missing; ask one concise blocking question.",
     ],
@@ -271,6 +272,8 @@ TASK_CONTRACTS = {
         "Follow the approved plan and acceptance criteria as binding constraints.",
         "Do not redesign, reorder, expand scope, or substitute architecture.",
         "Do not refactor unrelated code or change behavior outside scope.",
+        "Prefer the smallest sufficient implementation: write no new code when configuration, removal, or an existing call suffices; otherwise prefer the standard library, then native platform features, then an already-installed dependency, before adding bespoke code or a new dependency.",
+        "This minimalism never overrides required validation, error handling, security checks, or tests; if the plan looks unsafe or materially over-built, stop and report it instead of silently trimming.",
         "If any plan step is impossible or ambiguous, stop and report the blocker instead of improvising.",
         "Report files changed, checks run, and remaining risks.",
     ],
