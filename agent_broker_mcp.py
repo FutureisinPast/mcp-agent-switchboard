@@ -34,7 +34,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.0"
+BROKER_VERSION = "1.0.1"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -116,6 +116,39 @@ GENERIC_MODEL_REQUESTS = {
     "antigravity",
 }
 
+# Most-capable ("flagship") CLI model per family — what a bare "codex"/"claude"
+# request routes to by default ("highest model available"). The Claude "opus" and
+# Codex "gpt-5.5" aliases track whatever the installed CLI maps them to; bump these
+# one-liners when a new top model ships. None => no auto-flagship (caller must name
+# a model, or the family's own config/default applies).
+FAMILY_FLAGSHIP = {
+    "codex": "gpt-5.5",
+    "claude": "opus",
+    "gemini": None,
+}
+
+# Reasoning-effort ladders per family, lowest -> highest. The last entry is the
+# family max, used as the default ("highest effort available") for routed CLI
+# consults unless a lower effort is explicitly requested. Gemini has no effort knob.
+FAMILY_EFFORTS = {
+    "codex": ["minimal", "low", "medium", "high", "xhigh"],
+    "claude": ["low", "medium", "high", "xhigh", "max"],
+}
+
+# Free-text effort phrases -> canonical intent. "top" means "this family's highest"
+# (codex => xhigh, claude => max), resolved per family in effort_for_family().
+_EFFORT_SYNONYMS = {
+    "minimal": "minimal", "min": "minimal",
+    "low": "low",
+    "medium": "medium", "med": "medium", "mid": "medium", "normal": "medium",
+    "high": "high",
+    "xhigh": "xhigh", "x-high": "xhigh", "extra high": "xhigh",
+    "extra-high": "xhigh", "very high": "xhigh", "veryhigh": "xhigh",
+    "max": "top", "maximum": "top", "ultra": "top", "highest": "top", "top": "top",
+}
+# Longest phrases first so multi-word "extra high" matches before bare "high".
+_EFFORT_PHRASES = sorted(_EFFORT_SYNONYMS, key=len, reverse=True)
+
 STATIC_ANTIGRAVITY_MODELS = [
     "Gemini 3.5 Flash (Medium)",
     "Gemini 3.5 Flash (High)",
@@ -129,8 +162,15 @@ STATIC_ANTIGRAVITY_MODELS = [
 
 STATIC_CLAUDE_MODELS = [
     {
+        "id": "fable",
+        "display": "Claude alias: fable (latest Fable, e.g. claude-fable-5)",
+        "aliases": [
+            "claude fable", "fable", "fable 5", "fable5", "claude-fable-5", "claude fable 5",
+        ],
+    },
+    {
         "id": "opus",
-        "display": "Claude alias: opus (runs whatever Opus the installed Claude CLI maps 'opus' to)",
+        "display": "Claude alias: opus (runs whatever Opus the installed Claude CLI maps 'opus' to, e.g. 4.8)",
         "aliases": [
             "claude opus", "opus",
             "opus 4.8", "opus4.8", "claude opus 4.8",
@@ -2130,6 +2170,77 @@ def match_model_request(family: str, requested_model: Any) -> dict[str, Any]:
     return {"status": "unknown", "requested": raw, "matches": [], "choices": choices}
 
 
+def family_max_effort(family: str) -> str | None:
+    """The highest reasoning effort the family's CLI supports (None if it has none)."""
+    ladder = FAMILY_EFFORTS.get(family)
+    return ladder[-1] if ladder else None
+
+
+def normalize_effort_token(token: Any) -> str | None:
+    """Free text -> canonical effort intent (minimal/low/medium/high/xhigh/top), or None."""
+    t = re.sub(r"\s+", " ", str(token or "").strip().lower())
+    if not t:
+        return None
+    return _EFFORT_SYNONYMS.get(t)
+
+
+def effort_for_family(family: str, canonical: Any) -> str | None:
+    """Map a canonical effort intent to a concrete level valid for `family`. 'top'
+    becomes the family max; an effort the family lacks (e.g. claude 'max' asked of
+    codex) snaps to that family's max. Returns None if the family has no effort knob."""
+    ladder = FAMILY_EFFORTS.get(family)
+    if not ladder or not canonical:
+        return None
+    if canonical == "top":
+        return ladder[-1]
+    return canonical if canonical in ladder else ladder[-1]
+
+
+def split_model_and_effort(raw: Any) -> tuple[str, str | None]:
+    """Separate an effort phrase from a model request: "5.5 extra high" -> ("5.5",
+    "xhigh"), "opus ultra" -> ("opus", "top"), "sonnet 4.6" -> ("sonnet 4.6", None).
+    Model slugs never contain effort words, so stripping them as whole words is safe.
+    Returns (model_text, canonical_effort)."""
+    text = re.sub(r"\s+", " ", str(raw or "").strip())
+    if not text:
+        return "", None
+    padded = " " + text.lower() + " "
+    found: str | None = None
+    for phrase in _EFFORT_PHRASES:
+        token = " " + phrase + " "
+        if token in padded:
+            found = _EFFORT_SYNONYMS[phrase]
+            padded = padded.replace(token, " ")
+    return re.sub(r"\s+", " ", padded).strip(), found
+
+
+def pick_cli_model(family: str, model_text: Any) -> str | None:
+    """Resolve an (effort-stripped) model request for a CLI family. Generic/empty ->
+    the family flagship (most capable). A named model resolves to its catalog id; an
+    unmatched name passes through unchanged so brand-new CLI models still work."""
+    text = str(model_text or "").strip()
+    if not text or normalize_lookup(text) in GENERIC_MODEL_REQUESTS:
+        return FAMILY_FLAGSHIP.get(family)
+    match = match_model_request(family, text)
+    if match.get("status") == "matched":
+        return match["model"]
+    if match.get("status") == "generic":
+        return FAMILY_FLAGSHIP.get(family)
+    return text
+
+
+def resolve_cli_model_and_effort(family: str, raw_model: Any, effort_arg: Any = None) -> tuple[str | None, str | None]:
+    """Single source of truth for CLI model+effort selection, shared by consult() and
+    resolve_model_request(). Splits any effort out of the model string, resolves the
+    model (generic -> flagship), and picks the effort: explicit arg > parsed-from-model
+    > family default (highest available)."""
+    model_text, parsed_effort = split_model_and_effort(raw_model)
+    model = pick_cli_model(family, model_text)
+    canonical = normalize_effort_token(effort_arg) or parsed_effort
+    effort = effort_for_family(family, canonical) if canonical else family_max_effort(family)
+    return model, effort
+
+
 def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
     project = args.get("project")
     topic = args.get("topic")
@@ -2137,8 +2248,14 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
     # Passing an inferred "antigravity" agent into model_family_for caused
     # "claude opus"/"sonnet" to be misclassified as Antigravity in-app Claude.
     raw_agent = args.get("target_agent") or args.get("agent")
-    target_model = args.get("target_model") or args.get("model") or ""
+    raw_model = args.get("target_model") or args.get("model") or ""
+    # Pull any reasoning-effort phrase out of the model text first, so "5.5 extra high"
+    # resolves the model as "5.5" and carries the effort separately instead of failing
+    # to match (which used to stall on needs_model_selection).
+    target_model, parsed_effort = split_model_and_effort(raw_model)
     family = model_family_for(raw_agent, target_model)
+    canonical_effort = normalize_effort_token(args.get("effort") or args.get("reasoning_effort")) or parsed_effort
+    resolved_effort = effort_for_family(family, canonical_effort) if canonical_effort else family_max_effort(family)
     match = match_model_request(family, target_model)
 
     if match["status"] == "generic":
@@ -2151,7 +2268,22 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
                 "model_family": family,
                 "target_agent": default["target_agent"],
                 "target_model": default["target_model"],
+                "effort": resolved_effort,
                 "source": "topic_default",
+            }
+        # No explicit pin: default to the family flagship at highest effort instead of
+        # interrupting to ask. Families with no flagship (antigravity / gemini) still ask.
+        flagship = FAMILY_FLAGSHIP.get(family)
+        if flagship is not None:
+            return {
+                "status": "resolved",
+                "project": resolve_project(project).name,
+                "topic": topic,
+                "model_family": family,
+                "target_agent": default_target_agent_for_family(family),
+                "target_model": flagship,
+                "effort": resolved_effort,
+                "source": "family_flagship",
             }
         catalog = list_agent_models(family, project, topic).get("catalogs", {}).get(family, {})
         return {
@@ -2166,7 +2298,10 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
 
     if match["status"] == "matched":
         resolved_agent = default_target_agent_for_family(family)
-        if args.get("remember_model", True) is not False:
+        # Only pin as the topic default when the caller EXPLICITLY opts in. Auto-pinning
+        # every explicit pick made model selection sticky and surprising on later
+        # generic requests; bare "codex"/"claude" should mean "flagship", not "last used".
+        if truthy(args.get("remember_model", False)):
             set_model_default(project, topic, family, resolved_agent, match["model"])
         resolved = {
             "status": "resolved",
@@ -2176,6 +2311,7 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
             "target_agent": resolved_agent,
             "target_model": match["model"],
             "display": match.get("display"),
+            "effort": resolved_effort,
             "source": "explicit_request",
         }
         note = version_collapse_note(family, target_model, match["model"])
@@ -2310,7 +2446,7 @@ def run_process(
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
-def consult_codex(project: str | None, prompt: str, mode: str = "read-only", model_name: str | None = None) -> str:
+def consult_codex(project: str | None, prompt: str, mode: str = "read-only", model_name: str | None = None, effort: str | None = None) -> str:
     config = load_config()
     codex = discover_codex(config)
     if not codex:
@@ -2331,6 +2467,10 @@ def consult_codex(project: str | None, prompt: str, mode: str = "read-only", mod
         "--ephemeral",
         "-",
     ]
+    # Reasoning effort is a config key, NOT part of the model name — keeping it separate
+    # is what fixes the "--model 'gpt-5.5 xhigh'" class of failures.
+    if effort:
+        command[2:2] = ["-c", f"model_reasoning_effort={effort}"]
     if model_name:
         command[2:2] = ["--model", str(model_name)]
     code, stdout, stderr = run_process(command, project_info.root_path, sanitize_prompt(prompt))
@@ -2345,6 +2485,7 @@ def consult_claude(
     mode: str = "plan",
     model_name: str | None = None,
     workspace: str | None = None,
+    effort: str | None = None,
 ) -> str:
     config = load_config()
     claude = find_executable(config, "claude_path", ["claude", "claude.cmd", "claude.ps1"])
@@ -2366,6 +2507,10 @@ def consult_claude(
     claude_model = model_name or config.get("claude_model") or os.environ.get("CLAUDE_MODEL")
     if claude_model:
         command.extend(["--model", str(claude_model)])
+    # Reasoning effort is a separate CLI flag (low|medium|high|xhigh|max), never baked
+    # into --model.
+    if effort:
+        command.extend(["--effort", str(effort)])
     # Run in the per-topic workspace when given so the session buckets into its own
     # ~/.claude/projects folder; otherwise use the project root. When bucketing in a
     # workspace, still grant read access to the project via --add-dir so codebase
@@ -2488,7 +2633,13 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     token_budget = int(args.get("token_budget") or TASK_BUDGETS.get(task_kind, TASK_BUDGETS["consult"]))
     mode = str(args.get("mode") or ("plan" if model == "claude" else "read-only"))
     requested_model = args.get("target_model") or args.get("model_name") or args.get("model")
-    resolved_model = str(requested_model).strip() if requested_model else None
+    # Resolve the model (generic -> family flagship) and the reasoning effort
+    # (explicit arg > parsed from the model text > family default = highest available)
+    # in one place. This keeps effort OUT of the model string and gives a bare
+    # "codex"/"claude" the most-capable model at top effort by default.
+    resolved_model, effort = resolve_cli_model_and_effort(
+        model, requested_model, args.get("effort") or args.get("reasoning_effort")
+    )
     project_info = resolve_project(str(project_arg) if project_arg is not None else None)
     if task_kind != "consult" or args.get("include_task_contract", True) is not False:
         prompt = wrap_task_prompt(prompt, task_kind, token_budget)
@@ -2498,12 +2649,12 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     started_at = utc_now()
     try:
         if model == "codex":
-            response = consult_codex(project_info.root_path, prompt, mode, resolved_model)
+            response = consult_codex(project_info.root_path, prompt, mode, resolved_model, effort)
         elif model == "claude":
             claude_workspace = None
             if topic_arg and load_config().get("topic_workspaces", True):
                 claude_workspace = str(topic_workspace_dir(project_info, topic_arg))
-            response = consult_claude(project_info.root_path, prompt, mode, resolved_model, claude_workspace)
+            response = consult_claude(project_info.root_path, prompt, mode, resolved_model, claude_workspace, effort)
         elif model == "gemini":
             response = consult_gemini(project_info.root_path, prompt, mode, resolved_model)
         else:
@@ -2521,11 +2672,14 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         status = "error" if response.startswith(failure_prefixes) else "ok"
         error = response if status == "error" else None
         consulted_name = f"{model}:{resolved_model}" if resolved_model else model
+        if effort:
+            consulted_name += f" [{effort}]"
         store_consultation(project_info, consulted_name, mode, prompt, response, status, error, started_at)
         return {
             "project": project_info.name,
             "root_path": project_info.root_path,
             "model": consulted_name,
+            "effort": effort,
             "mode": mode,
             "status": status,
             "response": response,
@@ -4438,12 +4592,15 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
             "target_agent": target_agent,
             "target_model": target_model,
             # A model only mentioned in the prompt is a one-off; don't overwrite the
-            # stored topic default with it.
-            "remember_model": False if detected_model else args.get("remember_model", True),
+            # stored topic default with it. Explicit picks are also one-offs by default
+            # now (remember_model defaults False) so bare "codex"/"claude" later means
+            # "flagship", not "whatever was last routed".
+            "remember_model": False if detected_model else args.get("remember_model", False),
         }
     )
     if model_resolution.get("status") == "needs_model_selection":
         return model_resolution
+    resolved_effort = model_resolution.get("effort")
     if model_resolution.get("status") == "resolved":
         target_agent = model_resolution["target_agent"]
         target_model = model_resolution["target_model"]
@@ -4669,6 +4826,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "task_kind": task_kind,
                 "token_budget": token_budget,
                 "target_model": target_model,
+                "effort": resolved_effort,
             },
         )
         result["route"] = "codex_cli"
@@ -4688,6 +4846,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "task_kind": task_kind,
                 "token_budget": token_budget,
                 "target_model": target_model,
+                "effort": resolved_effort,
             },
         )
         result["route"] = "claude_code"
@@ -4707,6 +4866,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "task_kind": task_kind,
                 "token_budget": token_budget,
                 "target_model": target_model,
+                "effort": resolved_effort,
             },
         )
         result["route"] = "gemini_cli"
@@ -4730,7 +4890,7 @@ TOOLS = [
     },
     {
         "name": "consult_codex",
-        "description": "Ask Codex for read-only consultation on a project.",
+        "description": "Ask Codex for read-only consultation on a project. Defaults to the most capable Codex model (gpt-5.5) at highest reasoning effort (xhigh). Pass target_model for a specific model (e.g. 'gpt-5.4-mini') and effort to override.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4742,14 +4902,15 @@ TOOLS = [
                 "task_kind": {"type": "string"},
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
-                "target_model": {"type": "string"},
+                "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'gpt-5.5', 'gpt-5.4-mini'."},
+                "effort": {"type": "string", "description": "Reasoning effort: minimal|low|medium|high|xhigh ('extra high'/'max'/'ultra' => xhigh). Omit for highest available (default)."},
             },
             "required": ["prompt"],
         },
     },
     {
         "name": "consult_claude",
-        "description": "Ask Claude Code for consultation on a project. Defaults to plan permission mode.",
+        "description": "Ask Claude Code for consultation on a project. Defaults to plan permission mode and the most capable Claude model (opus) at highest reasoning effort (max). Pass target_model for a specific model (e.g. 'sonnet', 'fable', 'claude-fable-5') and effort to override.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4761,7 +4922,8 @@ TOOLS = [
                 "task_kind": {"type": "string"},
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
-                "target_model": {"type": "string"},
+                "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'opus', 'sonnet', 'fable'."},
+                "effort": {"type": "string", "description": "Reasoning effort: low|medium|high|xhigh|max ('extra high' => xhigh, 'ultra' => max). Omit for highest available (default)."},
             },
             "required": ["prompt"],
         },
@@ -4816,14 +4978,15 @@ TOOLS = [
     },
     {
         "name": "route_agent_task",
-        "description": "Route a task to Antigravity, Codex, Claude, or Gemini. SURFACE DEFAULTS: Codex/Claude default to the headless CLI (reliable, model-switchable, returns the answer inline); pass surface='extension' (or say 'in app'/'in the chat') to use the in-app IDE panel instead, or surface='app' for a visible desktop-app handoff. Gemini defaults to the Antigravity in-app automation (the Gemini CLI on Pro plans only serves lesser models); pass surface='cli' to force the standalone Gemini CLI. Antigravity-hosted models (e.g. Antigravity's Opus/Gemini) ALWAYS use Antigravity automation, never a CLI, and require naming a specific Antigravity model. KEEP `prompt` SHORT: write a brief instruction and let the receiver read the files/work-memory itself; do NOT inline large context — stash it with store_shared_context and pass the context_ref. Oversized prompts trip a token-economy notice (`prompt_notice`).",
+        "description": "Route a task to Antigravity, Codex, Claude, or Gemini. MODEL DEFAULTS: a bare family ('codex'/'gpt' or 'claude') uses that family's MOST CAPABLE model at the HIGHEST reasoning effort (Codex gpt-5.5/xhigh, Claude opus/max) — no prompt to pick. Name target_model for a specific model (e.g. 'sonnet', 'gpt-5.4-mini', 'fable') and it is honored; put reasoning effort in the 'effort' field, never in target_model. SURFACE DEFAULTS: Codex/Claude default to the headless CLI (reliable, model-switchable, returns the answer inline); pass surface='extension' (or say 'in app'/'in the chat') to use the in-app IDE panel instead, or surface='app' for a visible desktop-app handoff. Gemini defaults to the Antigravity in-app automation (the Gemini CLI on Pro plans only serves lesser models); pass surface='cli' to force the standalone Gemini CLI. Antigravity-hosted models (e.g. Antigravity's Opus/Gemini) ALWAYS use Antigravity automation, never a CLI, and require naming a specific Antigravity model. KEEP `prompt` SHORT: write a brief instruction and let the receiver read the files/work-memory itself; do NOT inline large context — stash it with store_shared_context and pass the context_ref. Oversized prompts trip a token-economy notice (`prompt_notice`).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": {"type": "string"},
                 "topic": {"type": "string"},
                 "target_agent": {"type": "string"},
-                "target_model": {"type": "string"},
+                "target_model": {"type": "string", "description": "Model only (e.g. 'opus', 'sonnet', 'gpt-5.5', 'gpt-5.4-mini'). A bare family ('codex'/'claude') routes to that family's most-capable model. Keep reasoning effort OUT of this string — use the 'effort' field."},
+                "effort": {"type": "string", "description": "Reasoning effort for CLI surfaces. Codex: minimal|low|medium|high|xhigh; Claude: low|medium|high|xhigh|max ('extra high' => xhigh, 'max'/'ultra' => family top). Omit for highest available (default)."},
                 "target_host": {
                     "type": "string",
                     "description": "IDE host to open for extension delivery, such as 'antigravity' or 'vscode'.",
