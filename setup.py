@@ -320,6 +320,35 @@ def antigravity_schema() -> str | None:
     return None
 
 
+def claude_desktop_installed() -> bool:
+    """True if the Claude DESKTOP app (the GUI/Cowork app, distinct from Claude Code)
+    is present. Covers all three install shapes so Store users aren't false-negatived:
+      - modern Microsoft Store / MSIX 'Cowork' build -> %APPDATA%/Claude data dir
+        (created on first launch), or a registered *Claude* AppX package
+      - legacy standalone installer                  -> %LOCALAPPDATA%/AnthropicClaude
+    The cheap filesystem checks handle the common case; the AppX probe (best effort,
+    Windows only) catches a Store package that's registered but never launched, so its
+    %APPDATA%/Claude dir doesn't exist yet."""
+    if CLAUDE_DESKTOP_CONFIG.parent.exists():  # %APPDATA%/Claude (modern Cowork/CCD)
+        return True
+    if (LOCALAPPDATA / "AnthropicClaude").exists():  # legacy standalone installer
+        return True
+    if os.name == "nt":
+        ps = shutil.which("powershell") or shutil.which("pwsh")
+        if ps:
+            try:
+                proc = subprocess.run(
+                    [ps, "-NoProfile", "-Command",
+                     "if (Get-AppxPackage -Name '*Claude*') { 'yes' } else { 'no' }"],
+                    text=True, capture_output=True, timeout=8, check=False,
+                )
+                if "yes" in (proc.stdout or "").lower():
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+    return False
+
+
 # --- detection -------------------------------------------------------------
 def detect() -> dict[str, dict]:
     hosts = {
@@ -340,7 +369,7 @@ def detect() -> dict[str, dict]:
             # hosts), but treat the app as installed when its %APPDATA%/Claude data dir exists
             # even before any mcpServers file is written (install will create/merge it then).
             "config": CLAUDE_DESKTOP_CONFIG if CLAUDE_DESKTOP_CONFIG.exists() else None,
-            "installed": CLAUDE_DESKTOP_CONFIG.parent.exists(),
+            "installed": claude_desktop_installed(),
         },
         "antigravity": {
             "label": "Antigravity IDE",
@@ -437,7 +466,7 @@ def register_claude_desktop(command: str, args: list[str], dry: bool) -> str:
     # chat was invisible to every other agent. Caveat (honest): the desktop app still can't
     # be READ on disk like Claude Code/Codex, and only contributes when it proactively
     # records. Only touch the config if the desktop app is actually installed.
-    if not CLAUDE_DESKTOP_CONFIG.parent.exists():
+    if not claude_desktop_installed():
         return "skipped (not installed)"
     return _register_json(CLAUDE_DESKTOP_CONFIG, "claude_desktop", command, args, dry)
 
