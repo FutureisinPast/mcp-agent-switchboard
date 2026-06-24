@@ -2,7 +2,11 @@
 
 **Claude/MCP context budget reduction.**
 
-This release targets the high MCP-context usage reported by Claude when Agent Switchboard is enabled.
+This is a focused follow-up to v1.0.2. It keeps the same cross-agent routing behavior, but cuts down the passive MCP context Claude carries when Agent Switchboard is enabled.
+
+> **If this saves your agent workflow, please star the repo so others can find it.**
+
+---
 
 ## Highlights
 
@@ -31,13 +35,15 @@ or by setting `"mcp_tool_profile": "full"` in `~/.agent-broker/config.json`.
 
 ## What's in this release
 
-- `agent-switchboard.exe` - the self-contained installer and MCP server.
-- `antigravity-agent-broker-bridge-1.0.0.vsix` - unchanged bridge extension, still embedded in the exe.
-- Source code.
+- **`agent-switchboard.exe`** - the self-contained installer **and** MCP server (recommended download).
+- **`antigravity-agent-broker-bridge-1.0.0.vsix`** *(optional)* - the bridge extension (unchanged from v1.0.0; still embedded in the exe).
+- **Source code** *(auto-attached by GitHub)*.
 
 ## Upgrading
 
-Run the new `agent-switchboard.exe` and choose **Install**, then restart Claude/Codex/IDE sessions so the updated MCP server and tool catalog are reloaded. Existing `~/.agent-broker` state is preserved.
+Run the new `agent-switchboard.exe` and choose **Install** (it backs up and re-registers as before), then **restart your MCP server / reload your IDE** so the updated broker and tool catalog are live. No data migration; existing `~/.agent-broker` state is preserved.
+
+---
 
 ## Compatibility & notes
 
@@ -47,4 +53,6 @@ Run the new `agent-switchboard.exe` and choose **Install**, then restart Claude/
 
 ## License
 
-PolyForm Noncommercial 1.0.0. See [LICENSE](LICENSE).
+PolyForm Noncommercial 1.0.0 - noncommercial use allowed with the required notice; commercial use needs a separate written license from FutureisinPast / ChartTrades. See [LICENSE](LICENSE).
+
+If this helped you, please star the repo so others can find it.
