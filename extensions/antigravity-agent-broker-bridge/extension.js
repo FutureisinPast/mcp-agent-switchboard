@@ -119,6 +119,9 @@ function config() {
     snapshotPolling: cfg.get('snapshotPolling', true),
     snapshotConsumer: cfg.get('snapshotConsumer', 'snapshot-bridge'),
     snapshotClaudeCapable: cfg.get('snapshotClaudeCapable', true),
+    claimCurrentWorkspaceOnly: cfg.get('claimCurrentWorkspaceOnly', true),
+    antigravityClaimMaxAgeMs: cfg.get('antigravityClaimMaxAgeMs', 10 * 60 * 1000),
+    snapshotClaimMaxAgeMs: cfg.get('snapshotClaimMaxAgeMs', 10 * 60 * 1000),
   };
 }
 
@@ -934,6 +937,16 @@ function currentProjectPath() {
   return folders.length ? folders[0].uri.fsPath : '';
 }
 
+function brokerClaimProjectScope() {
+  return config().claimCurrentWorkspaceOnly ? (currentProjectPath() || '*') : '*';
+}
+
+function secondsFromMs(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return '0';
+  return String(Math.max(1, Math.floor(n / 1000)));
+}
+
 async function sendSnapshotHeartbeat() {
   const now = Date.now();
   if (now - snapshotHeartbeat.at < 12000) return;
@@ -1001,7 +1014,15 @@ async function pollContextSnapshots() {
   if (!caps.length) return false;
   let result;
   try {
-    result = await runBroker(['snapshot-claim', config().snapshotConsumer, await snapshotHostKind(), caps.join(',')]);
+    const cfg = config();
+    result = await runBroker([
+      'snapshot-claim',
+      cfg.snapshotConsumer,
+      await snapshotHostKind(),
+      caps.join(','),
+      brokerClaimProjectScope(),
+      secondsFromMs(cfg.snapshotClaimMaxAgeMs),
+    ]);
   } catch (err) {
     log(`snapshot-claim failed: ${err.message || err}`);
     return false;
@@ -1049,7 +1070,12 @@ async function pollOnce() {
     await pollClaudeInbox();
     let claimed = false;
     if (await hasAntigravitySendCommand()) {
-      const result = await runBroker(['claim', 'antigravity-extension']);
+      const result = await runBroker([
+        'claim',
+        'antigravity-extension',
+        brokerClaimProjectScope(),
+        secondsFromMs(cfg.antigravityClaimMaxAgeMs),
+      ]);
       if (result.status === 'claimed' && result.request) {
         claimed = true;
         await sendToAntigravity(result.request);

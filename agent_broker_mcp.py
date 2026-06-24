@@ -34,7 +34,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.3"
+BROKER_VERSION = "1.0.4"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -84,6 +84,7 @@ DEFAULT_WORK_MEMORY_BUDGET_CHARS = _env_int("AGENT_BROKER_WORK_MEMORY_BUDGET_CHA
 DEFAULT_SNAPSHOT_TOKENS = _env_int("AGENT_BROKER_SNAPSHOT_TOKENS", 300)
 DEFAULT_SNAPSHOT_TURNS = _env_int("AGENT_BROKER_SNAPSHOT_TURNS", 4)
 DEFAULT_CONSULT_RESPONSE_CHARS = _env_int("AGENT_BROKER_CONSULT_RESPONSE_CHARS", 5000)
+DEFAULT_BRIDGE_CLAIM_MAX_AGE_SECONDS = _env_int("AGENT_BROKER_CLAIM_MAX_AGE_SECONDS", 600)
 COMPACT_JSON_RESULTS = _env_bool("AGENT_BROKER_COMPACT_JSON_RESULTS", True)
 _MCP_CLIENT_NAME = ""
 
@@ -695,6 +696,20 @@ def resolve_project(project: str | None) -> ProjectInfo:
         return ProjectInfo(raw, str(Path.cwd()))
     root = Path.cwd().resolve()
     return ProjectInfo(normalize_project_name(root), str(root))
+
+
+def optional_project_scope(project: str | None) -> ProjectInfo | None:
+    raw = str(project or "").strip()
+    if not raw or raw == "*":
+        return None
+    return resolve_project(raw)
+
+
+def age_cutoff_iso(max_age_seconds: Any = None) -> str | None:
+    seconds = DEFAULT_BRIDGE_CLAIM_MAX_AGE_SECONDS if max_age_seconds is None else int(max_age_seconds or 0)
+    if seconds <= 0:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds))
 
 
 def register_project(name: str, root_path: str) -> dict[str, Any]:
@@ -3237,23 +3252,44 @@ def queue_antigravity_request(
     }
 
 
-def claim_antigravity_request(consumer: str = "antigravity-bridge") -> dict[str, Any]:
+def claim_antigravity_request(
+    consumer: str = "antigravity-bridge",
+    project: str | None = None,
+    max_age_seconds: Any = None,
+) -> dict[str, Any]:
     init_db()
     now = utc_now()
+    scope = optional_project_scope(project)
+    cutoff = age_cutoff_iso(max_age_seconds)
+    clauses = ["status = 'queued'"]
+    params: list[Any] = []
+    if scope:
+        clauses.append("(lower(project) = lower(?) OR root_path = ?)")
+        params.extend([scope.name, scope.root_path])
+    if cutoff:
+        clauses.append("created_at >= ?")
+        params.append(cutoff)
+    where = " AND ".join(clauses)
     with db_connect() as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            """
+            f"""
             SELECT * FROM antigravity_requests
-            WHERE status = 'queued'
+            WHERE {where}
             ORDER BY created_at ASC
             LIMIT 1
-            """
+            """,
+            params,
         ).fetchone()
         if not row:
             conn.commit()
-            return {"status": "empty"}
+            return {
+                "status": "empty",
+                "scope_project": scope.name if scope else "*",
+                "scope_root_path": scope.root_path if scope else None,
+                "max_age_seconds": int(max_age_seconds or DEFAULT_BRIDGE_CLAIM_MAX_AGE_SECONDS),
+            }
         conn.execute(
             """
             UPDATE antigravity_requests
@@ -5197,6 +5233,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "consumer": {"type": "string"},
+                "project": {"type": "string"},
+                "max_age_seconds": {"type": "integer"},
             },
         },
     },
@@ -5472,6 +5510,8 @@ TOOLS = [
                 "consumer": {"type": "string"},
                 "host": {"type": "string"},
                 "capabilities": {"type": "array", "items": {"type": "string"}},
+                "project": {"type": "string"},
+                "max_age_seconds": {"type": "integer"},
             },
         },
     },
@@ -6349,7 +6389,11 @@ def request_context_snapshot(
 
 
 def claim_context_snapshot_request(
-    consumer: str = "snapshot-bridge", host: str | None = None, capabilities: Any = None
+    consumer: str = "snapshot-bridge",
+    host: str | None = None,
+    capabilities: Any = None,
+    project: str | None = None,
+    max_age_seconds: Any = None,
 ) -> dict[str, Any]:
     """A bridge host claims the oldest queued snapshot request it can actually serve.
     capabilities is the set of target families/surfaces this host can reach."""
@@ -6362,6 +6406,17 @@ def claim_context_snapshot_request(
     now = utc_now()
     ttl = _env_int("AGENT_BROKER_SNAPSHOT_CLAIM_TTL_SECONDS", 120)
     stale_cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - ttl))
+    scope = optional_project_scope(project)
+    claim_cutoff = age_cutoff_iso(max_age_seconds)
+    clauses = ["status = 'queued'"]
+    params: list[Any] = []
+    if scope:
+        clauses.append("(lower(project) = lower(?) OR root_path = ?)")
+        params.extend([scope.name, scope.root_path])
+    if claim_cutoff:
+        clauses.append("created_at >= ?")
+        params.append(claim_cutoff)
+    where = " AND ".join(clauses)
     with db_connect() as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
@@ -6373,7 +6428,8 @@ def claim_context_snapshot_request(
             (stale_cutoff,),
         )
         rows = conn.execute(
-            "SELECT * FROM context_snapshot_requests WHERE status = 'queued' ORDER BY created_at ASC LIMIT 20"
+            f"SELECT * FROM context_snapshot_requests WHERE {where} ORDER BY created_at ASC LIMIT 20",
+            params,
         ).fetchall()
         chosen = None
         for r in rows:
@@ -6534,7 +6590,13 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "get_model_defaults":
         return text_content(get_model_defaults(args.get("project"), args.get("topic")))
     if name == "claim_antigravity_request":
-        return text_content(claim_antigravity_request(str(args.get("consumer") or "antigravity-bridge")))
+        return text_content(
+            claim_antigravity_request(
+                str(args.get("consumer") or "antigravity-bridge"),
+                args.get("project"),
+                args.get("max_age_seconds"),
+            )
+        )
     if name == "complete_antigravity_request":
         return text_content(
             complete_antigravity_request(
@@ -6653,7 +6715,12 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             int(args.get("max_tokens") or 0) or None, args.get("prefer_cached_age")))
     if name == "claim_context_snapshot_request":
         return text_content(claim_context_snapshot_request(
-            str(args.get("consumer") or "snapshot-bridge"), args.get("host"), args.get("capabilities")))
+            str(args.get("consumer") or "snapshot-bridge"),
+            args.get("host"),
+            args.get("capabilities"),
+            args.get("project"),
+            args.get("max_age_seconds"),
+        ))
     if name == "complete_context_snapshot_request":
         return text_content(complete_context_snapshot_request(
             str(args.get("request_id") or ""), str(args.get("source_surface") or "unknown"),
@@ -7087,7 +7154,7 @@ def handle_bridge_cli(argv: list[str]) -> int:
     if not argv or argv[0] in {"help", "-h", "--help"}:
         print(
             "Usage: agent_broker_mcp.py bridge "
-            "(claim [consumer] | requests [project] [limit] | queue <project> <topic> <target_model> <prompt> | "
+            "(claim [consumer] [project] [max_age_seconds] | requests [project] [limit] | queue <project> <topic> <target_model> <prompt> | "
             "route <project> <topic> <target_agent> <target_model> <task_kind> <prompt> | "
             "requeue <request_id> | await-model <request_id> | resume-model [request_id] | awaiting-model [project] [limit] | "
             "complete <request_id> <model> <response> | complete-file <request_id> <model> <path> | "
@@ -7105,7 +7172,7 @@ def handle_bridge_cli(argv: list[str]) -> int:
             "model-defaults [project] [topic] | topic-status [project] [topic] | "
             "compact-topic [project] [topic] [budget_tokens] | "
             "snapshot-request <project> <topic> <target_agent> [target_model] [question] | "
-            "snapshot-claim [consumer] [host] [capabilities-csv] | "
+            "snapshot-claim [consumer] [host] [capabilities-csv] [project] [max_age_seconds] | "
             "snapshot-complete <request_id> <source_surface> <model> <response> [confidence] | "
             "snapshot-complete-file <request_id> <source_surface> <path> [model] | snapshot-release <request_id> | "
             "snapshot-latest [project] [topic] [target_agent] | live-surfaces [project] [max_age] | "
@@ -7122,7 +7189,11 @@ def handle_bridge_cli(argv: list[str]) -> int:
             print(render_doctor(report))
         return 0
     if command == "claim":
-        result = claim_antigravity_request(argv[1] if len(argv) > 1 else "antigravity-bridge")
+        result = claim_antigravity_request(
+            argv[1] if len(argv) > 1 else "antigravity-bridge",
+            argv[2] if len(argv) > 2 else None,
+            argv[3] if len(argv) > 3 else None,
+        )
     elif command == "requests":
         project = argv[1] if len(argv) > 1 else None
         limit = int(argv[2]) if len(argv) > 2 else 20
@@ -7323,7 +7394,9 @@ def handle_bridge_cli(argv: list[str]) -> int:
         consumer = argv[1] if len(argv) > 1 else "snapshot-bridge"
         host = argv[2] if len(argv) > 2 and argv[2] != "*" else None
         caps = argv[3] if len(argv) > 3 else None
-        result = claim_context_snapshot_request(consumer, host, caps)
+        project = argv[4] if len(argv) > 4 and argv[4] != "*" else None
+        max_age_seconds = argv[5] if len(argv) > 5 else None
+        result = claim_context_snapshot_request(consumer, host, caps, project, max_age_seconds)
     elif command == "snapshot-complete":
         if len(argv) < 5:
             raise ValueError("snapshot-complete requires <request_id> <source_surface> <model> <response> [confidence]")

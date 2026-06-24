@@ -2,7 +2,7 @@
   "name": "antigravity-agent-broker-bridge",
   "displayName": "Agent Switchboard Bridge",
   "description": "Routes queued Agent Broker requests into Antigravity's in-app agent panel.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "futureisinpast",
   "license": "PolyForm-Noncommercial-1.0.0",
   "engines": {
@@ -180,6 +180,23 @@
           "default": 600000,
           "minimum": 0,
           "description": "On extension startup, process Claude inbox files newer than this age instead of treating them as stale."
+        },
+        "agentBrokerBridge.claimCurrentWorkspaceOnly": {
+          "type": "boolean",
+          "default": true,
+          "description": "Only claim Antigravity/snapshot broker work for the currently open workspace. Prevents unrelated windows from picking up global queued tasks."
+        },
+        "agentBrokerBridge.antigravityClaimMaxAgeMs": {
+          "type": "number",
+          "default": 600000,
+          "minimum": 0,
+          "description": "Only auto-send queued Antigravity requests newer than this age. Zero disables the age guard."
+        },
+        "agentBrokerBridge.snapshotClaimMaxAgeMs": {
+          "type": "number",
+          "default": 600000,
+          "minimum": 0,
+          "description": "Only claim context snapshot requests newer than this age. Zero disables the age guard."
         }
       }
     }

@@ -172,6 +172,11 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.4 (Antigravity bridge claim isolation)
+- **Antigravity bridge claims are now workspace-scoped and fresh-only by default.** The bridge passes its current workspace root when claiming queued Antigravity work, and ignores queued work older than 10 minutes unless configured otherwise. This prevents an unrelated Antigravity window/chat from waking up for stale or cross-project broker tasks.
+- **Context snapshot claims use the same isolation.** Live bridge hosts now claim snapshot requests only for the active workspace and within the freshness window, so snapshot polling cannot route another project’s request into the visible Antigravity panel.
+- **Bridge settings added:** `claimCurrentWorkspaceOnly`, `antigravityClaimMaxAgeMs`, and `snapshotClaimMaxAgeMs`. Bridge extension version is now `1.0.1`.
+
 ### v1.0.3 (Claude/MCP context budget reduction)
 - **Claude gets a lite MCP catalog by default.** When the MCP client identifies as Claude, `tools/list` now returns 12 compact user-facing tools instead of the full 36-tool bridge/internal catalog. Set `AGENT_BROKER_TOOL_PROFILE=full` or `mcp_tool_profile: "full"` if a client needs every internal bridge tool.
 - **Tool results are summary-first.** MCP JSON results are compact by default, `get_consultation_history` now returns bounded summaries unless `include_raw=true`, and long consult responses return an excerpt plus `response_ref` for explicit retrieval.
