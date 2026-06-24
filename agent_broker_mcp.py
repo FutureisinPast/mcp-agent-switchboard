@@ -349,6 +349,7 @@ GENERIC_GROUND_RULES = [
     "Read `Topic Work Memory` before broad files/history when continuing another model's work.",
     "Expand only specific files/history/events that are needed to answer.",
     "Do not repeat full context back to the caller.",
+    "Do not schedule follow-up chat turns or background wait/poll timers. If work is still running, report the current status and stop unless the user explicitly requested monitoring.",
     "When finished, return your answer by calling `respond_to_request` with this Request ID (and your model name) so it lands in the broker ledger -- do NOT make the user copy-paste your reply from the chat. If broker tools are unavailable, write the answer under `## Answer for <request-id>` so it can be ingested.",
     "After meaningful planning, edits, audits, or handoffs, call `record_work_memory` with what changed, where, why, checks, risks, and next step.",
     "Record important evidence as context events when tools are available.",
@@ -2422,6 +2423,7 @@ def task_contract_text(task_kind: str, token_budget: int | None = None, compact:
         rules_path = ensure_ground_rules_file()
         return (
             f"[Agent Switchboard] task={kind} | budget ~{budget}w. {essence} "
+            f"Do not schedule follow-up chat turns or background wait/poll timers; report current status and stop if work is still running. "
             f"When done, return your answer via respond_to_request(this Request ID) -- don't make the user relay it. "
             f"Full ground rules: {rules_path} (read once; not re-sent each message)."
         )

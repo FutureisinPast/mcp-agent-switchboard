@@ -159,6 +159,11 @@
           "minimum": 0,
           "description": "Delay before pressing Enter after Antigravity fills the agent panel composer."
         },
+        "agentBrokerBridge.preventAntigravityBackgroundTimers": {
+          "type": "boolean",
+          "default": true,
+          "description": "Add a one-shot guard to broker-delivered Antigravity prompts so the in-app agent does not create scheduled follow-up turns, wait loops, or background timers after the handoff is complete."
+        },
         "agentBrokerBridge.claudeUseTopicSession": {
           "type": "boolean",
           "default": true,

@@ -112,6 +112,7 @@ function config() {
     strictModelAutoResumeDelayMs: cfg.get('strictModelAutoResumeDelayMs', 0),
     antigravityAutoSubmit: cfg.get('antigravityAutoSubmit', true),
     antigravityAutoSubmitDelayMs: cfg.get('antigravityAutoSubmitDelayMs', 1800),
+    preventAntigravityBackgroundTimers: cfg.get('preventAntigravityBackgroundTimers', true),
     claudeUseTopicSession: cfg.get('claudeUseTopicSession', true),
     claudeAutoSubmit: cfg.get('claudeAutoSubmit', true),
     claudeAutoSubmitDelayMs: cfg.get('claudeAutoSubmitDelayMs', 1200),
@@ -225,6 +226,7 @@ function taskContract(request) {
     '- If the context pack includes context_ref markers, retrieve only the specific ref/query you need instead of asking for broad history.',
     '- For vague model requests, call resolve_model_request first. If it returns needs_model_selection, ask the user to choose from the returned choices and remember that choice with set_model_default.',
     '- Reuse the remembered model default for this topic until the user explicitly asks to change it.',
+    '- Do not schedule follow-up chat turns or background wait/poll timers. If work is still running, report the current status and stop unless the user explicitly requested monitoring.',
     '- Do not repeat full context back to the caller.',
     '- Record important findings as context events when tools are available.',
   ].join('\n');
@@ -344,6 +346,9 @@ function buildPrompt(request) {
   const fallbackPath = responsePath(request);
   const contextPack = request.context_pack || '';
   const strictModel = Number(request.strict_model || 0) === 1;
+  const oneShotGuard = config().preventAntigravityBackgroundTimers
+    ? 'One-shot delivery rule: do not create Antigravity scheduled tasks, background timers, wait loops, or delayed follow-up chat turns for this broker request. Run only what can complete in this turn; if a deployment/test/tool is still pending, write the current status, complete the broker request, and stop.'
+    : '';
   return [
     '# Agent Broker Request',
     '',
@@ -358,6 +363,7 @@ function buildPrompt(request) {
     `Token budget: ${request.token_budget || 2500}`,
     '',
     'You are responding from inside Antigravity using the currently selected in-app model and the user subscription. Keep this on the same topic and use the project context when needed.',
+    oneShotGuard,
     '',
     strictModel
       ? 'First confirm the visible selected model name. If it does not match the requested target model, STOP. Do not perform the task under the wrong model. Write a short mismatch response to the fallback file and include a Codex Callback asking Codex to requeue after the user selects the target model.'
