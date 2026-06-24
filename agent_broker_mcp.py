@@ -34,7 +34,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.2"
+BROKER_VERSION = "1.0.3"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -54,14 +54,38 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_bool_value(value: Any, default: bool = False) -> bool:
+    if value is None or str(value).strip() == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
 DEFAULT_TIMEOUT_SECONDS = _env_int("AGENT_BROKER_TIMEOUT_SECONDS", 600)
-DEFAULT_CONTEXT_BUDGET = _env_int("AGENT_BROKER_CONTEXT_BUDGET", 8000)
+DEFAULT_CONTEXT_BUDGET = _env_int("AGENT_BROKER_CONTEXT_BUDGET", 2400)
 SHARED_CONTEXT_THRESHOLD_CHARS = _env_int("AGENT_BROKER_CONTEXT_THRESHOLD_CHARS", 1200)
 SHARED_CONTEXT_INLINE_CHARS = _env_int("AGENT_BROKER_CONTEXT_INLINE_CHARS", 700)
 # A routed handoff prompt over this many tokens trips a token-economy nudge: the broker
 # stashes the full prompt as a context_ref and warns the caller to send a short
 # instruction + ref instead of inlining context the receiver can read itself.
 PROMPT_SOFT_LIMIT_TOKENS = _env_int("AGENT_BROKER_PROMPT_SOFT_LIMIT_TOKENS", 600)
+DEFAULT_HISTORY_LIMIT = _env_int("AGENT_BROKER_HISTORY_LIMIT", 5)
+DEFAULT_HISTORY_TEXT_CHARS = _env_int("AGENT_BROKER_HISTORY_TEXT_CHARS", 420)
+DEFAULT_WORK_MEMORY_LIMIT = _env_int("AGENT_BROKER_WORK_MEMORY_LIMIT", 5)
+DEFAULT_WORK_MEMORY_BUDGET_CHARS = _env_int("AGENT_BROKER_WORK_MEMORY_BUDGET_CHARS", 2600)
+DEFAULT_SNAPSHOT_TOKENS = _env_int("AGENT_BROKER_SNAPSHOT_TOKENS", 300)
+DEFAULT_SNAPSHOT_TURNS = _env_int("AGENT_BROKER_SNAPSHOT_TURNS", 4)
+DEFAULT_CONSULT_RESPONSE_CHARS = _env_int("AGENT_BROKER_CONSULT_RESPONSE_CHARS", 5000)
+COMPACT_JSON_RESULTS = _env_bool("AGENT_BROKER_COMPACT_JSON_RESULTS", True)
+_MCP_CLIENT_NAME = ""
 
 SECRET_NAMES = {
     ".env",
@@ -2678,24 +2702,54 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         if effort:
             consulted_name += f" [{effort}]"
         store_consultation(project_info, consulted_name, mode, prompt, response, status, error, started_at)
-        return {
+        max_response_chars = max(800, min(int(args.get("max_response_chars") or DEFAULT_CONSULT_RESPONSE_CHARS), 40000))
+        response_ref = None
+        response_payload = response
+        response_truncated = False
+        if len(response or "") > max_response_chars:
+            response_truncated = True
+            response_payload = compact_text(response, max_response_chars)
+            try:
+                response_ref = store_shared_context(
+                    project_info.name,
+                    topic_arg,
+                    response,
+                    f"consultation:{consulted_name}",
+                    "consultation_response",
+                    max_response_chars,
+                ).get("ref")
+            except Exception as exc:  # noqa: BLE001
+                log(f"consult response stash failed: {exc}")
+        result = {
             "project": project_info.name,
             "root_path": project_info.root_path,
             "model": consulted_name,
             "effort": effort,
             "mode": mode,
             "status": status,
-            "response": response,
+            "response": response_payload,
         }
+        if response_truncated:
+            result["response_truncated"] = True
+            result["response_chars"] = len(response or "")
+            result["response_ref"] = response_ref
+            result["note"] = "Long response was stored locally; use retrieve_shared_context(response_ref, query) for exact details."
+        return result
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
         store_consultation(project_info, model, mode, prompt, "", "error", error, started_at)
         raise
 
 
-def get_history(project: str | None, limit: int = 20) -> dict[str, Any]:
+def get_history(
+    project: str | None,
+    limit: int | None = None,
+    include_raw: bool = False,
+    max_text_chars: int | None = None,
+) -> dict[str, Any]:
     init_db()
-    limit = max(1, min(int(limit or 20), 100))
+    limit = max(1, min(int(limit or DEFAULT_HISTORY_LIMIT), 100))
+    text_limit = max(120, min(int(max_text_chars or DEFAULT_HISTORY_TEXT_CHARS), 20000))
     project_info = resolve_project(project)
     with db_connect() as conn:
         conn.row_factory = sqlite3.Row
@@ -2710,7 +2764,47 @@ def get_history(project: str | None, limit: int = 20) -> dict[str, Any]:
             """,
             (project_info.name, project_info.root_path, limit),
         ).fetchall()
-    return {"project": project_info.name, "items": [dict(row) for row in rows]}
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        prompt = row["prompt"] or ""
+        response = row["response"] or ""
+        error = row["error"] or ""
+        item = {
+            "id": row["id"],
+            "project": row["project"],
+            "root_path": row["root_path"],
+            "branch": row["branch"],
+            "commit_sha": row["commit_sha"],
+            "caller": row["caller"],
+            "consulted_model": row["consulted_model"],
+            "mode": row["mode"],
+            "status": row["status"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "prompt_chars": len(prompt),
+            "response_chars": len(response),
+            "error_chars": len(error),
+        }
+        if include_raw:
+            item["prompt"] = compact_text(prompt, text_limit)
+            item["response"] = compact_text(response, text_limit)
+            item["error"] = compact_text(error, text_limit) if error else None
+            item["text_limit_chars"] = text_limit
+            item["truncated"] = (
+                len(prompt) > text_limit or len(response) > text_limit or len(error) > text_limit
+            )
+        else:
+            item["prompt_excerpt"] = compact_text(prompt, text_limit)
+            item["response_excerpt"] = compact_text(response or error, text_limit)
+        items.append(item)
+    return {
+        "project": project_info.name,
+        "limit": limit,
+        "include_raw": include_raw,
+        "text_limit_chars": text_limit,
+        "items": items,
+        "note": "History is summary-first by default; pass include_raw=true and max_text_chars for larger excerpts.",
+    }
 
 
 def context_pack_path(project_info: ProjectInfo, topic: str | None) -> Path:
@@ -2736,10 +2830,10 @@ def coerce_string_list(value: Any) -> list[str]:
 def topic_work_memory_section(
     project_info: ProjectInfo,
     topic: str | None,
-    limit: int = 10,
-    budget_chars: int = 5000,
+    limit: int = DEFAULT_WORK_MEMORY_LIMIT,
+    budget_chars: int = DEFAULT_WORK_MEMORY_BUDGET_CHARS,
 ) -> str:
-    limit = max(1, min(int(limit or 10), 50))
+    limit = max(1, min(int(limit or DEFAULT_WORK_MEMORY_LIMIT), 50))
     params: list[Any] = [project_info.name, project_info.root_path]
     topic_filter = ""
     if topic:
@@ -2809,10 +2903,17 @@ def topic_work_memory_section(
     return "\n".join(lines).strip() + "\n"
 
 
-def get_work_memory(project: str | None, topic: str | None = None, limit: int = 10) -> dict[str, Any]:
+def get_work_memory(
+    project: str | None,
+    topic: str | None = None,
+    limit: int | None = None,
+    budget_chars: int | None = None,
+) -> dict[str, Any]:
     init_db()
     project_info = resolve_project(project)
-    content = topic_work_memory_section(project_info, topic, limit, 8000)
+    row_limit = max(1, min(int(limit or DEFAULT_WORK_MEMORY_LIMIT), 50))
+    char_budget = max(600, min(int(budget_chars or DEFAULT_WORK_MEMORY_BUDGET_CHARS), 12000))
+    content = topic_work_memory_section(project_info, topic, row_limit, char_budget)
     path = work_memory_path(project_info, topic)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -2820,7 +2921,8 @@ def get_work_memory(project: str | None, topic: str | None = None, limit: int = 
         "project": project_info.name,
         "root_path": project_info.root_path,
         "topic": topic,
-        "limit": max(1, min(int(limit or 10), 50)),
+        "limit": row_limit,
+        "budget_chars": char_budget,
         "path": str(path),
         "content": content,
     }
@@ -4830,6 +4932,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "token_budget": token_budget,
                 "target_model": target_model,
                 "effort": resolved_effort,
+                "max_response_chars": args.get("max_response_chars"),
             },
         )
         result["route"] = "codex_cli"
@@ -4850,6 +4953,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "token_budget": token_budget,
                 "target_model": target_model,
                 "effort": resolved_effort,
+                "max_response_chars": args.get("max_response_chars"),
             },
         )
         result["route"] = "claude_code"
@@ -4870,6 +4974,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "token_budget": token_budget,
                 "target_model": target_model,
                 "effort": resolved_effort,
+                "max_response_chars": args.get("max_response_chars"),
             },
         )
         result["route"] = "gemini_cli"
@@ -4905,6 +5010,7 @@ TOOLS = [
                 "task_kind": {"type": "string"},
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
+                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 40000},
                 "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'gpt-5.5', 'gpt-5.4-mini'."},
                 "effort": {"type": "string", "description": "Reasoning effort: minimal|low|medium|high|xhigh ('extra high'/'max'/'ultra' => xhigh). Omit for highest available (default)."},
             },
@@ -4925,6 +5031,7 @@ TOOLS = [
                 "task_kind": {"type": "string"},
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
+                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 40000},
                 "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'opus', 'sonnet', 'fable'."},
                 "effort": {"type": "string", "description": "Reasoning effort: low|medium|high|xhigh|max ('extra high' => xhigh, 'ultra' => max). Omit for highest available (default)."},
             },
@@ -4945,6 +5052,7 @@ TOOLS = [
                 "task_kind": {"type": "string"},
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
+                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 40000},
                 "target_model": {"type": "string"},
             },
             "required": ["prompt"],
@@ -4958,6 +5066,8 @@ TOOLS = [
             "properties": {
                 "project": {"type": "string"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "include_raw": {"type": "boolean"},
+                "max_text_chars": {"type": "integer", "minimum": 120, "maximum": 20000},
             },
         },
     },
@@ -5021,6 +5131,7 @@ TOOLS = [
                 "strict_model": {"type": "boolean"},
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "mode": {"type": "string"},
+                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 40000},
                 "prompt": {"type": "string"},
             },
             "required": ["prompt"],
@@ -5151,6 +5262,7 @@ TOOLS = [
                 "project": {"type": "string"},
                 "topic": {"type": "string"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                "budget_chars": {"type": "integer", "minimum": 600, "maximum": 12000},
             },
         },
     },
@@ -5390,6 +5502,7 @@ TOOLS = [
                 "target_agent": {"type": "string"},
                 "target_model": {"type": "string"},
                 "max_age_seconds": {"type": "integer"},
+                "max_tokens": {"type": "integer", "minimum": 120, "maximum": 4000},
             },
             "required": ["project"],
         },
@@ -5425,11 +5538,110 @@ TOOLS = [
 ]
 
 
+CLAUDE_LITE_TOOL_NAMES = {
+    "consult_codex",
+    "consult_gemini",
+    "route_agent_task",
+    "list_agent_models",
+    "get_consultation_history",
+    "get_work_memory",
+    "get_context_pack",
+    "retrieve_shared_context",
+    "request_context_snapshot",
+    "get_latest_context_snapshot",
+    "list_live_surfaces",
+    "respond_to_request",
+}
+
+PUBLIC_TOOL_NAMES = CLAUDE_LITE_TOOL_NAMES | {
+    "register_project",
+    "consult_claude",
+    "resolve_model_request",
+    "set_model_default",
+    "get_model_defaults",
+    "record_agent_event",
+    "get_topic_timeline",
+    "record_work_memory",
+    "get_topic_status",
+    "compact_topic",
+    "store_shared_context",
+    "get_shared_context_stats",
+    "get_chat_bootstrap",
+    "record_context_event",
+    "get_request_ledger",
+}
+
+COMPACT_TOOL_DESCRIPTIONS = {
+    "consult_codex": "Ask Codex for a bounded consultation. Long answers return an excerpt plus response_ref.",
+    "consult_claude": "Ask Claude Code for a bounded consultation. Long answers return an excerpt plus response_ref.",
+    "consult_gemini": "Ask Gemini through the configured CLI/API. Long answers return an excerpt plus response_ref.",
+    "route_agent_task": "Route a short task to Codex, Claude, Gemini, or Antigravity. Keep prompt brief; use refs for large context.",
+    "list_agent_models": "List detected models and remembered defaults.",
+    "get_consultation_history": "Return recent consultation summaries. Pass include_raw=true only when excerpts are needed.",
+    "get_work_memory": "Return the compact per-topic continuation log.",
+    "get_context_pack": "Return a compact project/topic context pack.",
+    "retrieve_shared_context": "Retrieve stored large context by ref, optionally filtered by query.",
+    "request_context_snapshot": "Request a compact snapshot of another open agent session.",
+    "get_latest_context_snapshot": "Read the latest completed snapshot, capped by max_tokens.",
+    "list_live_surfaces": "List recent bridge heartbeats and capabilities.",
+    "respond_to_request": "Attach a finished answer to a queued broker request.",
+    "get_request_ledger": "Return the per-topic request ledger.",
+    "store_shared_context": "Store large context locally and return a compact ref.",
+    "compact_topic": "Compact topic state and return a retrievable ref.",
+}
+
+
+def current_tool_profile() -> str:
+    configured = os.environ.get("AGENT_BROKER_TOOL_PROFILE")
+    if not configured:
+        try:
+            configured = str(load_config().get("mcp_tool_profile") or "")
+        except Exception:  # noqa: BLE001
+            configured = ""
+    profile = configured.strip().lower()
+    if profile:
+        return profile
+    if "claude" in _MCP_CLIENT_NAME.lower():
+        return "lite"
+    return "full"
+
+
+def _copy_tool(tool: dict[str, Any], compact: bool) -> dict[str, Any]:
+    result = json.loads(json.dumps(tool, ensure_ascii=False))
+    if compact:
+        name = str(result.get("name") or "")
+        desc = COMPACT_TOOL_DESCRIPTIONS.get(name) or str(result.get("description") or "")
+        if len(desc) > 180:
+            desc = compact_text(desc, 180)
+        result["description"] = desc
+    return result
+
+
+def tools_for_current_client() -> list[dict[str, Any]]:
+    profile = current_tool_profile()
+    if profile in {"lite", "claude", "claude-lite"}:
+        names = CLAUDE_LITE_TOOL_NAMES
+        compact = True
+    elif profile in {"public", "slim"}:
+        names = PUBLIC_TOOL_NAMES
+        compact = True
+    elif profile in {"compact", "all-compact"}:
+        names = None
+        compact = True
+    else:
+        names = None
+        compact = False
+    return [_copy_tool(tool, compact) for tool in TOOLS if names is None or tool.get("name") in names]
+
+
 def text_content(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         text = value
     else:
-        text = json.dumps(value, ensure_ascii=False, indent=2)
+        if COMPACT_JSON_RESULTS:
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        else:
+            text = json.dumps(value, ensure_ascii=False, indent=2)
     return {"content": [{"type": "text", "text": text}]}
 
 
@@ -5950,9 +6162,11 @@ def get_latest_context_snapshot(
     target_agent: str | None = None,
     target_model: str | None = None,
     max_age_seconds: Any = None,
+    max_tokens: Any = None,
 ) -> dict[str, Any]:
     init_db()
     project_info = resolve_project(project)
+    content_chars = max(480, min(int(max_tokens or DEFAULT_SNAPSHOT_TOKENS) * 4, 16000))
     clauses = ["(lower(project) = lower(?) OR root_path = ?)", "status = 'completed'"]
     params: list[Any] = [project_info.name, project_info.root_path]
     if topic:
@@ -5974,6 +6188,12 @@ def get_latest_context_snapshot(
     snap = dict(row)
     age = _snapshot_age_seconds(snap["created_at"])
     snap["age_seconds"] = age
+    content = str(snap.get("content") or "")
+    snap["content_chars"] = len(content)
+    if len(content) > content_chars:
+        snap["content"] = compact_text(content, content_chars)
+        snap["content_truncated"] = True
+        snap["content_limit_chars"] = content_chars
     if max_age_seconds:
         snap["fresh"] = age is not None and age <= int(max_age_seconds)
     return {"status": "found", "snapshot": snap}
@@ -6073,7 +6293,7 @@ def request_context_snapshot(
     now = utc_now()
     created_by = os.environ.get("AGENT_BROKER_CALLER") or "mcp-client"
     fam = model_family_for(target_agent, target_model)
-    mtok = max(120, int(max_tokens or 600))
+    mtok = max(120, min(int(max_tokens or DEFAULT_SNAPSHOT_TOKENS), 4000))
     if prefer_cached_age:
         cached = get_latest_context_snapshot(project_info.name, topic, target_agent, target_model, prefer_cached_age)
         if cached.get("status") == "found" and cached["snapshot"].get("fresh"):
@@ -6097,13 +6317,13 @@ def request_context_snapshot(
     # Both Codex and Claude Code persist their live sessions to disk, so the broker can
     # read the recent turns and complete the snapshot immediately for either family.
     if fam == "codex":
-        snap = codex_rollout_snapshot(project_info, topic, last_n=8, max_chars=mtok * 4)
+        snap = codex_rollout_snapshot(project_info, topic, last_n=DEFAULT_SNAPSHOT_TURNS, max_chars=mtok * 4)
         if snap:
             done = complete_context_snapshot_request(rid, "codex_rollout_file", snap.get("model"), snap["content"], "ok", "medium")
             return {"status": "completed", "request_id": rid, "source_surface": "codex_rollout_file",
                     "snapshot_id": done.get("snapshot_id"), "snapshot": snap}
     if fam == "claude":
-        snap = claude_session_snapshot(project_info, topic, last_n=8, max_chars=mtok * 4)
+        snap = claude_session_snapshot(project_info, topic, last_n=DEFAULT_SNAPSHOT_TURNS, max_chars=mtok * 4)
         if snap:
             done = complete_context_snapshot_request(rid, "claude_session_file", snap.get("model"), snap["content"], "ok", "medium")
             return {"status": "completed", "request_id": rid, "source_surface": "claude_session_file",
@@ -6273,7 +6493,14 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "consult_gemini":
         return text_content(consult("gemini", args))
     if name == "get_consultation_history":
-        return text_content(get_history(args.get("project"), int(args.get("limit") or 20)))
+        return text_content(
+            get_history(
+                args.get("project"),
+                int(args.get("limit") or 0) or None,
+                _env_bool_value(args.get("include_raw"), False),
+                int(args.get("max_text_chars") or 0) or None,
+            )
+        )
     if name == "queue_antigravity_request":
         return text_content(
             queue_antigravity_request(
@@ -6333,7 +6560,14 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "get_topic_timeline":
         return text_content(get_topic_timeline(args.get("project"), args.get("topic"), int(args.get("limit") or 50)))
     if name == "get_work_memory":
-        return text_content(get_work_memory(args.get("project"), args.get("topic"), int(args.get("limit") or 10)))
+        return text_content(
+            get_work_memory(
+                args.get("project"),
+                args.get("topic"),
+                int(args.get("limit") or 0) or None,
+                int(args.get("budget_chars") or 0) or None,
+            )
+        )
     if name == "record_work_memory":
         return text_content(
             record_work_memory(
@@ -6428,7 +6662,7 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "get_latest_context_snapshot":
         return text_content(get_latest_context_snapshot(
             args.get("project"), args.get("topic"), args.get("target_agent"),
-            args.get("target_model"), args.get("max_age_seconds")))
+            args.get("target_model"), args.get("max_age_seconds"), args.get("max_tokens")))
     if name == "list_live_surfaces":
         return text_content(list_live_surfaces(args.get("project"), int(args.get("max_age_seconds") or 180)))
     if name == "record_surface_heartbeat":
@@ -6448,11 +6682,15 @@ def error_response(request_id: Any, code: int, message: str) -> dict[str, Any]:
 
 
 def handle_message(message: dict[str, Any]) -> dict[str, Any] | None:
+    global _MCP_CLIENT_NAME
     method = message.get("method")
     request_id = message.get("id")
     params = message.get("params") or {}
 
     if method == "initialize":
+        client_info = params.get("clientInfo") or {}
+        if isinstance(client_info, dict):
+            _MCP_CLIENT_NAME = str(client_info.get("name") or client_info.get("title") or "")
         return success_response(
             request_id,
             {
@@ -6464,7 +6702,7 @@ def handle_message(message: dict[str, Any]) -> dict[str, Any] | None:
     if method == "notifications/initialized":
         return None
     if method == "tools/list":
-        return success_response(request_id, {"tools": TOOLS})
+        return success_response(request_id, {"tools": tools_for_current_client()})
     if method == "tools/call":
         name = params.get("name")
         args = params.get("arguments") or {}

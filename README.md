@@ -172,6 +172,11 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.3 (Claude/MCP context budget reduction)
+- **Claude gets a lite MCP catalog by default.** When the MCP client identifies as Claude, `tools/list` now returns 12 compact user-facing tools instead of the full 36-tool bridge/internal catalog. Set `AGENT_BROKER_TOOL_PROFILE=full` or `mcp_tool_profile: "full"` if a client needs every internal bridge tool.
+- **Tool results are summary-first.** MCP JSON results are compact by default, `get_consultation_history` now returns bounded summaries unless `include_raw=true`, and long consult responses return an excerpt plus `response_ref` for explicit retrieval.
+- **Smaller default context reads.** Default context packs are 2.4k tokens, work memory is 5 entries / ~2.6k chars, and snapshot fast paths read 4 turns / ~300 tokens unless a caller asks for more.
+
 ### v1.0.2 (straightforward CLI model + reasoning-effort selection; smallest-sufficient build rung)
 - **Pick the model and reasoning effort the obvious way.** `consult_codex` / `consult_claude` / `route_agent_task` now take a first-class **`effort`** field (`minimal|low|medium|high|xhigh`, plus phrases — *"extra high" → xhigh*, *"ultra"/"max" → family top*) that is passed to the CLI as **its own flag** (Codex `-c model_reasoning_effort=`, Claude `--effort`) and **never** smuggled into the model name. A bare family request — **"codex"**, **"claude"** — now resolves to the **flagship model at the highest available effort** (Codex `gpt-5.5`/`xhigh`, Claude `opus`/`max`) instead of stalling on a model-selection prompt; a specific model is honored verbatim (**"sonnet 4.6 for implementation"**, **"gpt-5.4-mini"**). Effort phrases are split out of the model text before matching, so a request like *"5.5 extra high"* resolves cleanly to model `gpt-5.5` + effort `xhigh` — fixing a class of failures where the effort phrase produced an invalid `--model "gpt-5.5-codex xhigh"` (rejected by Codex). Per-request auto-pinning of a topic default is now **opt-in** (`remember_model`). New shared helper `resolve_cli_model_and_effort()`; **Fable** added to the Claude catalog. *(Tagged `v1.0.1` in source; first shipped as a binary in v1.0.2.)*
 - **Smallest-sufficient-implementation rung in the build contracts.** The `implementation` and `implementation_plan` task contracts now tell the receiving agent to prefer the **standard library / a native platform feature / an already-installed dependency over new code or new dependencies** — explicitly **without** dropping required validation, error handling, security checks, or tests, and without disputing an approved plan (stop and report instead). Scoped to code-writing task kinds only; `consult`/`co_audit`/`debate`/`review` are unchanged, so second-opinion reasoning quality is untouched.
@@ -259,7 +264,13 @@ Register it with an MCP client by pointing the client's MCP config at:
 }
 ```
 
-**MCP tools exposed (36):**
+**MCP tools exposed:**
+
+- Full profile: 36 tools.
+- Claude/default lite profile: 12 compact user-facing tools (`consult_codex`, `route_agent_task`, model listing, compact history/memory/context/snapshot reads, retrieval, live-surface status, and `respond_to_request`).
+- Override with `AGENT_BROKER_TOOL_PROFILE=full|public|lite|compact` or `mcp_tool_profile` in `~/.agent-broker/config.json`.
+
+Full profile:
 
 ```text
 register_project, route_agent_task, resolve_model_request, list_agent_models,

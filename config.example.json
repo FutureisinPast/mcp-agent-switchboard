@@ -16,6 +16,9 @@
 
   "handoff_auto_compact": true,
   "handoff_compact_budget_tokens": 1800,
+  "mcp_tool_profile": "",
+
+  "_comment_token_defaults": "Leave blank/default for automatic low-context behavior. Set AGENT_BROKER_TOOL_PROFILE=full or mcp_tool_profile=full if an MCP client needs every internal bridge tool.",
 
   "_comment_contract": "compact_task_contract keeps the per-message ground-rules block out of the chat: it writes the full rules once to ~/.agent-broker/AGENT_GROUND_RULES.md and the delivered message only references that path. Set false for the legacy inline rules.",
   "compact_task_contract": true,

@@ -33,7 +33,7 @@ if (-not $SkipVsix) {
   Push-Location $bridge
   try {
     # --allow-missing-repository keeps a local/unpublished extension packageable.
-    & npx --yes @vscode/vsce package --allow-missing-repository
+    & npm.cmd exec --yes --package @vscode/vsce -- vsce package --allow-missing-repository
     if ($LASTEXITCODE -ne 0) { throw "vsce package failed (exit $LASTEXITCODE)" }
   } finally { Pop-Location }
   $newest = Get-ChildItem (Join-Path $bridge '*.vsix') | Sort-Object LastWriteTime -Descending | Select-Object -First 1
