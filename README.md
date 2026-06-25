@@ -75,7 +75,7 @@ Other notes:
 | Keep all shared state **local** (SQLite), never scrape private chat history | ✅ |
 | **Token compaction** so cross-agent calls don't burn context | ✅ compressed handoffs + compact context packs with a locally-stored, retrievable original (Headroom-style *retrieval*, not a reversible codec) |
 | Keep a short per-topic **work memory** so the next model sees what changed, where, why, checks, risks, and next step | ✅ |
-| **Peek at another open chat** — fetch a *compact snapshot* of what another agent's session knows, on request (opt-in, local, never silent scraping) | ✅ active context snapshots; **Codex & Claude Code read on disk** (`request_context_snapshot` → `get_latest_context_snapshot`) |
+| **Peek at another open chat** — fetch a *compact snapshot* of what another agent's session knows, on request (opt-in, local, never silent scraping) | ✅ active context snapshots; **Codex & Claude Code read on disk**, with **Antigravity local task/log/activity fallback** (`request_context_snapshot` → `get_latest_context_snapshot`) |
 | **Cross-model debate** — two assistants debate N rounds headless on your subscriptions, then a synthesis judge writes a verdict | ✅ (`agent-switchboard debate`) |
 | Route Codex/Claude to the **headless CLI** by default; the **in-app chat** ("in app") or **desktop app** only when asked | ✅ |
 | Keep **Gemini** + **Antigravity-hosted** models on in-app automation by default, with the Gemini CLI available when explicitly requested | ✅ |
@@ -103,7 +103,8 @@ Working in one assistant but need the *current* state another open chat is holdi
 
 - **`request_context_snapshot(project, topic, target_agent)`** asks the best available open surface for that compact state.
 - **Codex & Claude Code fast path (on disk):** the broker reads the live session transcript on disk — **Codex** from `~/.codex`, **Claude Code** from `~/.claude/projects` — redacted + truncated and **scoped to the session whose `cwd` matches the project** (no cross-project leak), returning **immediately** with no agent cooperation or CDP needed. The two CLIs are symmetric.
-- **Other surfaces:** the request is queued for a capable bridge host (`claim_context_snapshot_request` / `complete_context_snapshot_request`, race-safe + idempotent, with a stale-claim reaper), or picked up from a `.agent-broker/context-snapshots/` fallback file. If **no live surface is heartbeating**, the request reports `no_live_surface` (with guidance) instead of queuing forever with no claimer.
+- **Antigravity fallback:** when no live bridge snapshot is available, the broker can read local Antigravity task/log/activity files (`~/.gemini/antigravity-ide/brain` plus workspace/file history) and return a bounded, clearly low/medium-confidence continuation snapshot. This is not guaranteed to be the visible chat transcript, but it prevents dead-end "cannot find context" failures.
+- **Other surfaces:** the request is queued for a capable bridge host (`claim_context_snapshot_request` / `complete_context_snapshot_request`, race-safe + idempotent, with a stale-claim reaper), or picked up from a `.agent-broker/context-snapshots/` fallback file. If **no live surface is heartbeating** and no local fallback exists, the request reports `no_live_surface` (with guidance) instead of queuing forever with no claimer.
 - **Honest limit:** a surface feeds the nerve system only if it's readable on disk (Codex/Claude Code), a live heartbeating bridge (Antigravity/VS Code), **or** it proactively records. A disconnected helper — e.g. the **Claude desktop app** (Electron + server-side history, not on disk) — can be *registered to push* context, but cannot be read on demand. `doctor` shows exactly which surfaces can contribute, so blind spots are visible, not surprising.
 - Read it back with **`get_latest_context_snapshot`** — it also folds into `get_context_pack` ("Latest Context Snapshots") and `get_topic_status`, so the next model picks it up automatically. Live-host routing uses `record_surface_heartbeat` / `list_live_surfaces`.
 
@@ -179,7 +180,7 @@ broker/bridge version drift and prints actionable next steps.
 - **Bridge settings added:** `claimCurrentWorkspaceOnly`, `antigravityClaimMaxAgeMs`, `snapshotClaimMaxAgeMs`, and `preventAntigravityBackgroundTimers`. Bridge extension version is now `1.0.1`.
 
 ### v1.0.3 (Claude/MCP context budget reduction)
-- **Claude gets a lite MCP catalog by default.** When the MCP client identifies as Claude, `tools/list` now returns 12 compact user-facing tools instead of the full 36-tool bridge/internal catalog. Set `AGENT_BROKER_TOOL_PROFILE=full` or `mcp_tool_profile: "full"` if a client needs every internal bridge tool.
+- **Claude gets a lite MCP catalog by default.** When the MCP client identifies as Claude, `tools/list` now returns 18 compact user-facing tools instead of the full bridge/internal catalog. It includes Codex routing, request return, and work-memory recording so broker instructions never ask Claude to call hidden tools. Set `AGENT_BROKER_TOOL_PROFILE=full` or `mcp_tool_profile: "full"` if a client needs every internal bridge tool.
 - **Tool results are summary-first.** MCP JSON results are compact by default, `get_consultation_history` now returns bounded summaries unless `include_raw=true`, and long consult responses return an excerpt plus `response_ref` for explicit retrieval.
 - **Smaller default context reads.** Default context packs are 2.4k tokens, work memory is 5 entries / ~2.6k chars, and snapshot fast paths read 4 turns / ~300 tokens unless a caller asks for more.
 
@@ -273,7 +274,7 @@ Register it with an MCP client by pointing the client's MCP config at:
 **MCP tools exposed:**
 
 - Full profile: 36 tools.
-- Claude/default lite profile: 12 compact user-facing tools (`consult_codex`, `route_agent_task`, model listing, compact history/memory/context/snapshot reads, retrieval, live-surface status, and `respond_to_request`).
+- Claude/default lite profile: 18 compact user-facing tools (`consult_codex`, `route_agent_task`, Codex queue/status, model listing, compact history/memory/context/snapshot reads, memory/event recording, retrieval, live-surface status, request ledger, and `respond_to_request`).
 - Override with `AGENT_BROKER_TOOL_PROFILE=full|public|lite|compact` or `mcp_tool_profile` in `~/.agent-broker/config.json`.
 
 Full profile:
