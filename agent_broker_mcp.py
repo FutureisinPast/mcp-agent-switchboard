@@ -20,6 +20,7 @@ import sys
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -672,6 +673,10 @@ def init_db() -> None:
 
 def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def utc_from_epoch(value: float | int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(value)))
 
 
 def normalize_project_name(path: Path) -> str:
@@ -5485,7 +5490,7 @@ TOOLS = [
     },
     {
         "name": "request_context_snapshot",
-        "description": "Ask the best available open surface for a COMPACT snapshot of what another agent's current chat knows (objective, plan, files, checks, risks, next step) - not a full transcript. For Codex the broker reads the live session transcript on disk and returns immediately; other targets are queued for a capable bridge host. Then read get_latest_context_snapshot. Opt-in and local; no silent chat scraping.",
+        "description": "Ask the best available open surface for a COMPACT snapshot of what another agent's current chat knows (objective, plan, files, checks, risks, next step) - not a full transcript. Codex and Claude Code use on-disk transcript fast paths; Antigravity uses local task/log/activity fallbacks when available, or a live bridge snapshot otherwise; other targets are queued for a capable bridge host. Then read get_latest_context_snapshot. Opt-in and local; no silent chat scraping.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -6128,6 +6133,388 @@ def claude_session_snapshot(
     return {"content": content, "model": "claude (claude code)", "source": "claude_session_file", "path": str(path)}
 
 
+def _file_uri_to_path(value: Any) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.startswith("file://"):
+        parsed = urllib.parse.urlparse(text)
+        raw_path = urllib.parse.unquote(parsed.path or "")
+        if re.match(r"^/[A-Za-z]:/", raw_path):
+            raw_path = raw_path[1:]
+        return Path(raw_path)
+    return Path(text)
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _safe_relpath(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path)
+
+
+def _epoch_ms_iso(value: Any) -> str | None:
+    try:
+        ms = int(value)
+        if ms <= 0:
+            return None
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ms / 1000))
+    except Exception:
+        return None
+
+
+def _antigravity_user_dir() -> Path | None:
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    user_dir = Path(appdata) / "Antigravity" / "User"
+    return user_dir if user_dir.exists() else None
+
+
+def _antigravity_brain_roots() -> list[Path]:
+    home = Path(os.environ.get("USERPROFILE") or os.path.expanduser("~"))
+    roots = [
+        home / ".gemini" / "antigravity-ide" / "brain",
+        home / ".gemini" / "antigravity" / "brain",
+    ]
+    return [p for p in roots if p.exists()]
+
+
+def _compact_one_line(value: Any, limit: int = 700) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) > limit:
+        return text[: max(0, limit - 16)].rstrip() + " ... [truncated]"
+    return text
+
+
+def _read_text_limited(path: Path, max_chars: int = 80_000) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    if len(text) > max_chars:
+        return text[:max_chars].rstrip() + "\n... [truncated]"
+    return text
+
+
+def _contains_any(text: str, needles: list[str]) -> bool:
+    haystack = text.lower()
+    return any(n and n in haystack for n in needles)
+
+
+def _antigravity_project_needles(project_info: "ProjectInfo", hints: list[str] | None = None) -> list[str]:
+    root = str(project_info.root_path)
+    needles = {
+        root.lower(),
+        root.replace("\\", "/").lower(),
+        project_info.name.lower(),
+    }
+    for hint in hints or []:
+        cleaned = str(hint or "").strip().lower()
+        if cleaned:
+            needles.add(cleaned)
+            needles.add(cleaned.replace("\\", "/"))
+    return sorted(n for n in needles if len(n) >= 3)
+
+
+def _antigravity_text_excerpt(text: str, needles: list[str], limit: int = 900) -> str:
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    matches = [ln for ln in lines if _contains_any(ln, needles)]
+    sample = "\n".join(matches[:8] if matches else lines[:18]).strip()
+    if len(sample) > limit:
+        sample = sample[: max(0, limit - 16)].rstrip() + " ... [truncated]"
+    return sample
+
+
+def _summarize_antigravity_event(data: dict[str, Any]) -> str | None:
+    content = data.get("content") or data.get("thinking") or ""
+    if not content:
+        tool_calls = data.get("tool_calls") or []
+        if isinstance(tool_calls, list) and tool_calls:
+            names = [str(tc.get("name") or tc.get("type") or "tool") for tc in tool_calls if isinstance(tc, dict)]
+            content = "tool calls: " + ", ".join(names[:8])
+    content = _compact_one_line(content, 700)
+    if not content:
+        return None
+    created = data.get("created_at") or "unknown-time"
+    source = data.get("source") or "unknown-source"
+    typ = data.get("type") or "event"
+    status = data.get("status") or ""
+    return f"{created} | {source}/{typ}/{status}: {content}"
+
+
+def _antigravity_transcript_events(path: Path, needles: list[str], max_events: int = 10) -> tuple[list[str], list[str]]:
+    relevant: list[str] = []
+    tail: list[str] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                raw_text = raw.strip()
+                if not raw_text:
+                    continue
+                try:
+                    data = json.loads(raw_text)
+                except Exception:
+                    data = {"content": raw_text}
+                summary = _summarize_antigravity_event(data)
+                if not summary:
+                    continue
+                tail.append(summary)
+                if len(tail) > max_events:
+                    tail = tail[-max_events:]
+                if _contains_any(raw_text, needles):
+                    relevant.append(summary)
+                    if len(relevant) > max_events * 3:
+                        relevant = relevant[-max_events * 3:]
+    except Exception:
+        return [], []
+    return relevant[-max_events:], tail[-max_events:]
+
+
+def _antigravity_brain_items(
+    project_info: "ProjectInfo", hints: list[str] | None = None, limit: int = 3
+) -> list[dict[str, Any]]:
+    needles = _antigravity_project_needles(project_info, hints)
+    items: list[dict[str, Any]] = []
+    for root in _antigravity_brain_roots():
+        try:
+            dirs = [p for p in root.iterdir() if p.is_dir() and p.name != "tempmediaStorage"]
+        except OSError:
+            continue
+        dirs.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        for session_dir in dirs[:25]:
+            score = 0
+            snippets: list[dict[str, str]] = []
+            for rel in ("task.md", "implementation_plan.md"):
+                path = session_dir / rel
+                if not path.exists():
+                    continue
+                text = _read_text_limited(path, 40_000)
+                if not text:
+                    continue
+                if _contains_any(text, needles):
+                    score += 2
+                snippets.append({
+                    "file": rel,
+                    "mtime": utc_from_epoch(path.stat().st_mtime),
+                    "excerpt": _antigravity_text_excerpt(text, needles),
+                })
+            transcript = session_dir / ".system_generated" / "logs" / "transcript.jsonl"
+            relevant_events: list[str] = []
+            tail_events: list[str] = []
+            if transcript.exists():
+                relevant_events, tail_events = _antigravity_transcript_events(transcript, needles, 10)
+                if relevant_events:
+                    score += 4
+            if score <= 0:
+                continue
+            items.append({
+                "session": str(session_dir),
+                "mtime": utc_from_epoch(session_dir.stat().st_mtime),
+                "snippets": snippets,
+                "transcript": str(transcript) if transcript.exists() else None,
+                "transcript_events": relevant_events or tail_events[:5],
+                "confidence": "medium" if relevant_events else "low",
+            })
+            if len(items) >= max(1, int(limit)):
+                return items
+    return items
+
+
+def _antigravity_history_items(project_info: "ProjectInfo", limit: int = 8) -> list[dict[str, Any]]:
+    """Read VS Code-style local file history written by Antigravity.
+
+    This is not a chat transcript. It is a best-effort local activity signal for
+    "what was I working on?" when no cooperative Antigravity context snapshot exists.
+    """
+    user_dir = _antigravity_user_dir()
+    if not user_dir:
+        return []
+    history_root = user_dir / "History"
+    if not history_root.exists():
+        return []
+    root = Path(project_info.root_path)
+    items: list[dict[str, Any]] = []
+    try:
+        entries_files = list(history_root.glob("*/entries.json"))
+    except OSError:
+        return []
+    for entries_file in entries_files:
+        try:
+            data = json.loads(entries_file.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        resource = data.get("resource")
+        file_path = _file_uri_to_path(resource)
+        if not file_path or not _path_within(file_path, root):
+            continue
+        entries = [e for e in (data.get("entries") or []) if isinstance(e, dict)]
+        if not entries:
+            continue
+        latest = max(entries, key=lambda e: int(e.get("timestamp") or 0))
+        latest_file = entries_file.parent / str(latest.get("id") or "")
+        items.append({
+            "path": _safe_relpath(file_path, root),
+            "history_dir": str(entries_file.parent),
+            "entries": len(entries),
+            "latest_id": latest.get("id"),
+            "latest_source": latest.get("source") or "manual/save",
+            "latest_at": _epoch_ms_iso(latest.get("timestamp")),
+            "latest_history_file_mtime": utc_from_epoch(latest_file.stat().st_mtime) if latest_file.exists() else None,
+            "latest_timestamp": int(latest.get("timestamp") or 0),
+        })
+    items.sort(key=lambda x: (x.get("latest_timestamp") or 0, x.get("latest_history_file_mtime") or ""), reverse=True)
+    return items[: max(1, int(limit))]
+
+
+def _antigravity_workspace_items(project_info: "ProjectInfo", limit: int = 4) -> list[dict[str, Any]]:
+    user_dir = _antigravity_user_dir()
+    if not user_dir:
+        return []
+    storage_root = user_dir / "workspaceStorage"
+    if not storage_root.exists():
+        return []
+    root = Path(project_info.root_path)
+    items: list[dict[str, Any]] = []
+    for workspace_json in storage_root.glob("*/workspace.json"):
+        try:
+            data = json.loads(workspace_json.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        folder = _file_uri_to_path(data.get("folder"))
+        workspace = _file_uri_to_path(data.get("workspace"))
+        match = (folder and _path_within(root, folder)) or (folder and _path_within(folder, root))
+        match = match or (workspace and _path_within(workspace, root))
+        if not match:
+            continue
+        db = workspace_json.parent / "state.vscdb"
+        state_keys: list[str] = []
+        if db.exists():
+            try:
+                con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                rows = con.execute(
+                    """
+                    SELECT key FROM ItemTable
+                    WHERE key IN (
+                        'antigravity.agentViewContainerId.state',
+                        'workbench.explorer.treeViewState',
+                        'memento/workbench.editors.files.textFileEditor',
+                        'chat.ChatSessionStore.index'
+                    )
+                    ORDER BY key
+                    """
+                ).fetchall()
+                state_keys = [str(r[0]) for r in rows]
+                con.close()
+            except Exception:
+                state_keys = []
+        items.append({
+            "storage": str(workspace_json.parent),
+            "folder": str(folder) if folder else None,
+            "workspace": str(workspace) if workspace else None,
+            "mtime": utc_from_epoch((db if db.exists() else workspace_json).stat().st_mtime),
+            "state_keys": state_keys,
+        })
+    items.sort(key=lambda x: x.get("mtime") or "", reverse=True)
+    return items[: max(1, int(limit))]
+
+
+def _recent_project_files(project_info: "ProjectInfo", limit: int = 8) -> list[dict[str, Any]]:
+    root = Path(project_info.root_path)
+    if not root.exists():
+        return []
+    skip_dirs = {
+        ".git", ".agent-broker", ".claude", ".codex", "__pycache__", "node_modules",
+        "build", "dist", ".venv", "venv", ".next", ".cache",
+    }
+    found: list[tuple[float, Path]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".tmp")]
+        for name in filenames:
+            path = Path(dirpath) / name
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_size > 3_000_000:
+                continue
+            found.append((stat.st_mtime, path))
+    found.sort(key=lambda item: item[0], reverse=True)
+    return [
+        {"path": _safe_relpath(path, root), "mtime": utc_from_epoch(mtime)}
+        for mtime, path in found[: max(1, int(limit))]
+    ]
+
+
+def antigravity_local_activity_snapshot(
+    project_info: "ProjectInfo", topic: str | None = None, max_chars: int = 4000
+) -> dict[str, Any] | None:
+    history_items = _antigravity_history_items(project_info, 8)
+    workspace_items = _antigravity_workspace_items(project_info, 4)
+    recent_files = _recent_project_files(project_info, 8)
+    hints = [str(item.get("path") or "") for item in history_items[:6]]
+    hints.extend(str(item.get("path") or "") for item in recent_files[:6])
+    brain_items = _antigravity_brain_items(project_info, hints, 3)
+    if not brain_items and not history_items and not workspace_items and not recent_files:
+        return None
+    confidence = "medium" if brain_items else "low"
+    lines = [
+        "Source: Antigravity local task/log/activity fallback",
+        f"Captured: {utc_now()}",
+        f"Confidence: {confidence}",
+        "Note: this is not a guaranteed live visible-chat snapshot. It is inferred from local Antigravity task/log files when present, plus workspace state, VS Code-style file history, and recent project file mtimes because no live/cooperative Antigravity snapshot was available.",
+        "",
+    ]
+    if brain_items:
+        lines.append("Antigravity local task/log context:")
+        for item in brain_items:
+            lines.append(f"- session={item.get('session')} | mtime={item.get('mtime')} | confidence={item.get('confidence')}")
+            for snippet in item.get("snippets") or []:
+                excerpt = str(snippet.get("excerpt") or "").strip()
+                if excerpt:
+                    lines.append(f"  - {snippet.get('file')} | mtime={snippet.get('mtime')}")
+                    for ln in excerpt.splitlines()[:10]:
+                        lines.append(f"    {ln}")
+            events = item.get("transcript_events") or []
+            if events:
+                lines.append("  - transcript events:")
+                for event in events[:10]:
+                    lines.append(f"    {event}")
+        lines.append("")
+    if workspace_items:
+        lines.append("Antigravity workspace state:")
+        for item in workspace_items:
+            target = item.get("folder") or item.get("workspace") or item.get("storage")
+            keys = ", ".join(item.get("state_keys") or [])
+            lines.append(f"- {target} | mtime={item.get('mtime')} | state={keys or 'none'}")
+        lines.append("")
+    if history_items:
+        lines.append("Recent Antigravity local history entries for this project:")
+        for item in history_items:
+            lines.append(
+                f"- {item['path']} | entries={item['entries']} | latest={item.get('latest_at') or item.get('latest_history_file_mtime')} | source={item.get('latest_source')}"
+            )
+        lines.append("")
+    if recent_files:
+        lines.append("Recent project files by filesystem mtime:")
+        for item in recent_files:
+            lines.append(f"- {item['path']} | mtime={item.get('mtime')}")
+        lines.append("")
+    lines.append("Next step: inspect the listed recent files directly, then continue from the concrete file diffs/state instead of assuming chat memory exists.")
+    content = "\n".join(lines)
+    if len(content) > int(max_chars):
+        content = content[: int(max_chars)].rstrip() + " ... [truncated]"
+    return {"content": content, "model": "antigravity local task/log/activity", "source": "antigravity_local_activity", "confidence": confidence}
+
+
 def _snapshot_fallback_path(request_id: str, root_path: str | None) -> Path:
     base = Path(root_path) if root_path else BROKER_DIR
     return base / ".agent-broker" / "context-snapshots" / f"{request_id}.md"
@@ -6370,6 +6757,14 @@ def request_context_snapshot(
             done = complete_context_snapshot_request(rid, "claude_session_file", snap.get("model"), snap["content"], "ok", "medium")
             return {"status": "completed", "request_id": rid, "source_surface": "claude_session_file",
                     "snapshot_id": done.get("snapshot_id"), "snapshot": snap}
+    if fam == "antigravity":
+        snap = antigravity_local_activity_snapshot(project_info, topic, max_chars=mtok * 4)
+        if snap:
+            confidence = str(snap.get("confidence") or "low")
+            done = complete_context_snapshot_request(rid, "antigravity_local_activity", snap.get("model"), snap["content"], "ok", confidence)
+            return {"status": "completed", "request_id": rid, "source_surface": "antigravity_local_activity",
+                    "snapshot_id": done.get("snapshot_id"), "snapshot": snap,
+                    "note": "No live Antigravity snapshot was available; returned local task/log/activity fallback."}
     # No on-disk fast path applied. The request is queued for a live bridge host
     # (Antigravity/VS Code) to claim. Degrade usefully: if NO surface is heartbeating,
     # nothing will ever pick this up, so tell the caller plainly instead of leaving them
@@ -6380,8 +6775,8 @@ def request_context_snapshot(
         return {"status": "pending", "request_id": rid, "project": project_info.name, "topic": topic,
                 "target_agent": target_agent, "family": fam, "no_live_surface": True, "live_surfaces": 0,
                 "note": ("Queued, but NO live bridge surface is heartbeating right now, so nothing can "
-                         "serve it. On-disk fast paths exist only for Codex and Claude Code (open one of "
-                         "those in this project), or open the target IDE with the bridge running. Run "
+                         "serve it. On-disk fast paths exist for Codex, Claude Code, and Antigravity local "
+                         "task/activity state when present; otherwise open the target IDE with the bridge running. Run "
                          "`doctor` to see which surfaces can feed the nerve system. Disconnected apps "
                          "(e.g. the Claude desktop app) cannot be snapshotted on demand.")}
     return {"status": "pending", "request_id": rid, "project": project_info.name, "topic": topic,
@@ -6928,9 +7323,9 @@ def _nerve_system_report() -> dict[str, Any]:
          "available": codex_disk, "detail": "Recent turns read on demand; no live agent needed."},
         {"surface": "claude_code", "mechanism": "disk fast-path (~/.claude/projects)", "readable_on_demand": True,
          "available": claude_disk, "detail": "Recent turns read on demand; no live agent needed."},
-        {"surface": "antigravity", "mechanism": "live bridge (heartbeat + claim)", "readable_on_demand": False,
-         "available": any("antigravity" in h.lower() for h in live_hosts),
-         "detail": "Contributes only while Antigravity runs with the bridge heartbeating."},
+        {"surface": "antigravity", "mechanism": "live bridge snapshot + local task/log/activity fallback", "readable_on_demand": True,
+         "available": bool(_antigravity_brain_roots() or _antigravity_user_dir()) or any("antigravity" in h.lower() for h in live_hosts),
+         "detail": "Live bridge can snapshot the visible chat; without it the broker falls back to local Antigravity task/log files plus workspace/file history when present."},
         {"surface": "vscode", "mechanism": "live bridge (heartbeat + claim)", "readable_on_demand": False,
          "available": any(("code" in h.lower() or "vscode" in h.lower()) for h in live_hosts),
          "detail": "Contributes only while VS Code runs with the bridge heartbeating."},
