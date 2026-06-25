@@ -173,6 +173,11 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.5 (Antigravity local context + Claude tool permissions)
+- **Antigravity context pickup no longer dead-ends when no live bridge answers.** `request_context_snapshot(target_agent="antigravity")` now falls back to bounded local Antigravity task/log/activity state (`~/.gemini/antigravity-ide/brain`), workspace state, file history, and recent project file mtimes. It clearly labels the result as low/medium-confidence instead of pretending it is a guaranteed visible-chat transcript.
+- **Claude's default MCP catalog now includes the tools Switchboard asks it to use.** The lite profile exposes Codex queue/status, work-memory recording, context-event recording, and request-ledger tools, so Claude no longer gets instructions to call hidden tools such as `record_work_memory`.
+- **Docs now describe the real Antigravity fallback and Claude tool profile.** README context-snapshot and tool-profile sections now match the shipped behavior.
+
 ### v1.0.4 (Antigravity bridge claim isolation)
 - **Antigravity bridge claims are now workspace-scoped and fresh-only by default.** The bridge passes its current workspace root when claiming queued Antigravity work, and ignores queued work older than 10 minutes unless configured otherwise. This prevents an unrelated Antigravity window/chat from waking up for stale or cross-project broker tasks.
 - **Context snapshot claims use the same isolation.** Live bridge hosts now claim snapshot requests only for the active workspace and within the freshness window, so snapshot polling cannot route another project’s request into the visible Antigravity panel.
