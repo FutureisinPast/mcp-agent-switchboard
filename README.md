@@ -173,6 +173,11 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.7 (direct consult timeout hardening)
+- **Direct Claude/Codex consults now finish before Codex's MCP tool-call timeout.** Synchronous CLI consults are capped below the client timeout, so Codex gets a controlled broker response instead of a red `timed out awaiting tools/call` failure.
+- **Claude consults now use stream-json parsing.** If Claude starts answering but does not finish before the safe timeout, the broker can return any partial answer it received instead of losing everything.
+- **Tool descriptions now warn that direct consults are bounded.** Full-site reviews should be split into batches or routed asynchronously; a single synchronous MCP tool call is not a safe place for a many-minute Opus pass.
+
 ### v1.0.6 (Codex/Claude peer-consult fallback)
 - **Codex can now ask for a peer consult without naming every routing field.** If a Codex-origin Switchboard call leaves `target_agent` and `target_model` empty, the broker now defaults to Claude Code CLI with the flagship Claude model (`opus`, max effort) instead of falling into Antigravity model selection.
 - **Claude gets the symmetric fallback.** Ambiguous Claude-origin consult/co-op/debate requests now default to Codex CLI with the flagship Codex model (`gpt-5.5`, xhigh effort).

@@ -35,7 +35,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.6"
+BROKER_VERSION = "1.0.7"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -71,6 +71,11 @@ def _env_bool_value(value: Any, default: bool = False) -> bool:
 
 
 DEFAULT_TIMEOUT_SECONDS = _env_int("AGENT_BROKER_TIMEOUT_SECONDS", 600)
+MCP_CLIENT_TIMEOUT_SECONDS = _env_int("AGENT_BROKER_MCP_CLIENT_TIMEOUT_SECONDS", 300)
+SYNC_CONSULT_TIMEOUT_SECONDS = min(
+    _env_int("AGENT_BROKER_SYNC_CONSULT_TIMEOUT_SECONDS", 240),
+    max(30, MCP_CLIENT_TIMEOUT_SECONDS - 30),
+)
 DEFAULT_CONTEXT_BUDGET = _env_int("AGENT_BROKER_CONTEXT_BUDGET", 2400)
 SHARED_CONTEXT_THRESHOLD_CHARS = _env_int("AGENT_BROKER_CONTEXT_THRESHOLD_CHARS", 1200)
 SHARED_CONTEXT_INLINE_CHARS = _env_int("AGENT_BROKER_CONTEXT_INLINE_CHARS", 700)
@@ -2515,6 +2520,24 @@ def append_budgeted(lines: list[str], line: str, budget: int) -> bool:
     return False
 
 
+def process_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def bounded_sync_timeout(value: Any = None) -> int:
+    try:
+        requested = int(str(value).strip()) if value is not None and str(value).strip() else 0
+    except (TypeError, ValueError):
+        requested = 0
+    if requested <= 0:
+        requested = SYNC_CONSULT_TIMEOUT_SECONDS
+    return max(15, min(requested, SYNC_CONSULT_TIMEOUT_SECONDS))
+
+
 def run_process(
     command: list[str],
     cwd: str,
@@ -2523,22 +2546,80 @@ def run_process(
 ) -> tuple[int, str, str]:
     env = os.environ.copy()
     env["AGENT_BROKER_CHILD"] = "1"
-    proc = subprocess.run(
-        command,
-        cwd=cwd,
-        input=stdin_text,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-        timeout=timeout,
-        env=env,
-        check=False,
-    )
-    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=cwd,
+            input=stdin_text,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except subprocess.TimeoutExpired as exc:
+        stdout = process_text(exc.stdout).strip()
+        stderr = process_text(exc.stderr).strip()
+        message = f"Process timed out after {timeout} seconds before the MCP client timeout."
+        return 124, stdout, f"{message}\n{stderr}".strip()
 
 
-def consult_codex(project: str | None, prompt: str, mode: str = "read-only", model_name: str | None = None, effort: str | None = None) -> str:
+def parse_claude_stream_output(stdout: str) -> str:
+    result: str | None = None
+    assistant_text: list[str] = []
+    delta_text: list[str] = []
+    for line in str(stdout or "").splitlines():
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") == "result" and payload.get("result"):
+            result = str(payload.get("result"))
+            continue
+        if payload.get("type") == "assistant":
+            message = payload.get("message") or {}
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                text = "".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
+                if text.strip():
+                    assistant_text.append(text)
+            continue
+        if payload.get("type") == "stream_event":
+            event = payload.get("event") or {}
+            delta = event.get("delta") if isinstance(event, dict) else None
+            if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                delta_text.append(str(delta.get("text") or ""))
+    if result and result.strip():
+        return result.strip()
+    if assistant_text:
+        return "\n".join(item.strip() for item in assistant_text if item.strip()).strip()
+    return "".join(delta_text).strip()
+
+
+def consult_timeout_message(agent: str, timeout: int, partial: str | None = None) -> str:
+    lines = [
+        f"{agent} timed out after {timeout} seconds before Codex's MCP tool-call limit.",
+        "The request reached the CLI, but it did not finish quickly enough for a synchronous MCP response.",
+        "Use a smaller/batched prompt for direct consults, or route the work asynchronously through the extension/inbox path.",
+    ]
+    if partial and partial.strip():
+        lines.extend(["", "Partial response before timeout:", "", partial.strip()])
+    return "\n".join(lines)
+
+
+def consult_codex(
+    project: str | None,
+    prompt: str,
+    mode: str = "read-only",
+    model_name: str | None = None,
+    effort: str | None = None,
+    timeout: int = SYNC_CONSULT_TIMEOUT_SECONDS,
+) -> str:
     config = load_config()
     codex = discover_codex(config)
     if not codex:
@@ -2565,7 +2646,9 @@ def consult_codex(project: str | None, prompt: str, mode: str = "read-only", mod
         command[2:2] = ["-c", f"model_reasoning_effort={effort}"]
     if model_name:
         command[2:2] = ["--model", str(model_name)]
-    code, stdout, stderr = run_process(command, project_info.root_path, sanitize_prompt(prompt))
+    code, stdout, stderr = run_process(command, project_info.root_path, sanitize_prompt(prompt), timeout=timeout)
+    if code == 124:
+        return consult_timeout_message("Codex", timeout, stdout)
     if code != 0:
         return f"Codex exited with code {code}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}".strip()
     return stdout or stderr or "Codex returned no output."
@@ -2578,6 +2661,7 @@ def consult_claude(
     model_name: str | None = None,
     workspace: str | None = None,
     effort: str | None = None,
+    timeout: int = SYNC_CONSULT_TIMEOUT_SECONDS,
 ) -> str:
     config = load_config()
     claude = find_executable(config, "claude_path", ["claude", "claude.cmd", "claude.ps1"])
@@ -2592,7 +2676,9 @@ def consult_claude(
         claude,
         "-p",
         "--output-format",
-        "json",
+        "stream-json",
+        "--include-partial-messages",
+        "--verbose",
         "--permission-mode",
         permission_mode,
     ]
@@ -2610,19 +2696,22 @@ def consult_claude(
     run_cwd = workspace or project_info.root_path
     if workspace and os.path.abspath(workspace) != os.path.abspath(project_info.root_path):
         command.extend(["--add-dir", project_info.root_path])
-    code, stdout, stderr = run_process(command, run_cwd, sanitize_prompt(prompt))
+    code, stdout, stderr = run_process(command, run_cwd, sanitize_prompt(prompt), timeout=timeout)
+    parsed = parse_claude_stream_output(stdout)
+    if code == 124:
+        return consult_timeout_message("Claude Code", timeout, parsed or stdout)
     if code != 0:
         return f"Claude exited with code {code}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}".strip()
-    try:
-        payload = json.loads(stdout)
-        if isinstance(payload, dict):
-            return str(payload.get("result") or payload.get("response") or stdout)
-    except Exception:
-        pass
-    return stdout or stderr or "Claude returned no output."
+    return parsed or stdout or stderr or "Claude returned no output."
 
 
-def consult_gemini(project: str | None, prompt: str, mode: str = "read-only", model_name: str | None = None) -> str:
+def consult_gemini(
+    project: str | None,
+    prompt: str,
+    mode: str = "read-only",
+    model_name: str | None = None,
+    timeout: int = SYNC_CONSULT_TIMEOUT_SECONDS,
+) -> str:
     config = load_config()
     project_info = resolve_project(project)
     gemini = find_executable(config, "gemini_path", ["gemini", "gemini.cmd", "gemini.ps1"])
@@ -2632,7 +2721,9 @@ def consult_gemini(project: str | None, prompt: str, mode: str = "read-only", mo
         if gem_model:
             command += ["-m", str(gem_model)]
         command += ["-p", sanitize_prompt(prompt)]
-        code, stdout, stderr = run_process(command, project_info.root_path)
+        code, stdout, stderr = run_process(command, project_info.root_path, timeout=timeout)
+        if code == 124:
+            return consult_timeout_message("Gemini CLI", timeout, stdout)
         if code != 0:
             return f"Gemini CLI exited with code {code}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}".strip()
         return stdout or stderr or "Gemini returned no output."
@@ -2659,7 +2750,7 @@ def consult_gemini(project: str | None, prompt: str, mode: str = "read-only", mo
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -2732,6 +2823,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     resolved_model, effort = resolve_cli_model_and_effort(
         model, requested_model, args.get("effort") or args.get("reasoning_effort")
     )
+    timeout_seconds = bounded_sync_timeout(args.get("timeout_seconds"))
     project_info = resolve_project(str(project_arg) if project_arg is not None else None)
     if task_kind != "consult" or args.get("include_task_contract", True) is not False:
         prompt = wrap_task_prompt(prompt, task_kind, token_budget)
@@ -2741,22 +2833,25 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     started_at = utc_now()
     try:
         if model == "codex":
-            response = consult_codex(project_info.root_path, prompt, mode, resolved_model, effort)
+            response = consult_codex(project_info.root_path, prompt, mode, resolved_model, effort, timeout_seconds)
         elif model == "claude":
             claude_workspace = None
             if topic_arg and load_config().get("topic_workspaces", True):
                 claude_workspace = str(topic_workspace_dir(project_info, topic_arg))
-            response = consult_claude(project_info.root_path, prompt, mode, resolved_model, claude_workspace, effort)
+            response = consult_claude(project_info.root_path, prompt, mode, resolved_model, claude_workspace, effort, timeout_seconds)
         elif model == "gemini":
-            response = consult_gemini(project_info.root_path, prompt, mode, resolved_model)
+            response = consult_gemini(project_info.root_path, prompt, mode, resolved_model, timeout_seconds)
         else:
             raise ValueError(f"unknown model: {model}")
         failure_prefixes = (
             "Codex CLI was not found.",
+            "Codex timed out after",
             "Codex exited with code",
             "Claude Code CLI was not found.",
+            "Claude Code timed out after",
             "Claude exited with code",
             "Gemini is not configured.",
+            "Gemini CLI timed out after",
             "Gemini CLI exited with code",
             "Gemini API returned HTTP",
             "Gemini API call failed",
@@ -5030,6 +5125,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "target_model": target_model,
                 "effort": resolved_effort,
                 "max_response_chars": args.get("max_response_chars"),
+                "timeout_seconds": args.get("timeout_seconds"),
             },
         )
         result["route"] = "codex_cli"
@@ -5051,6 +5147,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "target_model": target_model,
                 "effort": resolved_effort,
                 "max_response_chars": args.get("max_response_chars"),
+                "timeout_seconds": args.get("timeout_seconds"),
             },
         )
         result["route"] = "claude_code"
@@ -5072,6 +5169,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "target_model": target_model,
                 "effort": resolved_effort,
                 "max_response_chars": args.get("max_response_chars"),
+                "timeout_seconds": args.get("timeout_seconds"),
             },
         )
         result["route"] = "gemini_cli"
@@ -5095,7 +5193,7 @@ TOOLS = [
     },
     {
         "name": "consult_codex",
-        "description": "Ask Codex for read-only consultation on a project. Defaults to the most capable Codex model (gpt-5.5) at highest reasoning effort (xhigh). Pass target_model for a specific model (e.g. 'gpt-5.4-mini') and effort to override.",
+        "description": "Ask Codex for a bounded synchronous consultation. Defaults to gpt-5.5/xhigh. Keep direct consults small enough to finish within the MCP timeout; split full-site reviews into batches or use route_agent_task for async handoff.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5116,7 +5214,7 @@ TOOLS = [
     },
     {
         "name": "consult_claude",
-        "description": "Ask Claude Code for consultation on a project. Defaults to plan permission mode and the most capable Claude model (opus) at highest reasoning effort (max). Pass target_model for a specific model (e.g. 'sonnet', 'fable', 'claude-fable-5') and effort to override.",
+        "description": "Ask Claude Code for a bounded synchronous consultation. Defaults to opus/max in plan mode. Keep direct consults small enough to finish within the MCP timeout; split full-site reviews into batches or use route_agent_task for async handoff.",
         "inputSchema": {
             "type": "object",
             "properties": {
