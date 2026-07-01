@@ -175,6 +175,7 @@ broker/bridge version drift and prints actionable next steps.
 
 ### v1.0.7 (direct consult timeout hardening)
 - **Direct Claude/Codex consults now finish before Codex's MCP tool-call timeout.** Synchronous CLI consults are capped below the client timeout, so Codex gets a controlled broker response instead of a red `timed out awaiting tools/call` failure.
+- **Codex -> Claude CLI consults are isolated from Claude extension state.** Switchboard starts Claude consults with safe mode, an empty MCP config, no Chrome bridge, and no session persistence so a Claude extension task using Switchboard does not bleed into a Codex extension consult.
 - **Claude consults now use stream-json parsing.** If Claude starts answering but does not finish before the safe timeout, the broker can return any partial answer it received instead of losing everything.
 - **Tool descriptions now warn that direct consults are bounded.** Full-site reviews should be split into batches or routed asynchronously; a single synchronous MCP tool call is not a safe place for a many-minute Opus pass.
 

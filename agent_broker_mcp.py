@@ -2538,6 +2538,27 @@ def bounded_sync_timeout(value: Any = None) -> int:
     return max(15, min(requested, SYNC_CONSULT_TIMEOUT_SECONDS))
 
 
+def kill_process_tree(proc: subprocess.Popen[Any]) -> None:
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            log(f"taskkill failed for pid {proc.pid}: {exc}")
+    try:
+        proc.kill()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def run_process(
     command: list[str],
     cwd: str,
@@ -2546,23 +2567,34 @@ def run_process(
 ) -> tuple[int, str, str]:
     env = os.environ.copy()
     env["AGENT_BROKER_CHILD"] = "1"
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    proc = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        creationflags=creationflags,
+    )
     try:
-        proc = subprocess.run(
-            command,
-            cwd=cwd,
-            input=stdin_text,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            timeout=timeout,
-            env=env,
-            check=False,
-        )
-        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+        stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout)
+        return proc.returncode or 0, stdout.strip(), stderr.strip()
     except subprocess.TimeoutExpired as exc:
+        kill_process_tree(proc)
+        try:
+            stdout_after, stderr_after = proc.communicate(timeout=10)
+        except Exception:
+            stdout_after, stderr_after = "", ""
         stdout = process_text(exc.stdout).strip()
         stderr = process_text(exc.stderr).strip()
+        if stdout_after:
+            stdout = f"{stdout}\n{process_text(stdout_after).strip()}".strip()
+        if stderr_after:
+            stderr = f"{stderr}\n{process_text(stderr_after).strip()}".strip()
         message = f"Process timed out after {timeout} seconds before the MCP client timeout."
         return 124, stdout, f"{message}\n{stderr}".strip()
 
@@ -2610,6 +2642,17 @@ def consult_timeout_message(agent: str, timeout: int, partial: str | None = None
     if partial and partial.strip():
         lines.extend(["", "Partial response before timeout:", "", partial.strip()])
     return "\n".join(lines)
+
+
+def claude_empty_mcp_config_path() -> Path:
+    path = BROKER_DIR / "tmp" / "claude-consult-empty-mcp.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text('{"mcpServers":{}}', encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        log(f"could not create empty Claude MCP config: {exc}")
+    return path
 
 
 def consult_codex(
@@ -2675,6 +2718,12 @@ def consult_claude(
     command = [
         claude,
         "-p",
+        "--safe-mode",
+        "--strict-mcp-config",
+        "--mcp-config",
+        str(claude_empty_mcp_config_path()),
+        "--no-chrome",
+        "--no-session-persistence",
         "--output-format",
         "stream-json",
         "--include-partial-messages",
