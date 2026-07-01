@@ -173,6 +173,12 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.8 (async Opus Max consults)
+- **Heavy Codex -> Claude Opus/max consults no longer block inside the MCP timeout.** Reviews, audits, debates, bug hunts, implementations, and other large max-effort Claude requests from Codex now queue through the Claude inbox and return a request id immediately.
+- **Opus/max quality is preserved instead of downgraded.** The queued Claude request carries a strict model guard plus an explicit effort guard, so the receiver is told to use Claude Opus at max effort or report a mismatch instead of silently answering with a lesser/default model.
+- **Codex can track the queued Claude answer.** `queue_claude_request`, `get_claude_requests`, `request_status`, and `request_result` are now exposed as MCP tools, so a caller can queue a long Opus pass, keep working, then retrieve the recorded answer.
+- **Claude inbox prompts now include the return path in the injected body.** Claude sees the exact `respond_to_request(...)` instruction, plus the `.agent-broker/claude-responses/<request-id>.md` fallback, after the bridge strips the metadata header.
+
 ### v1.0.7 (direct consult timeout hardening)
 - **Direct Claude/Codex consults now finish before Codex's MCP tool-call timeout.** Synchronous CLI consults are capped below the client timeout, so Codex gets a controlled broker response instead of a red `timed out awaiting tools/call` failure.
 - **Codex -> Claude CLI consults are isolated from Claude extension state.** Switchboard starts Claude consults with safe mode, an empty MCP config, no Chrome bridge, and no session persistence so a Claude extension task using Switchboard does not bleed into a Codex extension consult.

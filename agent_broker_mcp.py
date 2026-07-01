@@ -35,7 +35,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.7"
+BROKER_VERSION = "1.0.8"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -90,6 +90,9 @@ DEFAULT_WORK_MEMORY_BUDGET_CHARS = _env_int("AGENT_BROKER_WORK_MEMORY_BUDGET_CHA
 DEFAULT_SNAPSHOT_TOKENS = _env_int("AGENT_BROKER_SNAPSHOT_TOKENS", 300)
 DEFAULT_SNAPSHOT_TURNS = _env_int("AGENT_BROKER_SNAPSHOT_TURNS", 4)
 DEFAULT_CONSULT_RESPONSE_CHARS = _env_int("AGENT_BROKER_CONSULT_RESPONSE_CHARS", 5000)
+CLAUDE_ASYNC_MIN_TOKEN_BUDGET = _env_int("AGENT_BROKER_CLAUDE_ASYNC_MIN_TOKEN_BUDGET", 3000)
+CLAUDE_ASYNC_MIN_PROMPT_TOKENS = _env_int("AGENT_BROKER_CLAUDE_ASYNC_MIN_PROMPT_TOKENS", 2200)
+CLAUDE_ASYNC_MIN_RESPONSE_CHARS = _env_int("AGENT_BROKER_CLAUDE_ASYNC_MIN_RESPONSE_CHARS", 8000)
 DEFAULT_BRIDGE_CLAIM_MAX_AGE_SECONDS = _env_int("AGENT_BROKER_CLAIM_MAX_AGE_SECONDS", 600)
 COMPACT_JSON_RESULTS = _env_bool("AGENT_BROKER_COMPACT_JSON_RESULTS", True)
 _MCP_CLIENT_NAME = ""
@@ -2538,6 +2541,93 @@ def bounded_sync_timeout(value: Any = None) -> int:
     return max(15, min(requested, SYNC_CONSULT_TIMEOUT_SECONDS))
 
 
+HEAVY_CLAUDE_ASYNC_TASKS = {
+    "implementation_plan",
+    "co_audit",
+    "debate",
+    "argue",
+    "implementation",
+    "review",
+    "bug_hunt",
+}
+
+
+def wants_async_claude(args: dict[str, Any]) -> bool:
+    return truthy(
+        args.get("async")
+        or args.get("async_handoff")
+        or args.get("use_inbox")
+        or args.get("queue")
+        or args.get("queue_async")
+    )
+
+
+def wants_direct_claude(args: dict[str, Any]) -> bool:
+    return truthy(
+        args.get("force_sync")
+        or args.get("sync")
+        or args.get("direct")
+        or args.get("use_cli")
+        or args.get("force_cli")
+    )
+
+
+def should_queue_heavy_claude_consult(
+    args: dict[str, Any],
+    prompt: str,
+    task_kind: str,
+    token_budget: int,
+    effort: str | None,
+) -> tuple[bool, str | None]:
+    if wants_async_claude(args):
+        return True, "caller_requested_async"
+    if wants_direct_claude(args):
+        return False, "caller_forced_sync"
+    if family_from_caller() != "codex":
+        return False, "caller_not_codex"
+    if str(effort or "").strip().lower() != "max":
+        return False, "not_claude_max_effort"
+    if task_kind in {"quick_check", "sanity_check"}:
+        return False, "quick_task"
+    if task_kind in HEAVY_CLAUDE_ASYNC_TASKS:
+        return True, f"task_kind={task_kind}"
+    if int(token_budget or 0) >= CLAUDE_ASYNC_MIN_TOKEN_BUDGET:
+        return True, f"token_budget={token_budget}"
+    try:
+        max_response_chars = int(args.get("max_response_chars") or DEFAULT_CONSULT_RESPONSE_CHARS)
+    except (TypeError, ValueError):
+        max_response_chars = DEFAULT_CONSULT_RESPONSE_CHARS
+    if max_response_chars >= CLAUDE_ASYNC_MIN_RESPONSE_CHARS:
+        return True, f"max_response_chars={max_response_chars}"
+    try:
+        prompt_tokens = estimate_tokens(prompt)
+    except Exception:  # noqa: BLE001
+        prompt_tokens = 0
+    if prompt_tokens >= CLAUDE_ASYNC_MIN_PROMPT_TOKENS:
+        return True, f"prompt_tokens={prompt_tokens}"
+    return False, "within_sync_budget"
+
+
+def claude_async_model_labels(model_name: str | None, effort: str | None) -> tuple[str, str]:
+    base = str(model_name or FAMILY_FLAGSHIP.get("claude") or "Claude").strip()
+    guard = f"Claude {base}" if "claude" not in base.lower() else base
+    label = guard
+    if effort:
+        label += f" (effort={effort})"
+    return guard, label
+
+
+def claude_effort_guard_text(effort: str | None) -> str:
+    if not effort:
+        return ""
+    return (
+        f"[REQUIRED CLAUDE EFFORT: {effort}]\n"
+        "Use that reasoning/thinking level for this request. If this Claude surface cannot "
+        "run that effort, say so before answering; do not silently downgrade.\n"
+        "---\n\n"
+    )
+
+
 def kill_process_tree(proc: subprocess.Popen[Any]) -> None:
     if proc.poll() is not None:
         return
@@ -2879,6 +2969,43 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     if topic_arg and args.get("include_context_pack", True) is not False:
         pack = get_context_pack(project_info.name, topic_arg, DEFAULT_CONTEXT_BUDGET)["content"]
         prompt = f"Shared context pack for this topic:\n\n{pack}\n\nCurrent request:\n\n{prompt}"
+    if model == "claude":
+        async_queue, async_reason = should_queue_heavy_claude_consult(args, prompt, task_kind, token_budget, effort)
+        if async_queue:
+            guard_label, model_label = claude_async_model_labels(resolved_model, effort)
+            queued_prompt = prompt
+            if "[REQUIRED MODEL:" not in queued_prompt and "[Preferred model:" not in queued_prompt:
+                queued_prompt = model_guard_text(guard_label, strict=True) + claude_effort_guard_text(effort) + queued_prompt
+            queued = queue_claude_request(
+                project_info.root_path,
+                queued_prompt,
+                topic_arg,
+                model_label,
+                task_kind,
+                token_budget,
+                args.get("new_chat"),
+                strict_model=True,
+            )
+            consulted_name = f"claude:{resolved_model}" if resolved_model else "claude"
+            if effort:
+                consulted_name += f" [{effort}]"
+            queued.update(
+                {
+                    "async": True,
+                    "route": "claude_inbox",
+                    "surface": "extension",
+                    "model": consulted_name,
+                    "effort": effort,
+                    "mode": mode,
+                    "async_reason": async_reason,
+                    "note": (
+                        "Queued through the Claude inbox instead of blocking inside the MCP "
+                        "timeout. This preserves the requested Claude Opus/max target; poll "
+                        "request_status/request_result with the returned id."
+                    ),
+                }
+            )
+            return queued
     started_at = utc_now()
     try:
         if model == "codex":
@@ -4668,6 +4795,7 @@ def queue_claude_request(
     task_kind: str | None = None,
     token_budget: int | None = None,
     new_chat: Any = None,
+    strict_model: Any = None,
 ) -> dict[str, Any]:
     """Default 'Claude Code extension' delivery: write an inbox markdown file.
 
@@ -4683,9 +4811,15 @@ def queue_claude_request(
     now = utc_now()
     created_by = os.environ.get("AGENT_BROKER_CALLER") or "mcp-client"
     model_label = target_model or "Claude (extension-selected model)"
+    requested_model_label = str(target_model or "").strip()
+    strict_flag = 1 if truthy(strict_model) else 0
+    clean_prompt = prompt.strip()
+    if requested_model_label and "[REQUIRED MODEL:" not in clean_prompt and "[Preferred model:" not in clean_prompt:
+        clean_prompt = model_guard_text(requested_model_label, strict=bool(strict_flag)) + clean_prompt
     force_new_chat = truthy(new_chat)
     thread_policy = "new Claude session requested" if force_new_chat else "same project/topic session by default"
     compact_section = compacted_topic_handoff_section(project_info, topic)
+    response_file = BROKER_DIR / "claude-responses" / f"{request_id}.md"
     body = (
         f"# Claude Inbox Request - Requested model: {model_label}\n\n"
         f"Request ID: {request_id}\n"
@@ -4705,8 +4839,11 @@ def queue_claude_request(
         f"Broker topic: {topic or '(none)'}\n"
         f"Thread policy: {thread_policy}\n"
         f"Reply routing: respond through the broker to the requesting agent on this same topic unless the user asks for a new chat.\n\n"
+        f"Return path:\n"
+        f"- Preferred: call respond_to_request(request_id=\"{request_id}\", response=<your answer>, agent=\"claude-extension\", model=<active Claude model>).\n"
+        f"- If broker tools are unavailable, write the answer to .agent-broker/claude-responses/{request_id}.md or {response_file}.\n\n"
         f"{compact_section}"
-        f"{prompt.strip()}\n"
+        f"{clean_prompt}\n"
     )
     written: list[str] = []
     for inbox_dir in (BROKER_DIR / "claude-inbox", Path(project_info.root_path) / ".agent-broker" / "claude-inbox"):
@@ -4722,18 +4859,19 @@ def queue_claude_request(
             """
             INSERT INTO claude_requests (
                 id, project, root_path, topic, prompt, status, created_by, created_at,
-                target_model, task_kind, token_budget
-            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+                target_model, strict_model, task_kind, token_budget
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
             """,
             (
                 request_id,
                 project_info.name,
                 project_info.root_path,
                 topic,
-                prompt.strip(),
+                clean_prompt,
                 created_by,
                 now,
                 model_label,
+                strict_flag,
                 normalize_task_kind(task_kind),
                 int(token_budget or 0) or None,
             ),
@@ -4751,7 +4889,7 @@ def queue_claude_request(
                 created_by,
                 "queued_claude_request",
                 f"Queued Claude inbox request {request_id} ({model_label})",
-                prompt.strip(),
+                clean_prompt,
                 now,
             ),
         )
@@ -4765,6 +4903,7 @@ def queue_claude_request(
         "root_path": project_info.root_path,
         "topic": topic,
         "target_model": model_label,
+        "strict_model": bool(strict_flag),
         "new_chat": force_new_chat,
         "task_kind": normalize_task_kind(task_kind),
         "token_budget": int(token_budget or 0) or None,
@@ -4772,6 +4911,36 @@ def queue_claude_request(
         "status": "queued",
         "note": "Queued for the bridge to open/submit in Claude Code. The inbox file is the durable fallback; CLI is the headless fallback.",
     }
+
+
+def get_claude_requests(project: str | None, limit: int = 20) -> dict[str, Any]:
+    init_db()
+    limit = max(1, min(int(limit or 20), 100))
+    if not project or str(project).strip() == "*":
+        with db_connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT * FROM claude_requests
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return {"project": "*", "items": [dict(row) for row in rows]}
+    project_info = resolve_project(project)
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT * FROM claude_requests
+            WHERE lower(project) = lower(?) OR root_path = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (project_info.name, project_info.root_path, limit),
+        ).fetchall()
+    return {"project": project_info.name, "items": [dict(row) for row in rows]}
 
 
 def _archive_processed(path: Path) -> None:
@@ -5117,7 +5286,16 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         queued["model_resolution"] = model_resolution
         return queued
     if target_agent == "claude_ext":
-        queued = queue_claude_request(project, wrapped_prompt, topic, target_model, task_kind, token_budget, new_chat)
+        queued = queue_claude_request(
+            project,
+            wrapped_prompt,
+            topic,
+            target_model,
+            task_kind,
+            token_budget,
+            new_chat,
+            strict_model=strict_model,
+        )
         queued["route"] = "claude_inbox"
         queued["surface"] = surface
         if ide_host:
@@ -5197,10 +5375,13 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "effort": resolved_effort,
                 "max_response_chars": args.get("max_response_chars"),
                 "timeout_seconds": args.get("timeout_seconds"),
+                "new_chat": new_chat,
+                "async": args.get("async") or args.get("async_handoff") or args.get("use_inbox") or args.get("queue"),
+                "force_sync": args.get("force_sync") or args.get("sync") or args.get("direct") or args.get("use_cli"),
             },
         )
-        result["route"] = "claude_code"
-        result["surface"] = surface
+        result["route"] = "claude_inbox" if result.get("async") else "claude_code"
+        result["surface"] = "extension" if result.get("async") else surface
         if surface_note:
             result["surface_note"] = surface_note
         result["model_resolution"] = model_resolution
@@ -5263,7 +5444,7 @@ TOOLS = [
     },
     {
         "name": "consult_claude",
-        "description": "Ask Claude Code for a bounded synchronous consultation. Defaults to opus/max in plan mode. Keep direct consults small enough to finish within the MCP timeout; split full-site reviews into batches or use route_agent_task for async handoff.",
+        "description": "Ask Claude Code for consultation. Defaults to opus/max in plan mode. Small requests use the direct CLI; heavy Codex-origin Opus/max reviews, audits, and debates queue through the Claude inbox and return a request id to avoid the MCP timeout. Use force_sync to require the direct CLI.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5278,6 +5459,9 @@ TOOLS = [
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 40000},
                 "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'opus', 'sonnet', 'fable'."},
                 "effort": {"type": "string", "description": "Reasoning effort: low|medium|high|xhigh|max ('extra high' => xhigh, 'ultra' => max). Omit for highest available (default)."},
+                "async": {"type": "boolean", "description": "Queue through the Claude inbox and return a request id immediately instead of waiting synchronously."},
+                "force_sync": {"type": "boolean", "description": "Force the direct Claude CLI path even for work that would normally queue to avoid the MCP timeout."},
+                "new_chat": {"type": "boolean", "description": "For async inbox delivery, request a fresh Claude session instead of reusing the project/topic session."},
             },
             "required": ["prompt"],
         },
@@ -5351,6 +5535,14 @@ TOOLS = [
                 "new_chat": {
                     "type": "boolean",
                     "description": "Open a fresh target-agent chat/session instead of reusing the project/topic thread when the bridge supports it.",
+                },
+                "async": {
+                    "type": "boolean",
+                    "description": "For Claude targets, queue through the Claude inbox and return a request id instead of waiting on the synchronous CLI.",
+                },
+                "force_sync": {
+                    "type": "boolean",
+                    "description": "For Claude targets, force the direct CLI path even for heavy Opus/max work.",
                 },
                 "surface": {
                     "type": "string",
@@ -5663,6 +5855,35 @@ TOOLS = [
         },
     },
     {
+        "name": "queue_claude_request",
+        "description": "Queue a request for the Claude Code extension inbox. Use this for long Opus/max reviews, audits, and debates that should not block inside the MCP timeout.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "topic": {"type": "string"},
+                "prompt": {"type": "string"},
+                "target_model": {"type": "string"},
+                "task_kind": {"type": "string"},
+                "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
+                "new_chat": {"type": "boolean"},
+                "strict_model": {"type": "boolean"},
+            },
+            "required": ["prompt"],
+        },
+    },
+    {
+        "name": "get_claude_requests",
+        "description": "List requests queued for the Claude Code extension inbox.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
+        },
+    },
+    {
         "name": "respond_to_request",
         "description": "Return your finished answer to the broker for a queued request (Codex/Claude/Antigravity). Use the Request ID from the inbox/handoff. The broker records the response, timing, and responder on the request and refreshes the per-topic ledger.md. This is how a non-Antigravity surface (e.g. Codex) sends its reply back instead of the user copy-pasting it from the chat panel.",
         "inputSchema": {
@@ -5676,6 +5897,28 @@ TOOLS = [
                 "model": {"type": "string"},
             },
             "required": ["request_id", "response"],
+        },
+    },
+    {
+        "name": "request_status",
+        "description": "Check the lifecycle state of a queued Codex, Claude, or Antigravity request by id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "request_id": {"type": "string"},
+            },
+            "required": ["request_id"],
+        },
+    },
+    {
+        "name": "request_result",
+        "description": "Return the recorded answer for a queued request by id, or report its current state if no answer is recorded yet.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "request_id": {"type": "string"},
+            },
+            "required": ["request_id"],
         },
     },
     {
@@ -5792,6 +6035,8 @@ CLAUDE_LITE_TOOL_NAMES = {
     "route_agent_task",
     "queue_codex_request",
     "get_codex_requests",
+    "queue_claude_request",
+    "get_claude_requests",
     "list_agent_models",
     "get_consultation_history",
     "get_work_memory",
@@ -5804,6 +6049,8 @@ CLAUDE_LITE_TOOL_NAMES = {
     "get_latest_context_snapshot",
     "list_live_surfaces",
     "respond_to_request",
+    "request_status",
+    "request_result",
     "get_request_ledger",
 }
 
@@ -5823,15 +6070,21 @@ PUBLIC_TOOL_NAMES = CLAUDE_LITE_TOOL_NAMES | {
     "get_chat_bootstrap",
     "record_context_event",
     "get_request_ledger",
+    "queue_claude_request",
+    "get_claude_requests",
+    "request_status",
+    "request_result",
 }
 
 COMPACT_TOOL_DESCRIPTIONS = {
     "consult_codex": "Ask Codex for a bounded consultation. Long answers return an excerpt plus response_ref.",
-    "consult_claude": "Ask Claude Code for a bounded consultation. Long answers return an excerpt plus response_ref.",
+    "consult_claude": "Ask Claude Code; heavy Opus/max Codex requests queue to Claude inbox with a request id.",
     "consult_gemini": "Ask Gemini through the configured CLI/API. Long answers return an excerpt plus response_ref.",
     "route_agent_task": "Route a short task to Codex, Claude, Gemini, or Antigravity. Keep prompt brief; use refs for large context.",
     "queue_codex_request": "Queue a request for Codex extension pickup.",
     "get_codex_requests": "List recent queued/completed Codex extension requests.",
+    "queue_claude_request": "Queue a request for Claude extension pickup.",
+    "get_claude_requests": "List recent queued/completed Claude extension requests.",
     "list_agent_models": "List detected models and remembered defaults.",
     "get_consultation_history": "Return recent consultation summaries. Pass include_raw=true only when excerpts are needed.",
     "get_work_memory": "Return the compact per-topic continuation log.",
@@ -5844,6 +6097,8 @@ COMPACT_TOOL_DESCRIPTIONS = {
     "get_latest_context_snapshot": "Read the latest completed snapshot, capped by max_tokens.",
     "list_live_surfaces": "List recent bridge heartbeats and capabilities.",
     "respond_to_request": "Attach a finished answer to a queued broker request.",
+    "request_status": "Check queued request state by id.",
+    "request_result": "Read a queued request answer by id.",
     "get_request_ledger": "Return the per-topic request ledger.",
     "store_shared_context": "Store large context locally and return a compact ref.",
     "compact_topic": "Compact topic state and return a retrievable ref.",
@@ -5955,6 +6210,7 @@ def get_topic_status(project: str | None, topic: str | None) -> dict[str, Any]:
 
         counts["events"] = scalar("select count(*) from agent_events where project=? and topic=?") or 0
         counts["codex_requests"] = scalar("select count(*) from codex_requests where project=? and topic=?") or 0
+        counts["claude_requests"] = scalar("select count(*) from claude_requests where project=? and topic=?") or 0
         counts["antigravity_requests"] = scalar("select count(*) from antigravity_requests where project=? and topic=?") or 0
         counts["context_blobs"] = scalar("select count(*) from shared_context_blobs where project=? and topic=?") or 0
         counts["context_snapshots"] = scalar("select count(*) from context_snapshots where project=? and topic=?") or 0
@@ -5962,6 +6218,7 @@ def get_topic_status(project: str | None, topic: str | None) -> dict[str, Any]:
         times = [
             scalar("select max(created_at) from agent_events where project=? and topic=?"),
             scalar("select max(created_at) from codex_requests where project=? and topic=?"),
+            scalar("select max(created_at) from claude_requests where project=? and topic=?"),
             scalar("select max(created_at) from antigravity_requests where project=? and topic=?"),
         ]
         times = [t for t in times if t]
@@ -5986,6 +6243,13 @@ def get_topic_status(project: str | None, topic: str | None) -> dict[str, Any]:
                 (pname, topic),
             ).fetchall()
         }
+        cl_status = {
+            r["status"]: r["c"]
+            for r in conn.execute(
+                "select status, count(*) c from claude_requests where project=? and topic=? group by status",
+                (pname, topic),
+            ).fetchall()
+        }
         snap_status = {
             r["status"]: r["c"]
             for r in conn.execute(
@@ -5998,8 +6262,8 @@ def get_topic_status(project: str | None, topic: str | None) -> dict[str, Any]:
             (pname, topic),
         ).fetchone()
     counts["claude_sessions"] = count_claude_sessions(workspace)
-    counts["routes"] = counts["codex_requests"] + counts["antigravity_requests"] + counts["claude_sessions"]
-    pending = any(s in open_states for s in list(ag_status) + list(cx_status) + list(snap_status))
+    counts["routes"] = counts["codex_requests"] + counts["claude_requests"] + counts["antigravity_requests"] + counts["claude_sessions"]
+    pending = any(s in open_states for s in list(ag_status) + list(cx_status) + list(cl_status) + list(snap_status))
     status = "in_progress" if pending else ("active" if counts["routes"] else "empty")
     snapshot_ttl = _env_int("AGENT_BROKER_SNAPSHOT_TTL_SECONDS", 600)
     latest_snapshot = None
@@ -6021,7 +6285,7 @@ def get_topic_status(project: str | None, topic: str | None) -> dict[str, Any]:
         "last_model": last_model,
         "last_activity": last_activity,
         "status": status,
-        "request_status": {"antigravity": ag_status, "codex": cx_status, "snapshots": snap_status},
+        "request_status": {"antigravity": ag_status, "codex": cx_status, "claude": cl_status, "snapshots": snap_status},
         "snapshots": {"requests_by_status": snap_status, "latest": latest_snapshot, "ttl_seconds": snapshot_ttl},
         "generated_at": utc_now(),
     }
@@ -7311,10 +7575,27 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         ))
     if name == "get_codex_requests":
         return text_content(get_codex_requests(args.get("project"), int(args.get("limit") or 20)))
+    if name == "queue_claude_request":
+        return text_content(queue_claude_request(
+            args.get("project"),
+            str(args.get("prompt") or ""),
+            args.get("topic"),
+            args.get("target_model"),
+            args.get("task_kind"),
+            int(args.get("token_budget") or 0) or None,
+            args.get("new_chat"),
+            args.get("strict_model"),
+        ))
+    if name == "get_claude_requests":
+        return text_content(get_claude_requests(args.get("project"), int(args.get("limit") or 20)))
     if name == "respond_to_request":
         return text_content(respond_to_request(
             args.get("project"), args.get("topic"), str(args.get("request_id") or ""),
             str(args.get("response") or ""), args.get("agent"), args.get("model")))
+    if name == "request_status":
+        return text_content(request_status(str(args.get("request_id") or "")))
+    if name == "request_result":
+        return text_content(request_result(str(args.get("request_id") or "")))
     if name == "get_request_ledger":
         return text_content(get_request_ledger(args.get("project"), args.get("topic")))
     if name == "request_context_snapshot":
@@ -7768,6 +8049,7 @@ def handle_bridge_cli(argv: list[str]) -> int:
             "requeue <request_id> | await-model <request_id> | resume-model [request_id] | awaiting-model [project] [limit] | "
             "complete <request_id> <model> <response> | complete-file <request_id> <model> <path> | "
             "codex-inbox [project] [limit] | queue-codex <project> <topic> <prompt> | "
+            "claude-inbox [project] [limit] | queue-claude <project> <topic> <target_model> <prompt> | "
             "respond <project> <topic> <request_id> <response> [agent] [model] | ledger [project] [topic] | "
             "claude-responses [project] | status <request_id> | result <request_id> | "
             "cancel <request_id> [reason] | reap [max_age_hours] | "
@@ -7868,6 +8150,14 @@ def handle_bridge_cli(argv: list[str]) -> int:
         if len(argv) < 4:
             raise ValueError("queue-codex requires <project> <topic> <prompt>")
         result = queue_codex_request(argv[1], argv[3], argv[2])
+    elif command == "claude-inbox":
+        project = argv[1] if len(argv) > 1 else "*"
+        limit = int(argv[2]) if len(argv) > 2 else 20
+        result = get_claude_requests(project, limit)
+    elif command == "queue-claude":
+        if len(argv) < 5:
+            raise ValueError("queue-claude requires <project> <topic> <target_model> <prompt>")
+        result = queue_claude_request(argv[1], argv[4], argv[2] if argv[2] != "*" else None, argv[3])
     elif command == "respond":
         if len(argv) < 5:
             raise ValueError("respond requires <project> <topic> <request_id> <response> [agent] [model]")
