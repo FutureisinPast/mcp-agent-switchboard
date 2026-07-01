@@ -35,7 +35,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.5"
+BROKER_VERSION = "1.0.6"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -159,6 +159,11 @@ FAMILY_FLAGSHIP = {
 FAMILY_EFFORTS = {
     "codex": ["minimal", "low", "medium", "high", "xhigh"],
     "claude": ["low", "medium", "high", "xhigh", "max"],
+}
+
+PEER_CONSULT_DEFAULTS = {
+    "codex": "claude",
+    "claude": "codex",
 }
 
 # Free-text effort phrases -> canonical intent. "top" means "this family's highest"
@@ -1829,6 +1834,19 @@ def default_target_agent_for_family(family: str) -> str:
     return "antigravity"
 
 
+def family_from_caller() -> str | None:
+    raw = normalize_lookup(f"{os.environ.get('AGENT_BROKER_CALLER') or ''} {_MCP_CLIENT_NAME}")
+    if not raw:
+        return None
+    family = model_family_for(raw)
+    return family if family in PEER_CONSULT_DEFAULTS else None
+
+
+def peer_consult_family_for_caller() -> str | None:
+    caller_family = family_from_caller()
+    return PEER_CONSULT_DEFAULTS.get(caller_family or "")
+
+
 def model_entry(model_id: str, display: str | None = None, aliases: list[str] | None = None, source: str = "static") -> dict[str, Any]:
     return {
         "id": model_id,
@@ -2163,6 +2181,27 @@ def detect_model_in_prompt(prompt: Any) -> str | None:
     return None
 
 
+def detect_target_family_in_prompt(prompt: Any) -> str | None:
+    """Detect generic peer mentions such as "consult with Claude" or "ask Codex".
+    This is only used when structured target fields are empty."""
+    text = " ".join(str(prompt or "").lower().split())
+    if not text:
+        return None
+    family_patterns = [
+        (r"(?:claude|claude\s+code)", "claude"),
+        (r"(?:codex|gpt|openai)", "codex"),
+        (r"gemini", "gemini"),
+    ]
+    for pattern, family in family_patterns:
+        verb_re = r"\b" + _PROMPT_MODEL_VERB + r"\b[^.!?]{0,32}?\b" + pattern + r"\b"
+        if re.search(verb_re, text):
+            return family
+        poss_re = r"\b" + pattern + r"(?:'s|s')?\s+" + _PROMPT_MODEL_NOUN + r"\b"
+        if re.search(poss_re, text):
+            return family
+    return None
+
+
 def model_guard_text(requested_label: Any, *, strict: bool) -> str:
     """Prompt prefix that makes the RECEIVING agent self-check its model. On surfaces
     the broker cannot switch programmatically (Codex/Claude extensions and apps), this
@@ -2297,6 +2336,10 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
     # "claude opus"/"sonnet" to be misclassified as Antigravity in-app Claude.
     raw_agent = args.get("target_agent") or args.get("agent")
     raw_model = args.get("target_model") or args.get("model") or ""
+    if not str(raw_agent or "").strip() and not str(raw_model or "").strip():
+        peer_family = peer_consult_family_for_caller()
+        if peer_family:
+            raw_agent = default_target_agent_for_family(peer_family)
     # Pull any reasoning-effort phrase out of the model text first, so "5.5 extra high"
     # resolves the model as "5.5" and carries the effort separately instead of failing
     # to match (which used to stall on needs_model_selection).
@@ -4705,6 +4748,8 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
     # Pass the RAW model into resolution. normalize_model_name applies the
     # Antigravity display-name aliases (opus -> "Claude Opus 4.6 (Thinking)"),
     # which would corrupt Claude/Codex CLI resolution if applied this early.
+    explicit_target_agent = args.get("target_agent") or args.get("agent")
+    target_agent_hint = explicit_target_agent
     target_model = str(args.get("target_model") or args.get("model") or "")
     new_chat = truthy(args.get("new_chat") or args.get("force_new_chat"))
     # Conservative fallback: if no model was named in the structured args, look for an
@@ -4716,6 +4761,15 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         detected_model = detect_model_in_prompt(prompt)
         if detected_model:
             target_model = detected_model
+    prompt_target_family = None
+    if not str(target_agent_hint or "").strip() and not target_model.strip():
+        prompt_target_family = detect_target_family_in_prompt(prompt)
+        if prompt_target_family:
+            target_agent_hint = default_target_agent_for_family(prompt_target_family)
+        else:
+            peer_family = peer_consult_family_for_caller()
+            if peer_family:
+                target_agent_hint = default_target_agent_for_family(peer_family)
     requested_label = target_model.strip()
     # Detect the family over the WHOLE routing intent (all hint fields), so a host
     # word like "antigravity"/"vscode" sitting next to an explicit family + an
@@ -4728,7 +4782,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         )
     )
     intent_family = model_family_for(routing_blob)
-    target_agent = infer_target_agent(args.get("target_agent") or args.get("agent"), target_model)
+    target_agent = infer_target_agent(target_agent_hint, target_model)
     if intent_family in ("claude", "codex", "gemini") and model_family_for(target_agent, target_model) == "antigravity":
         # The narrow per-field inference picked Antigravity-as-host; the full intent
         # names a real family hosted in that IDE. Correct it before model resolution.

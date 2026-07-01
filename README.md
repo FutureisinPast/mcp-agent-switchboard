@@ -131,7 +131,7 @@ There is a real difference between **delivered** (a file/prompt reached the surf
 
 > **Model + effort on the CLIs:** model and reasoning effort are **separate inputs**, never folded together. Pass **`effort`** (`minimal|low|medium|high|xhigh`; *"extra high" → xhigh*, *"ultra"/"max" → family top*) and the broker sets it as its own CLI flag (Codex `-c model_reasoning_effort=`, Claude `--effort`) — it is **never** appended to the model name. A bare family request (**"codex"**, **"claude"**) defaults to the **flagship model at the highest available effort** (Codex `gpt-5.5`/`xhigh`, Claude `opus`/`max`); a specific model is honored verbatim (*"sonnet 4.6 for implementation"*, *"gpt-5.4-mini"*). Effort phrases embedded in a model request (*"5.5 extra high"*) are split off before matching, so they resolve to model `gpt-5.5` + effort `xhigh` rather than an invalid model string.
 
-> The broker is **target-driven**: it routes by *where the work should go*, not by *who sent it*. A "from → to" matrix would imply source-awareness the router doesn't have.
+> The broker is **target-driven** when a target is named. If a Codex/Claude caller leaves the target completely empty, Switchboard uses the caller only as a fallback: Codex defaults to Claude, and Claude defaults to Codex. A named target or prompt phrase like "consult with Claude" still wins.
 
 ---
 
@@ -172,6 +172,11 @@ broker/bridge version drift and prints actionable next steps.
 ---
 
 ## Changelog
+
+### v1.0.6 (Codex/Claude peer-consult fallback)
+- **Codex can now ask for a peer consult without naming every routing field.** If a Codex-origin Switchboard call leaves `target_agent` and `target_model` empty, the broker now defaults to Claude Code CLI with the flagship Claude model (`opus`, max effort) instead of falling into Antigravity model selection.
+- **Claude gets the symmetric fallback.** Ambiguous Claude-origin consult/co-op/debate requests now default to Codex CLI with the flagship Codex model (`gpt-5.5`, xhigh effort).
+- **Prompt wording still wins.** Natural phrases such as "consult with Claude" or "ask Codex for a second opinion" are detected before the peer fallback, and explicit structured targets continue to take priority.
 
 ### v1.0.5 (Antigravity local context + Claude tool permissions)
 - **Antigravity context pickup no longer dead-ends when no live bridge answers.** `request_context_snapshot(target_agent="antigravity")` now falls back to bounded local Antigravity task/log/activity state (`~/.gemini/antigravity-ide/brain`), workspace state, file history, and recent project file mtimes. It clearly labels the result as low/medium-confidence instead of pretending it is a guaranteed visible-chat transcript.
