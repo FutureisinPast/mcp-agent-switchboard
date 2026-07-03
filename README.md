@@ -173,6 +173,11 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.9 (Fable backend routing fix)
+- **Fable max no longer gets caught by the Opus async-inbox rule.** The automatic async queue is now limited to `opus` at max effort; `fable`, `sonnet`, and other Claude aliases stay on the direct Claude CLI backend unless async is explicitly requested.
+- **`route_agent_task` now honors the requested Claude effort.** A routed request with `effort: low` now resolves and runs as low instead of silently falling back to Claude's max-effort default.
+- **Stale Fable inbox requests can be safely cancelled.** The failed queued Fable requests from the regression are terminal once cancelled and will not be re-delivered by the bridge.
+
 ### v1.0.8 (async Opus Max consults)
 - **Heavy Codex -> Claude Opus/max consults no longer block inside the MCP timeout.** Reviews, audits, debates, bug hunts, implementations, and other large max-effort Claude requests from Codex now queue through the Claude inbox and return a request id immediately.
 - **Opus/max quality is preserved instead of downgraded.** The queued Claude request carries a strict model guard plus an explicit effort guard, so the receiver is told to use Claude Opus at max effort or report a mismatch instead of silently answering with a lesser/default model.

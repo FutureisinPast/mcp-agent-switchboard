@@ -35,7 +35,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.8"
+BROKER_VERSION = "1.0.9"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -2578,6 +2578,7 @@ def should_queue_heavy_claude_consult(
     task_kind: str,
     token_budget: int,
     effort: str | None,
+    model_name: str | None = None,
 ) -> tuple[bool, str | None]:
     if wants_async_claude(args):
         return True, "caller_requested_async"
@@ -2587,6 +2588,8 @@ def should_queue_heavy_claude_consult(
         return False, "caller_not_codex"
     if str(effort or "").strip().lower() != "max":
         return False, "not_claude_max_effort"
+    if normalize_lookup(model_name) != "opus":
+        return False, f"model_not_opus:{model_name or 'default'}"
     if task_kind in {"quick_check", "sanity_check"}:
         return False, "quick_task"
     if task_kind in HEAVY_CLAUDE_ASYNC_TASKS:
@@ -2970,7 +2973,9 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         pack = get_context_pack(project_info.name, topic_arg, DEFAULT_CONTEXT_BUDGET)["content"]
         prompt = f"Shared context pack for this topic:\n\n{pack}\n\nCurrent request:\n\n{prompt}"
     if model == "claude":
-        async_queue, async_reason = should_queue_heavy_claude_consult(args, prompt, task_kind, token_budget, effort)
+        async_queue, async_reason = should_queue_heavy_claude_consult(
+            args, prompt, task_kind, token_budget, effort, resolved_model
+        )
         if async_queue:
             guard_label, model_label = claude_async_model_labels(resolved_model, effort)
             queued_prompt = prompt
@@ -5106,6 +5111,8 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
             "topic": topic,
             "target_agent": target_agent,
             "target_model": target_model,
+            "effort": args.get("effort"),
+            "reasoning_effort": args.get("reasoning_effort"),
             # A model only mentioned in the prompt is a one-off; don't overwrite the
             # stored topic default with it. Explicit picks are also one-offs by default
             # now (remember_model defaults False) so bare "codex"/"claude" later means
