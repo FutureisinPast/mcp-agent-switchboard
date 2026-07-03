@@ -173,6 +173,11 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.10 (consultation response redaction fix)
+- **Successful local consultation answers are no longer line-redacted before return or storage.** Long Fable/Claude/Codex/Gemini responses now keep security-audit wording intact in both the inline excerpt and `retrieve_shared_context(response_ref, query)`.
+- **Generic shared context redaction remains enabled by default.** User-provided context, prompts, logs, and error responses still use the existing safety redaction path.
+- **Retrieved shared context now flags stored redaction placeholders.** Older refs that already contain `[redacted possible secret line]` report `contains_redaction_placeholders` so callers know those lines were removed before storage.
+
 ### v1.0.9 (Fable backend routing fix)
 - **Fable max no longer gets caught by the Opus async-inbox rule.** The automatic async queue is now limited to `opus` at max effort; `fable`, `sonnet`, and other Claude aliases stay on the direct Claude CLI backend unless async is explicitly requested.
 - **`route_agent_task` now honors the requested Claude effort.** A routed request with `effort: low` now resolves and runs as low instead of silently falling back to Claude's max-effort default.

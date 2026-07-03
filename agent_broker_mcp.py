@@ -35,7 +35,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.9"
+BROKER_VERSION = "1.0.10"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -1328,8 +1328,9 @@ def redact_text(value: Any) -> str:
     return "\n".join(redacted)
 
 
-def compact_text(value: Any, limit: int = 500) -> str:
-    text = re.sub(r"\s+", " ", redact_text(value)).strip()
+def compact_text(value: Any, limit: int = 500, redact: bool = True) -> str:
+    raw = redact_text(value) if redact else ("" if value is None else str(value))
+    text = re.sub(r"\s+", " ", raw).strip()
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 15)].rstrip() + " ... [truncated]"
@@ -1404,7 +1405,7 @@ IMPORTANT_CONTEXT_RE = re.compile(
 )
 
 
-def summarize_json_context(text: str, max_chars: int) -> str | None:
+def summarize_json_context(text: str, max_chars: int, redact: bool = True) -> str | None:
     try:
         data = json.loads(text)
     except Exception:
@@ -1425,26 +1426,31 @@ def summarize_json_context(text: str, max_chars: int) -> str | None:
             if len(data) > 1:
                 samples.append(("last", data[-1]))
         for label, item in samples:
-            sample = compact_text(json.dumps(item, ensure_ascii=False), 500)
+            sample = compact_text(json.dumps(item, ensure_ascii=False), 500, redact=redact)
             lines.append(f"- {label}: {sample}")
     elif isinstance(data, dict):
         keys = list(data.keys())
         lines.append(f"- keys: {', '.join(str(key) for key in keys[:40])}")
         for key in keys[:12]:
-            lines.append(f"- {key}: {compact_text(data.get(key), 280)}")
+            lines.append(f"- {key}: {compact_text(data.get(key), 280, redact=redact)}")
     else:
         return None
     result = "\n".join(lines)
     return result[:max_chars].rstrip() if len(result) > max_chars else result
 
 
-def compress_context_content(value: Any, max_chars: int = SHARED_CONTEXT_INLINE_CHARS, content_type: str | None = None) -> str:
-    text = redact_text(value).strip()
+def compress_context_content(
+    value: Any,
+    max_chars: int = SHARED_CONTEXT_INLINE_CHARS,
+    content_type: str | None = None,
+    redact: bool = True,
+) -> str:
+    text = (redact_text(value) if redact else ("" if value is None else str(value))).strip()
     if len(text) <= max_chars:
         return text
     kind = classify_context_content(text, content_type)
     if kind == "json":
-        json_summary = summarize_json_context(text, max_chars)
+        json_summary = summarize_json_context(text, max_chars, redact=redact)
         if json_summary:
             return json_summary
 
@@ -1474,7 +1480,7 @@ def compress_context_content(value: Any, max_chars: int = SHARED_CONTEXT_INLINE_
     # the rendered excerpt fits both the char cap and a proportional token budget.
     token_budget = max(48, max_chars // 4)
     orig_tokens = estimate_tokens(text)
-    body = [f"- L{line_no} [{reason}]: {compact_text(line, 260)}" for line_no, line, reason in selected]
+    body = [f"- L{line_no} [{reason}]: {compact_text(line, 260, redact=redact)}" for line_no, line, reason in selected]
 
     def render(n: int) -> str:
         header = [
@@ -1501,9 +1507,10 @@ def store_shared_context(
     source: str | None = None,
     content_type: str | None = None,
     max_chars: int | None = None,
+    redact: bool = True,
 ) -> dict[str, Any]:
     init_db()
-    text = redact_text(content).strip()
+    text = (redact_text(content) if redact else ("" if content is None else str(content))).strip()
     if not text:
         raise ValueError("content is required")
     project_info = resolve_project(project)
@@ -1512,7 +1519,7 @@ def store_shared_context(
     ).hexdigest()
     ref = f"ctx_{digest[:16]}"
     kind = classify_context_content(text, content_type)
-    compressed = compress_context_content(text, int(max_chars or SHARED_CONTEXT_INLINE_CHARS), kind)
+    compressed = compress_context_content(text, int(max_chars or SHARED_CONTEXT_INLINE_CHARS), kind, redact=False)
     now = utc_now()
     with db_connect() as conn:
         conn.execute(
@@ -1553,6 +1560,7 @@ def store_shared_context(
         "original_tokens_est": original_tokens,
         "compressed_tokens_est": compressed_tokens,
         "savings_percent_est": max(0.0, savings),
+        "redaction": "applied" if redact else "disabled",
         "compressed": compressed,
     }
 
@@ -1598,6 +1606,7 @@ def retrieve_shared_context(ref: str, query: str | None = None, limit: int | Non
     original = row["original_text"]
     content = query_lines(original, str(query), char_limit) if query else original[:char_limit].rstrip()
     truncated = len(content) < len(original) if not query else False
+    contains_redaction_placeholders = "[redacted possible secret line]" in content
     return {
         "ref": clean_ref,
         "project": row["project"],
@@ -1607,6 +1616,12 @@ def retrieve_shared_context(ref: str, query: str | None = None, limit: int | Non
         "query": query,
         "truncated": truncated,
         "chars": len(content),
+        "contains_redaction_placeholders": contains_redaction_placeholders,
+        "redaction_note": (
+            "Stored content already contains redaction placeholders; this ref cannot recover the removed lines."
+            if contains_redaction_placeholders
+            else None
+        ),
         "content": content,
     }
 
@@ -3047,9 +3062,10 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         response_ref = None
         response_payload = response
         response_truncated = False
+        redact_response = status != "ok"
         if len(response or "") > max_response_chars:
             response_truncated = True
-            response_payload = compact_text(response, max_response_chars)
+            response_payload = compact_text(response, max_response_chars, redact=redact_response)
             try:
                 response_ref = store_shared_context(
                     project_info.name,
@@ -3058,6 +3074,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
                     f"consultation:{consulted_name}",
                     "consultation_response",
                     max_response_chars,
+                    redact=redact_response,
                 ).get("ref")
             except Exception as exc:  # noqa: BLE001
                 log(f"consult response stash failed: {exc}")
@@ -3074,7 +3091,11 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             result["response_truncated"] = True
             result["response_chars"] = len(response or "")
             result["response_ref"] = response_ref
-            result["note"] = "Long response was stored locally; use retrieve_shared_context(response_ref, query) for exact details."
+            result["response_redacted"] = redact_response
+            if redact_response:
+                result["note"] = "Long error response was stored with safety redaction; use retrieve_shared_context(response_ref, query) for details."
+            else:
+                result["note"] = "Long consultation response was stored locally without redaction; use retrieve_shared_context(response_ref, query) for exact details."
         return result
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
