@@ -173,6 +173,10 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.12 (Codex consult effort guard)
+- **Serious Codex Sol consults no longer silently run at medium.** Accidental lower efforts on `gpt-5.6-sol` consult/audit/review/debate routes are upgraded to `max`.
+- **Deliberate downshifts are still allowed.** Use `model_policy: "balanced"`, `"efficient"`, or `"lower_effort"` when medium/lower effort is intentionally enough, or `model_policy: "cheap_read"` for Luna reader/sample-prep work.
+
 ### v1.0.11 (Codex 5.6 routing guide)
 - **Codex defaults now target GPT-5.6 Sol at max reasoning.** Bare `codex`/`gpt` consults, audits, reviews, debates, and co-op routes resolve to `gpt-5.6-sol` with `max` effort.
 - **Cheap reader/sample-prep requests now downshift automatically.** Explicit cheap/fast reading, extraction, summarizing, drafting, or sample-prep requests can use `model_policy: "cheap_read"` and resolve to `gpt-5.6-luna` with `low` effort.

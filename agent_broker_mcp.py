@@ -35,7 +35,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.11"
+BROKER_VERSION = "1.0.12"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -123,6 +123,17 @@ CODEX_BALANCED_MODEL = "gpt-5.6-terra"
 CODEX_CHEAP_MODEL = "gpt-5.6-luna"
 CODEX_DEFAULT_EFFORT = "max"
 CODEX_CHEAP_EFFORT = "low"
+CODEX_SERIOUS_TASK_KINDS = {
+    "consult",
+    "co_audit",
+    "debate",
+    "argue",
+    "review",
+    "bug_hunt",
+    "sanity_check",
+    "implementation_plan",
+    "implementation",
+}
 
 MODEL_ALIASES = {
     "gemini flash": "Gemini 3.5 Flash (High)",
@@ -2096,7 +2107,7 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                 "target_agent": "codex",
                 "target_model": CODEX_FLAGSHIP_MODEL,
                 "effort": CODEX_DEFAULT_EFFORT,
-                "rule": "Bare 'consult Codex', 'co-op with Codex', 'audit', 'review', 'debate', or 'talk to Codex' should use the flagship/highest route.",
+                "rule": "Bare 'consult Codex', 'co-op with Codex', 'audit', 'review', 'debate', or 'talk to Codex' should use the flagship/highest route. Accidental lower efforts are upgraded to max unless the caller makes the downshift explicit.",
             },
             "cheap_read_sample_prep": {
                 "target_agent": "codex",
@@ -2108,7 +2119,7 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                 "target_agent": "codex",
                 "target_model": CODEX_BALANCED_MODEL,
                 "effort": "medium",
-                "rule": "Use Terra when the user asks for a middle ground between Sol quality and Luna cost.",
+                "rule": "Use Terra or model_policy='balanced' when the user asks for a middle ground, or when the caller deliberately judges medium/lower effort sufficient.",
             },
         },
         "caller_examples": {
@@ -2134,6 +2145,7 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
         },
         "notes": [
             "Use target_model for the model slug only; put reasoning in effort.",
+            "For serious Sol consult/audit/review/debate, medium/high is allowed only when the caller explicitly marks the downshift with model_policy such as 'balanced', 'efficient', or 'lower_effort', or the prompt says medium/lower effort is enough.",
             "The broker maps bare Codex/GPT requests to gpt-5.6-sol instead of the bare gpt-5.6 alias because ChatGPT-auth Codex can reject that alias.",
             "Use list_agent_models for the raw catalog; this guide adds the default-routing policy.",
         ],
@@ -2493,11 +2505,87 @@ def apply_codex_model_policy(
     raw_model: Any,
     raw_effort: Any,
 ) -> tuple[Any, Any, str | None]:
+    policy = normalize_lookup(str(args.get("model_policy") or ""))
+    if policy in {"cheap read", "cheap_read", "cheap reader", "cheap"} and not str(raw_model or "").strip():
+        return CODEX_CHEAP_MODEL, raw_effort or CODEX_CHEAP_EFFORT, "cheap_read"
     if str(raw_model or "").strip() or str(raw_effort or "").strip():
         return raw_model, raw_effort, None
     if requested_codex_cheap_read_policy(args, prompt, task_kind):
         return CODEX_CHEAP_MODEL, CODEX_CHEAP_EFFORT, "cheap_read"
     return raw_model, raw_effort, None
+
+
+def is_codex_flagship_model(model: Any) -> bool:
+    return normalize_lookup(model) in {
+        normalize_lookup(CODEX_FLAGSHIP_MODEL),
+        "gpt 5.6",
+        "gpt-5.6",
+        "sol",
+        "solar",
+    }
+
+
+def is_serious_codex_task(task_kind: str, prompt: str) -> bool:
+    kind = normalize_task_kind(task_kind)
+    if kind in CODEX_SERIOUS_TASK_KINDS:
+        return True
+    text = normalize_lookup(prompt)
+    return bool(re.search(r"\b(?:consult|co-op|cooperate|audit|review|debate|argue|bug hunt|security|deep|second opinion)\b", text))
+
+
+def codex_lower_effort_allowed(args: dict[str, Any], prompt: str, model_policy: str | None = None) -> bool:
+    """A lower effort on serious Sol work is allowed only when the caller makes the
+    downshift explicit. This preserves best-advice defaults while still allowing
+    deliberate medium/efficient requests."""
+    policy = normalize_lookup(
+        " ".join(
+            str(value or "")
+            for value in (
+                model_policy,
+                args.get("model_policy"),
+                args.get("cost_tier"),
+                args.get("model_tier"),
+                args.get("routing_policy"),
+                args.get("quality"),
+            )
+        )
+    )
+    if re.search(r"\b(?:cheap|cheaper|cheapest|fast|fastest|efficient|budget|balanced|medium|lower effort|lower-effort|sufficient|good enough|good-enough)\b", policy):
+        return True
+    if any(truthy(args.get(key)) for key in ("allow_lower_effort", "explicit_lower_effort", "effort_override", "user_requested_effort")):
+        return True
+    text = normalize_lookup(prompt)
+    return bool(
+        re.search(
+            r"\b(?:use|run|try|okay|ok|fine|enough|sufficient|good enough|no need for)\b[^.!?]{0,40}\b(?:medium|high|low|cheap|fast|efficient|balanced|lower effort|max)\b",
+            text,
+        )
+        or re.search(r"\b(?:medium is enough|high is enough|lower effort is enough|no need for max|do not use max)\b", text)
+    )
+
+
+def enforce_codex_effort_policy(
+    args: dict[str, Any],
+    prompt: str,
+    task_kind: str,
+    model: Any,
+    effort: str | None,
+    model_policy: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Agents sometimes pass medium out of habit. For serious Codex work on Sol,
+    enforce the intended max default unless the request is explicitly cheap-read or
+    names a lower-tier model such as Luna/Terra."""
+    policy_text = normalize_lookup(model_policy or args.get("model_policy") or "")
+    if policy_text in {"cheap read", "cheap_read", "cheap reader", "cheap"}:
+        return effort, None
+    if (
+        is_codex_flagship_model(model)
+        and is_serious_codex_task(task_kind, prompt)
+        and effort != CODEX_DEFAULT_EFFORT
+        and not codex_lower_effort_allowed(args, prompt, model_policy)
+    ):
+        return CODEX_DEFAULT_EFFORT, "codex_sol_serious_max"
+    return effort, None
 
 
 def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
@@ -2530,6 +2618,10 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
     if match["status"] == "generic":
         default = find_model_default(project, topic, family)
         if default:
+            final_effort, effort_policy = enforce_codex_effort_policy(
+                args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")),
+                default["target_model"], resolved_effort, model_policy,
+            ) if family == "codex" else (resolved_effort, None)
             result = {
                 "status": "resolved",
                 "project": resolve_project(project).name,
@@ -2537,16 +2629,22 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
                 "model_family": family,
                 "target_agent": default["target_agent"],
                 "target_model": default["target_model"],
-                "effort": resolved_effort,
+                "effort": final_effort,
                 "source": "topic_default",
             }
             if model_policy:
                 result["model_policy"] = model_policy
+            if effort_policy:
+                result["effort_policy"] = effort_policy
             return result
         # No explicit pin: default to the family flagship at highest effort instead of
         # interrupting to ask. Families with no flagship (antigravity / gemini) still ask.
         flagship = FAMILY_FLAGSHIP.get(family)
         if flagship is not None:
+            final_effort, effort_policy = enforce_codex_effort_policy(
+                args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")),
+                flagship, resolved_effort, model_policy,
+            ) if family == "codex" else (resolved_effort, None)
             result = {
                 "status": "resolved",
                 "project": resolve_project(project).name,
@@ -2554,11 +2652,13 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
                 "model_family": family,
                 "target_agent": default_target_agent_for_family(family),
                 "target_model": flagship,
-                "effort": resolved_effort,
+                "effort": final_effort,
                 "source": "family_flagship",
             }
             if model_policy:
                 result["model_policy"] = model_policy
+            if effort_policy:
+                result["effort_policy"] = effort_policy
             return result
         catalog = list_agent_models(family, project, topic).get("catalogs", {}).get(family, {})
         return {
@@ -2573,6 +2673,10 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
 
     if match["status"] == "matched":
         resolved_agent = default_target_agent_for_family(family)
+        final_effort, effort_policy = enforce_codex_effort_policy(
+            args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")),
+            match["model"], resolved_effort, model_policy,
+        ) if family == "codex" else (resolved_effort, None)
         # Only pin as the topic default when the caller EXPLICITLY opts in. Auto-pinning
         # every explicit pick made model selection sticky and surprising on later
         # generic requests; bare "codex"/"claude" should mean "flagship", not "last used".
@@ -2586,7 +2690,7 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
             "target_agent": resolved_agent,
             "target_model": match["model"],
             "display": match.get("display"),
-            "effort": resolved_effort,
+            "effort": final_effort,
             "source": "explicit_request",
         }
         note = version_collapse_note(family, target_model, match["model"])
@@ -2594,6 +2698,8 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
             resolved["note"] = note
         if model_policy:
             resolved["model_policy"] = model_policy
+        if effort_policy:
+            resolved["effort_policy"] = effort_policy
         return resolved
 
     catalog = list_agent_models(family, project, topic).get("catalogs", {}).get(family, {})
@@ -3149,6 +3255,9 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     resolved_model, effort = resolve_cli_model_and_effort(
         model, requested_model, requested_effort
     )
+    effort_policy = None
+    if model == "codex":
+        effort, effort_policy = enforce_codex_effort_policy(args, prompt, task_kind, resolved_model, effort, model_policy)
     timeout_seconds = bounded_sync_timeout(args.get("timeout_seconds"))
     project_info = resolve_project(str(project_arg) if project_arg is not None else None)
     if task_kind != "consult" or args.get("include_task_contract", True) is not False:
@@ -3258,6 +3367,8 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         }
         if model_policy:
             result["model_policy"] = model_policy
+        if effort_policy:
+            result["effort_policy"] = effort_policy
         if response_truncated:
             result["response_truncated"] = True
             result["response_chars"] = len(response or "")
@@ -5641,7 +5752,7 @@ TOOLS = [
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 40000},
-                "model_policy": {"type": "string", "description": "Optional policy hint. Use 'cheap_read' only for explicit cheap/fast reading, extraction, summarizing, sample prep, drafting, or boilerplate. Omit for flagship consult/audit/review/debate."},
+                "model_policy": {"type": "string", "description": "Optional policy hint. Use 'cheap_read' for explicit cheap/fast reading, extraction, summarizing, sample prep, drafting, or boilerplate. Use 'balanced'/'efficient'/'lower_effort' when a deliberate medium/lower serious consult is acceptable. Omit for flagship consult/audit/review/debate."},
                 "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'gpt-5.5', 'gpt-5.4-mini'."},
                 "effort": {"type": "string", "description": "Reasoning effort: minimal|low|medium|high|xhigh ('extra high'/'max'/'ultra' => xhigh). Omit for highest available (default)."},
             },
@@ -5774,7 +5885,7 @@ TOOLS = [
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "mode": {"type": "string"},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 40000},
-                "model_policy": {"type": "string", "description": "Optional policy hint. Use 'cheap_read' only for explicit cheap/fast reading, extraction, summarizing, sample prep, drafting, or boilerplate; omit for flagship consult/audit/review/debate."},
+                "model_policy": {"type": "string", "description": "Optional policy hint. Use 'cheap_read' for explicit cheap/fast reading, extraction, summarizing, sample prep, drafting, or boilerplate. Use 'balanced'/'efficient'/'lower_effort' when a deliberate medium/lower serious consult is acceptable; omit for flagship consult/audit/review/debate."},
                 "prompt": {"type": "string"},
             },
             "required": ["prompt"],
