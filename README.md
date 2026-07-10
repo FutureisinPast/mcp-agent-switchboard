@@ -173,6 +173,11 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.11 (Codex 5.6 routing guide)
+- **Codex defaults now target GPT-5.6 Sol at max reasoning.** Bare `codex`/`gpt` consults, audits, reviews, debates, and co-op routes resolve to `gpt-5.6-sol` with `max` effort.
+- **Cheap reader/sample-prep requests now downshift automatically.** Explicit cheap/fast reading, extraction, summarizing, drafting, or sample-prep requests can use `model_policy: "cheap_read"` and resolve to `gpt-5.6-luna` with `low` effort.
+- **Agents can ask the broker which model policy to use.** New `get_model_routing_guide` returns the policy, examples, and available model catalog so Claude/Codex do not have to rediscover the rules every session.
+
 ### v1.0.10 (consultation response redaction fix)
 - **Successful local consultation answers are no longer line-redacted before return or storage.** Long Fable/Claude/Codex/Gemini responses now keep security-audit wording intact in both the inline excerpt and `retrieve_shared_context(response_ref, query)`.
 - **Generic shared context redaction remains enabled by default.** User-provided context, prompts, logs, and error responses still use the existing safety redaction path.

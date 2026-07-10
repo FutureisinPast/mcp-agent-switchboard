@@ -35,7 +35,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.10"
+BROKER_VERSION = "1.0.11"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -118,6 +118,12 @@ SECRET_WORDS = {
     "token",
 }
 
+CODEX_FLAGSHIP_MODEL = "gpt-5.6-sol"
+CODEX_BALANCED_MODEL = "gpt-5.6-terra"
+CODEX_CHEAP_MODEL = "gpt-5.6-luna"
+CODEX_DEFAULT_EFFORT = "max"
+CODEX_CHEAP_EFFORT = "low"
+
 MODEL_ALIASES = {
     "gemini flash": "Gemini 3.5 Flash (High)",
     "gemini flash high": "Gemini 3.5 Flash (High)",
@@ -134,6 +140,18 @@ MODEL_ALIASES = {
     "claude sonnet 4.6": "Claude Sonnet 4.6 (Thinking)",
     "gpt 5.5": "gpt-5.5",
     "gpt-5.5": "gpt-5.5",
+    "gpt 5.6": CODEX_FLAGSHIP_MODEL,
+    "gpt-5.6": CODEX_FLAGSHIP_MODEL,
+    "gpt 5.6 sol": CODEX_FLAGSHIP_MODEL,
+    "gpt-5.6-sol": CODEX_FLAGSHIP_MODEL,
+    "gpt 5.6 solar": CODEX_FLAGSHIP_MODEL,
+    "gpt-5.6-solar": CODEX_FLAGSHIP_MODEL,
+    "gpt 5.6 terra": CODEX_BALANCED_MODEL,
+    "gpt-5.6-terra": CODEX_BALANCED_MODEL,
+    "gpt 5.6 luna": CODEX_CHEAP_MODEL,
+    "gpt-5.6-luna": CODEX_CHEAP_MODEL,
+    "gpt 5.6 lunar": CODEX_CHEAP_MODEL,
+    "gpt-5.6-lunar": CODEX_CHEAP_MODEL,
 }
 
 GENERIC_MODEL_REQUESTS = {
@@ -156,7 +174,7 @@ GENERIC_MODEL_REQUESTS = {
 # one-liners when a new top model ships. None => no auto-flagship (caller must name
 # a model, or the family's own config/default applies).
 FAMILY_FLAGSHIP = {
-    "codex": "gpt-5.5",
+    "codex": CODEX_FLAGSHIP_MODEL,
     "claude": "opus",
     "gemini": None,
 }
@@ -165,7 +183,7 @@ FAMILY_FLAGSHIP = {
 # family max, used as the default ("highest effort available") for routed CLI
 # consults unless a lower effort is explicitly requested. Gemini has no effort knob.
 FAMILY_EFFORTS = {
-    "codex": ["minimal", "low", "medium", "high", "xhigh"],
+    "codex": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
     "claude": ["low", "medium", "high", "xhigh", "max"],
 }
 
@@ -177,6 +195,7 @@ PEER_CONSULT_DEFAULTS = {
 # Free-text effort phrases -> canonical intent. "top" means "this family's highest"
 # (codex => xhigh, claude => max), resolved per family in effort_for_family().
 _EFFORT_SYNONYMS = {
+    "none": "none", "no reasoning": "none",
     "minimal": "minimal", "min": "minimal",
     "low": "low",
     "medium": "medium", "med": "medium", "mid": "medium", "normal": "medium",
@@ -232,6 +251,27 @@ STATIC_CLAUDE_MODELS = [
 ]
 
 STATIC_CODEX_MODELS = [
+    {
+        "id": CODEX_FLAGSHIP_MODEL,
+        "display": "GPT-5.6 Sol (flagship; default for consult/audit/debate)",
+        "aliases": [
+            "gpt-5.6", "gpt 5.6", "gpt-5.6-sol", "gpt 5.6 sol",
+            "sol", "solar", "5.6 sol", "5.6 solar",
+        ],
+    },
+    {
+        "id": CODEX_BALANCED_MODEL,
+        "display": "GPT-5.6 Terra (balanced everyday work)",
+        "aliases": ["gpt-5.6-terra", "gpt 5.6 terra", "terra", "5.6 terra"],
+    },
+    {
+        "id": CODEX_CHEAP_MODEL,
+        "display": "GPT-5.6 Luna (fast/cheap reader and sample-prep model)",
+        "aliases": [
+            "gpt-5.6-luna", "gpt 5.6 luna", "luna", "lunar",
+            "5.6 luna", "5.6 lunar", "cheap codex", "fast codex",
+        ],
+    },
     {
         "id": "gpt-5.5",
         "display": "GPT-5.5",
@@ -2045,6 +2085,65 @@ def list_agent_models(agent: str | None = None, project: str | None = None, topi
     return {"agent": agent or "all", "catalogs": catalogs, "defaults": defaults.get("items", [])}
 
 
+def get_model_routing_guide(agent: str | None = None, project: str | None = None, topic: str | None = None) -> dict[str, Any]:
+    """Small, agent-readable guide so callers do not have to rediscover model policy."""
+    requested = normalize_lookup(agent or "all")
+    catalog = list_agent_models(agent, project, topic)
+    guide: dict[str, Any] = {
+        "purpose": "Use this before routing if you are unsure which model/effort to request.",
+        "defaults": {
+            "consult_audit_review_debate": {
+                "target_agent": "codex",
+                "target_model": CODEX_FLAGSHIP_MODEL,
+                "effort": CODEX_DEFAULT_EFFORT,
+                "rule": "Bare 'consult Codex', 'co-op with Codex', 'audit', 'review', 'debate', or 'talk to Codex' should use the flagship/highest route.",
+            },
+            "cheap_read_sample_prep": {
+                "target_agent": "codex",
+                "target_model": CODEX_CHEAP_MODEL,
+                "effort": CODEX_CHEAP_EFFORT,
+                "rule": "Only use this when the user explicitly asks for cheap/fast/efficient reading, extraction, summarizing, sample preparation, drafting, or boilerplate.",
+            },
+            "balanced_optional": {
+                "target_agent": "codex",
+                "target_model": CODEX_BALANCED_MODEL,
+                "effort": "medium",
+                "rule": "Use Terra when the user asks for a middle ground between Sol quality and Luna cost.",
+            },
+        },
+        "caller_examples": {
+            "serious_consult": {
+                "tool": "route_agent_task",
+                "args": {
+                    "target_agent": "codex",
+                    "task_kind": "co_audit",
+                    "prompt": "Audit this change and report concrete issues.",
+                },
+                "broker_resolves_to": {"target_model": CODEX_FLAGSHIP_MODEL, "effort": CODEX_DEFAULT_EFFORT},
+            },
+            "cheap_reader": {
+                "tool": "route_agent_task",
+                "args": {
+                    "target_agent": "codex",
+                    "model_policy": "cheap_read",
+                    "task_kind": "quick_check",
+                    "prompt": "Use a cheaper model to read these files and prepare a short sample.",
+                },
+                "broker_resolves_to": {"target_model": CODEX_CHEAP_MODEL, "effort": CODEX_CHEAP_EFFORT},
+            },
+        },
+        "notes": [
+            "Use target_model for the model slug only; put reasoning in effort.",
+            "The broker maps bare Codex/GPT requests to gpt-5.6-sol instead of the bare gpt-5.6 alias because ChatGPT-auth Codex can reject that alias.",
+            "Use list_agent_models for the raw catalog; this guide adds the default-routing policy.",
+        ],
+        "catalog": catalog,
+    }
+    if requested not in {"", "all", "*", "codex", "gpt", "openai"}:
+        guide["note"] = "The special cheap-read policy currently applies to Codex routes; other agent catalogs are still shown below."
+    return guide
+
+
 def get_model_defaults(project: str | None = None, topic: str | None = None) -> dict[str, Any]:
     init_db()
     filters = []
@@ -2167,6 +2266,13 @@ _PROMPT_MODEL_PATTERNS: list[tuple[str, str]] = [
     (r"sonnet\s*4\.6", "sonnet 4.6"),
     (r"sonnet", "sonnet"),
     (r"haiku", "haiku"),
+    (r"gpt[-\s]?5\.6[-\s]?(?:sol|solar)", CODEX_FLAGSHIP_MODEL),
+    (r"gpt[-\s]?5\.6[-\s]?terra", CODEX_BALANCED_MODEL),
+    (r"gpt[-\s]?5\.6[-\s]?(?:luna|lunar)", CODEX_CHEAP_MODEL),
+    (r"gpt[-\s]?5\.6", CODEX_FLAGSHIP_MODEL),
+    (r"sol|solar", CODEX_FLAGSHIP_MODEL),
+    (r"terra", CODEX_BALANCED_MODEL),
+    (r"luna|lunar", CODEX_CHEAP_MODEL),
     (r"gpt[-\s]?5\.5", "gpt-5.5"),
     (r"gpt[-\s]?5\.4[-\s]?mini", "gpt-5.4-mini"),
     (r"gpt[-\s]?5\.4", "gpt-5.4"),
@@ -2351,6 +2457,49 @@ def resolve_cli_model_and_effort(family: str, raw_model: Any, effort_arg: Any = 
     return model, effort
 
 
+def requested_codex_cheap_read_policy(args: dict[str, Any], prompt: str, task_kind: str) -> bool:
+    """True when the caller explicitly asks for cheap/fast Codex work that is read,
+    extraction, sample-prep, or drafting oriented. Generic consult/audit/debate stays
+    on the flagship unless the caller names a cheaper policy/model."""
+    policy = normalize_lookup(
+        " ".join(
+            str(args.get(key) or "")
+            for key in ("model_policy", "cost_tier", "model_tier", "routing_policy", "quality")
+        )
+    )
+    if policy:
+        if re.search(r"\b(?:cheap|cheaper|cheapest|fast|fastest|efficient|low cost|low-cost|budget|reader|sample)\b", policy):
+            return True
+        if re.search(r"\b(?:best|flagship|highest|max|maximum|audit|review|debate|deep|quality)\b", policy):
+            return False
+
+    text = normalize_lookup(f"{task_kind} {prompt}")
+    if not text:
+        return False
+    cheap = re.search(r"\b(?:cheap|cheaper|cheapest|fast|fastest|efficient|light|lightweight|low cost|low-cost|budget|save tokens|save usage)\b", text)
+    reader = re.search(
+        r"\b(?:read|reading|scan|skim|summarize|summary|extract|classify|transform|inventory|"
+        r"prepare|sample|example|draft|boilerplate|outline|format|parse)\b",
+        text,
+    )
+    deep = re.search(r"\b(?:audit|review|debate|co-op|cooperate|consult|security|bug hunt|deep|thorough|highest|best|max|implementation)\b", text)
+    return bool(cheap and (reader or not deep))
+
+
+def apply_codex_model_policy(
+    args: dict[str, Any],
+    prompt: str,
+    task_kind: str,
+    raw_model: Any,
+    raw_effort: Any,
+) -> tuple[Any, Any, str | None]:
+    if str(raw_model or "").strip() or str(raw_effort or "").strip():
+        return raw_model, raw_effort, None
+    if requested_codex_cheap_read_policy(args, prompt, task_kind):
+        return CODEX_CHEAP_MODEL, CODEX_CHEAP_EFFORT, "cheap_read"
+    return raw_model, raw_effort, None
+
+
 def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
     project = args.get("project")
     topic = args.get("topic")
@@ -2366,16 +2515,22 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
     # Pull any reasoning-effort phrase out of the model text first, so "5.5 extra high"
     # resolves the model as "5.5" and carries the effort separately instead of failing
     # to match (which used to stall on needs_model_selection).
+    raw_effort = args.get("effort") or args.get("reasoning_effort")
+    model_policy = None
+    if model_family_for(raw_agent, raw_model) == "codex":
+        raw_model, raw_effort, model_policy = apply_codex_model_policy(
+            args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")), raw_model, raw_effort
+        )
     target_model, parsed_effort = split_model_and_effort(raw_model)
     family = model_family_for(raw_agent, target_model)
-    canonical_effort = normalize_effort_token(args.get("effort") or args.get("reasoning_effort")) or parsed_effort
+    canonical_effort = normalize_effort_token(raw_effort) or parsed_effort
     resolved_effort = effort_for_family(family, canonical_effort) if canonical_effort else family_max_effort(family)
     match = match_model_request(family, target_model)
 
     if match["status"] == "generic":
         default = find_model_default(project, topic, family)
         if default:
-            return {
+            result = {
                 "status": "resolved",
                 "project": resolve_project(project).name,
                 "topic": topic,
@@ -2385,11 +2540,14 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
                 "effort": resolved_effort,
                 "source": "topic_default",
             }
+            if model_policy:
+                result["model_policy"] = model_policy
+            return result
         # No explicit pin: default to the family flagship at highest effort instead of
         # interrupting to ask. Families with no flagship (antigravity / gemini) still ask.
         flagship = FAMILY_FLAGSHIP.get(family)
         if flagship is not None:
-            return {
+            result = {
                 "status": "resolved",
                 "project": resolve_project(project).name,
                 "topic": topic,
@@ -2399,6 +2557,9 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
                 "effort": resolved_effort,
                 "source": "family_flagship",
             }
+            if model_policy:
+                result["model_policy"] = model_policy
+            return result
         catalog = list_agent_models(family, project, topic).get("catalogs", {}).get(family, {})
         return {
             "status": "needs_model_selection",
@@ -2431,6 +2592,8 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
         note = version_collapse_note(family, target_model, match["model"])
         if note:
             resolved["note"] = note
+        if model_policy:
+            resolved["model_policy"] = model_policy
         return resolved
 
     catalog = list_agent_models(family, project, topic).get("catalogs", {}).get(family, {})
@@ -2973,12 +3136,18 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     token_budget = int(args.get("token_budget") or TASK_BUDGETS.get(task_kind, TASK_BUDGETS["consult"]))
     mode = str(args.get("mode") or ("plan" if model == "claude" else "read-only"))
     requested_model = args.get("target_model") or args.get("model_name") or args.get("model")
+    requested_effort = args.get("effort") or args.get("reasoning_effort")
+    model_policy = None
+    if model == "codex":
+        requested_model, requested_effort, model_policy = apply_codex_model_policy(
+            args, prompt, task_kind, requested_model, requested_effort
+        )
     # Resolve the model (generic -> family flagship) and the reasoning effort
     # (explicit arg > parsed from the model text > family default = highest available)
     # in one place. This keeps effort OUT of the model string and gives a bare
     # "codex"/"claude" the most-capable model at top effort by default.
     resolved_model, effort = resolve_cli_model_and_effort(
-        model, requested_model, args.get("effort") or args.get("reasoning_effort")
+        model, requested_model, requested_effort
     )
     timeout_seconds = bounded_sync_timeout(args.get("timeout_seconds"))
     project_info = resolve_project(str(project_arg) if project_arg is not None else None)
@@ -3087,6 +3256,8 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             "status": status,
             "response": response_payload,
         }
+        if model_policy:
+            result["model_policy"] = model_policy
         if response_truncated:
             result["response_truncated"] = True
             result["response_chars"] = len(response or "")
@@ -4490,9 +4661,7 @@ def _debate_resolve(side: str, config: dict[str, Any]) -> tuple[str, str | None]
 
 
 def _debate_default_model(family: str) -> str | None:
-    # Claude defaults to its flagship; Codex defaults to the CLI's latest (so a new
-    # release like a future gpt-5.6 is picked up automatically without a code change).
-    return "opus" if family == "claude" else None
+    return FAMILY_FLAGSHIP.get(family)
 
 
 def _debate_turn(family: str, path: str, work_dir: str, prompt: str,
@@ -4596,8 +4765,8 @@ def run_debate(
     # extra-high reasoning for debaters (Codex latest, Claude opus); user overrides win.
     eff_model_a = model_a or _debate_default_model(fam_a)
     eff_model_b = model_b or _debate_default_model(fam_b)
-    eff_effort_a = (effort_a or "xhigh").strip().lower()
-    eff_effort_b = (effort_b or "xhigh").strip().lower()
+    eff_effort_a = (effort_a or family_max_effort(fam_a) or "xhigh").strip().lower()
+    eff_effort_b = (effort_b or family_max_effort(fam_b) or "xhigh").strip().lower()
     debate_budget = TASK_BUDGETS.get("debate", 4500)
     # Self-contained debate instructions. Deliberately NOT task_contract_text(), whose
     # broker ground-rules ("respond via respond_to_request", "## Answer for <id>")
@@ -5126,14 +5295,20 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         # The narrow per-field inference picked Antigravity-as-host; the full intent
         # names a real family hosted in that IDE. Correct it before model resolution.
         target_agent = default_target_agent_for_family(intent_family)
+    effort_hint = args.get("effort") or args.get("reasoning_effort")
+    model_policy = None
+    if model_family_for(target_agent, target_model) == "codex":
+        target_model, effort_hint, model_policy = apply_codex_model_policy(
+            args, prompt, normalize_task_kind(args.get("task_kind") or args.get("request_type")), target_model, effort_hint
+        )
     model_resolution = resolve_model_request(
         {
             "project": project,
             "topic": topic,
             "target_agent": target_agent,
             "target_model": target_model,
-            "effort": args.get("effort"),
-            "reasoning_effort": args.get("reasoning_effort"),
+            "effort": effort_hint,
+            "reasoning_effort": None,
             # A model only mentioned in the prompt is a one-off; don't overwrite the
             # stored topic default with it. Explicit picks are also one-offs by default
             # now (remember_model defaults False) so bare "codex"/"claude" later means
@@ -5147,6 +5322,8 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
     if model_resolution.get("status") == "resolved":
         target_agent = model_resolution["target_agent"]
         target_model = model_resolution["target_model"]
+    if model_policy:
+        model_resolution["model_policy"] = model_policy
     # Mark a prompt-detected model BEFORE computing requested_explicitly so the source
     # is set when it's read.
     if detected_model:
@@ -5451,7 +5628,7 @@ TOOLS = [
     },
     {
         "name": "consult_codex",
-        "description": "Ask Codex for a bounded synchronous consultation. Defaults to gpt-5.5/xhigh. Keep direct consults small enough to finish within the MCP timeout; split full-site reviews into batches or use route_agent_task for async handoff.",
+        "description": "Ask Codex for a bounded synchronous consultation. Defaults to gpt-5.6-sol/max for serious consult/audit/review/debate. If the user explicitly asks for cheap/fast reading or sample prep, set model_policy='cheap_read' to use gpt-5.6-luna/low. Keep direct consults small enough to finish within the MCP timeout.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5464,6 +5641,7 @@ TOOLS = [
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 40000},
+                "model_policy": {"type": "string", "description": "Optional policy hint. Use 'cheap_read' only for explicit cheap/fast reading, extraction, summarizing, sample prep, drafting, or boilerplate. Omit for flagship consult/audit/review/debate."},
                 "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'gpt-5.5', 'gpt-5.4-mini'."},
                 "effort": {"type": "string", "description": "Reasoning effort: minimal|low|medium|high|xhigh ('extra high'/'max'/'ultra' => xhigh). Omit for highest available (default)."},
             },
@@ -5596,6 +5774,7 @@ TOOLS = [
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "mode": {"type": "string"},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 40000},
+                "model_policy": {"type": "string", "description": "Optional policy hint. Use 'cheap_read' only for explicit cheap/fast reading, extraction, summarizing, sample prep, drafting, or boilerplate; omit for flagship consult/audit/review/debate."},
                 "prompt": {"type": "string"},
             },
             "required": ["prompt"],
@@ -5604,6 +5783,18 @@ TOOLS = [
     {
         "name": "list_agent_models",
         "description": "List available/detected models for Codex, Claude Code, and Antigravity, including topic defaults.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string"},
+                "project": {"type": "string"},
+                "topic": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "get_model_routing_guide",
+        "description": "Explain the broker's default model policy and return the available model catalog. Use before calling Codex/Claude if unsure: serious consult/audit/debate -> Codex gpt-5.6-sol/max; explicit cheap reading/sample prep -> Codex gpt-5.6-luna/low.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -6066,6 +6257,7 @@ CLAUDE_LITE_TOOL_NAMES = {
     "queue_claude_request",
     "get_claude_requests",
     "list_agent_models",
+    "get_model_routing_guide",
     "get_consultation_history",
     "get_work_memory",
     "record_work_memory",
@@ -6086,6 +6278,7 @@ PUBLIC_TOOL_NAMES = CLAUDE_LITE_TOOL_NAMES | {
     "register_project",
     "consult_claude",
     "resolve_model_request",
+    "get_model_routing_guide",
     "set_model_default",
     "get_model_defaults",
     "record_agent_event",
@@ -6104,6 +6297,17 @@ PUBLIC_TOOL_NAMES = CLAUDE_LITE_TOOL_NAMES | {
     "request_result",
 }
 
+TOOL_DESCRIPTION_OVERRIDES = {
+    "route_agent_task": (
+        "Route a task to Antigravity, Codex, Claude, or Gemini. DEFAULTS: bare 'codex'/'gpt' "
+        "means Codex CLI gpt-5.6-sol/max for consult, co-op, audit, review, debate, bug hunt, "
+        "or serious second opinion; bare 'claude' means opus/max. CHEAP CODEX READER: only "
+        "when the user explicitly asks for cheap/fast/efficient reading, extraction, summarizing, "
+        "sample prep, drafting, or boilerplate, use model_policy='cheap_read' and the broker "
+        "selects gpt-5.6-luna/low. Call get_model_routing_guide/list_agent_models if unsure."
+    ),
+}
+
 COMPACT_TOOL_DESCRIPTIONS = {
     "consult_codex": "Ask Codex for a bounded consultation. Long answers return an excerpt plus response_ref.",
     "consult_claude": "Ask Claude Code; heavy Opus/max Codex requests queue to Claude inbox with a request id.",
@@ -6114,6 +6318,7 @@ COMPACT_TOOL_DESCRIPTIONS = {
     "queue_claude_request": "Queue a request for Claude extension pickup.",
     "get_claude_requests": "List recent queued/completed Claude extension requests.",
     "list_agent_models": "List detected models and remembered defaults.",
+    "get_model_routing_guide": "Show routing policy: serious Codex -> gpt-5.6-sol/max; cheap reader -> gpt-5.6-luna/low.",
     "get_consultation_history": "Return recent consultation summaries. Pass include_raw=true only when excerpts are needed.",
     "get_work_memory": "Return the compact per-topic continuation log.",
     "record_work_memory": "Write a compact continuation update for the next model.",
@@ -6150,9 +6355,12 @@ def current_tool_profile() -> str:
 
 def _copy_tool(tool: dict[str, Any], compact: bool) -> dict[str, Any]:
     result = json.loads(json.dumps(tool, ensure_ascii=False))
+    name = str(result.get("name") or "")
+    override = TOOL_DESCRIPTION_OVERRIDES.get(name)
+    if override and not compact:
+        result["description"] = override
     if compact:
-        name = str(result.get("name") or "")
-        desc = COMPACT_TOOL_DESCRIPTIONS.get(name) or str(result.get("description") or "")
+        desc = COMPACT_TOOL_DESCRIPTIONS.get(name) or override or str(result.get("description") or "")
         if len(desc) > 180:
             desc = compact_text(desc, 180)
         result["description"] = desc
@@ -7475,6 +7683,8 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return text_content(route_agent_task(args))
     if name == "list_agent_models":
         return text_content(list_agent_models(args.get("agent"), args.get("project"), args.get("topic")))
+    if name == "get_model_routing_guide":
+        return text_content(get_model_routing_guide(args.get("agent"), args.get("project"), args.get("topic")))
     if name == "resolve_model_request":
         return text_content(resolve_model_request(args))
     if name == "set_model_default":
