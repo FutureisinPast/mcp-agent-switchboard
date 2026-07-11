@@ -35,7 +35,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.12"
+BROKER_VERSION = "1.0.13"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -76,6 +76,12 @@ SYNC_CONSULT_TIMEOUT_SECONDS = min(
     _env_int("AGENT_BROKER_SYNC_CONSULT_TIMEOUT_SECONDS", 240),
     max(30, MCP_CLIENT_TIMEOUT_SECONDS - 30),
 )
+CODEX_ASYNC_WORKER_TIMEOUT_SECONDS = _env_int("AGENT_BROKER_CODEX_ASYNC_TIMEOUT_SECONDS", 900)
+CODEX_STALE_REQUEST_SECONDS = _env_int(
+    "AGENT_BROKER_CODEX_STALE_REQUEST_SECONDS",
+    max(1800, CODEX_ASYNC_WORKER_TIMEOUT_SECONDS + 300),
+)
+CODEX_QUEUE_AUTORUN = _env_bool("AGENT_BROKER_CODEX_QUEUE_AUTORUN", True)
 DEFAULT_CONTEXT_BUDGET = _env_int("AGENT_BROKER_CONTEXT_BUDGET", 2400)
 SHARED_CONTEXT_THRESHOLD_CHARS = _env_int("AGENT_BROKER_CONTEXT_THRESHOLD_CHARS", 1200)
 SHARED_CONTEXT_INLINE_CHARS = _env_int("AGENT_BROKER_CONTEXT_INLINE_CHARS", 700)
@@ -581,6 +587,12 @@ def init_db() -> None:
             ("responder_model", "ALTER TABLE codex_requests ADD COLUMN responder_model TEXT"),
             ("target_model", "ALTER TABLE codex_requests ADD COLUMN target_model TEXT"),
             ("strict_model", "ALTER TABLE codex_requests ADD COLUMN strict_model INTEGER DEFAULT 0"),
+            ("task_kind", "ALTER TABLE codex_requests ADD COLUMN task_kind TEXT"),
+            ("token_budget", "ALTER TABLE codex_requests ADD COLUMN token_budget INTEGER"),
+            ("effort", "ALTER TABLE codex_requests ADD COLUMN effort TEXT"),
+            ("worker_pid", "ALTER TABLE codex_requests ADD COLUMN worker_pid INTEGER"),
+            ("worker_started_at", "ALTER TABLE codex_requests ADD COLUMN worker_started_at TEXT"),
+            ("worker_completed_at", "ALTER TABLE codex_requests ADD COLUMN worker_completed_at TEXT"),
         ):
             if column_name not in codex_columns:
                 try:
@@ -3317,20 +3329,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             response = consult_gemini(project_info.root_path, prompt, mode, resolved_model, timeout_seconds)
         else:
             raise ValueError(f"unknown model: {model}")
-        failure_prefixes = (
-            "Codex CLI was not found.",
-            "Codex timed out after",
-            "Codex exited with code",
-            "Claude Code CLI was not found.",
-            "Claude Code timed out after",
-            "Claude exited with code",
-            "Gemini is not configured.",
-            "Gemini CLI timed out after",
-            "Gemini CLI exited with code",
-            "Gemini API returned HTTP",
-            "Gemini API call failed",
-        )
-        status = "error" if response.startswith(failure_prefixes) else "ok"
+        status = "error" if response.startswith(CONSULT_FAILURE_PREFIXES) else "ok"
         error = response if status == "error" else None
         consulted_name = f"{model}:{resolved_model}" if resolved_model else model
         if effort:
@@ -4288,6 +4287,10 @@ def queue_codex_request(
     topic: str | None = None,
     target_model: str | None = None,
     strict_model: Any = None,
+    task_kind: str | None = None,
+    token_budget: int | None = None,
+    effort: str | None = None,
+    autorun: Any = None,
 ) -> dict[str, Any]:
     init_db()
     if not prompt or not prompt.strip():
@@ -4299,6 +4302,10 @@ def queue_codex_request(
     clean_prompt = prompt.strip()
     model_label = (str(target_model).strip() or None) if target_model else None
     strict_flag = 1 if truthy(strict_model) else 0
+    normalized_task_kind = normalize_task_kind(task_kind)
+    stored_token_budget = int(token_budget or 0) or None
+    stored_effort = normalize_effort_token(effort) or (str(effort).strip().lower() if effort else None)
+    autorun_enabled = CODEX_QUEUE_AUTORUN if autorun is None else truthy(autorun)
     # Direct callers that name a model get the self-check guard too; route_agent_task
     # already prepends it, so skip if it's present to avoid double-injection.
     if model_label and "[REQUIRED MODEL:" not in clean_prompt and "[Preferred model:" not in clean_prompt:
@@ -4308,7 +4315,8 @@ def queue_codex_request(
         existing = conn.execute(
             """
             SELECT id, project, root_path, topic, status, created_by, created_at, notified_at,
-                   completed_at, target_model, strict_model
+                   completed_at, target_model, strict_model, task_kind, token_budget, effort,
+                   worker_pid, worker_started_at, worker_completed_at
             FROM codex_requests
             WHERE (lower(project) = lower(?) OR root_path = ?)
               AND ((topic IS NULL AND ? IS NULL) OR topic = ?)
@@ -4321,13 +4329,17 @@ def queue_codex_request(
         if existing:
             result = dict(existing)
             result["deduped"] = True
+            if autorun_enabled:
+                result["async_worker"] = start_codex_request_worker(result["id"])
+                if result["async_worker"].get("started"):
+                    result["status"] = "running"
             return result
         conn.execute(
             """
             INSERT INTO codex_requests (
                 id, project, root_path, topic, prompt, status, created_by, created_at,
-                target_model, strict_model
-            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+                target_model, strict_model, task_kind, token_budget, effort
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request_id,
@@ -4339,6 +4351,9 @@ def queue_codex_request(
                 now,
                 model_label,
                 strict_flag,
+                normalized_task_kind,
+                stored_token_budget,
+                stored_effort,
             ),
         )
         conn.execute(
@@ -4362,6 +4377,9 @@ def queue_codex_request(
         render_request_ledger(project_info.name, topic)
     except Exception as exc:  # noqa: BLE001
         log(f"ledger refresh after queue-codex failed: {exc}")
+    async_worker = None
+    if autorun_enabled:
+        async_worker = start_codex_request_worker(request_id)
     return {
         "id": request_id,
         "project": project_info.name,
@@ -4369,7 +4387,11 @@ def queue_codex_request(
         "topic": topic,
         "target_model": model_label,
         "strict_model": bool(strict_flag),
-        "status": "queued",
+        "task_kind": normalized_task_kind,
+        "token_budget": stored_token_budget,
+        "effort": stored_effort,
+        "status": "running" if (async_worker or {}).get("started") else "queued",
+        "async_worker": async_worker,
     }
 
 
@@ -4401,6 +4423,219 @@ def get_codex_requests(project: str | None, limit: int = 20) -> dict[str, Any]:
             (project_info.name, project_info.root_path, limit),
         ).fetchall()
     return {"project": project_info.name, "items": [dict(row) for row in rows]}
+
+
+CONSULT_FAILURE_PREFIXES = (
+    "Codex CLI was not found.",
+    "Codex timed out after",
+    "Codex exited with code",
+    "Claude Code CLI was not found.",
+    "Claude Code timed out after",
+    "Claude exited with code",
+    "Gemini is not configured.",
+    "Gemini CLI timed out after",
+    "Gemini CLI exited with code",
+    "Gemini API returned HTTP",
+    "Gemini API call failed",
+)
+
+
+def _consult_status(response: str) -> tuple[str, str | None]:
+    return ("error", response) if str(response or "").startswith(CONSULT_FAILURE_PREFIXES) else ("completed", None)
+
+
+def _broker_bridge_command(*args: str) -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "bridge", *args]
+    return [sys.executable, str(Path(__file__).resolve()), "bridge", *args]
+
+
+def _worker_recent_enough(row: dict[str, Any]) -> bool:
+    if str(row.get("status") or "").lower() != "running":
+        return False
+    started = _iso_epoch(row.get("worker_started_at"))
+    if started is None:
+        return False
+    return time.time() - started < (CODEX_ASYNC_WORKER_TIMEOUT_SECONDS + 120)
+
+
+def start_codex_request_worker(request_id: str) -> dict[str, Any]:
+    """Start a detached CLI worker for a queued Codex request.
+
+    The previous extension-only path could deliver a prompt into Codex but had no
+    reliable answer capture. This worker gives request_result a deterministic
+    completion/error state even when no UI extension calls respond_to_request.
+    """
+    init_db()
+    rid = str(request_id or "").strip()
+    if not rid:
+        return {"started": False, "reason": "empty request id"}
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM codex_requests WHERE id = ?", (rid,)).fetchone()
+        if not row:
+            return {"started": False, "reason": "unknown request"}
+        data = dict(row)
+        if data.get("response") or is_terminal_state(data.get("status")):
+            return {"started": False, "reason": "request already terminal", "status": data.get("status")}
+        if _worker_recent_enough(data):
+            return {
+                "started": False,
+                "reason": "worker already running",
+                "pid": data.get("worker_pid"),
+                "worker_started_at": data.get("worker_started_at"),
+            }
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE codex_requests
+            SET status = 'running',
+                worker_started_at = ?,
+                notified_at = COALESCE(notified_at, ?)
+            WHERE id = ? AND response IS NULL
+              AND status NOT IN ('completed','error','cancelled','canceled','expired','failed')
+            """,
+            (now, now, rid),
+        )
+    try:
+        tmp_dir = BROKER_DIR / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        out_path = tmp_dir / f"codex-worker-{safe_slug(rid)}.log"
+        env = os.environ.copy()
+        env.pop("AGENT_BROKER_CHILD", None)
+        env["AGENT_BROKER_CALLER"] = "agent-broker-codex-worker"
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+        with out_path.open("ab") as fh:
+            proc = subprocess.Popen(
+                _broker_bridge_command("run-codex-request", rid),
+                cwd=str(BROKER_DIR),
+                stdin=subprocess.DEVNULL,
+                stdout=fh,
+                stderr=fh,
+                env=env,
+                creationflags=creationflags,
+            )
+        with db_connect() as conn:
+            conn.execute("UPDATE codex_requests SET worker_pid = ? WHERE id = ?", (proc.pid, rid))
+        return {"started": True, "pid": proc.pid, "timeout_seconds": CODEX_ASYNC_WORKER_TIMEOUT_SECONDS, "log": str(out_path)}
+    except Exception as exc:  # noqa: BLE001
+        now = utc_now()
+        err = f"failed to start Codex async worker: {type(exc).__name__}: {exc}"
+        with db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE codex_requests
+                SET status = 'error', error = ?, response = ?, completed_at = ?,
+                    worker_completed_at = ?
+                WHERE id = ?
+                """,
+                (err, err, now, now, rid),
+            )
+        return {"started": False, "reason": err}
+
+
+def run_codex_request_worker(request_id: str) -> dict[str, Any]:
+    init_db()
+    rid = str(request_id or "").strip()
+    if not rid:
+        raise ValueError("request_id is required")
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM codex_requests WHERE id = ?", (rid,)).fetchone()
+        if not row:
+            raise ValueError(f"unknown Codex request: {rid}")
+        data = dict(row)
+        if data.get("response") or is_terminal_state(data.get("status")):
+            return {"id": rid, "status": data.get("status"), "skipped": True, "reason": "already terminal"}
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE codex_requests
+            SET status = 'running',
+                worker_started_at = COALESCE(worker_started_at, ?),
+                worker_pid = ?
+            WHERE id = ?
+            """,
+            (now, os.getpid(), rid),
+        )
+    task_kind = normalize_task_kind(data.get("task_kind"))
+    target_model, resolved_effort = resolve_cli_model_and_effort("codex", data.get("target_model"), data.get("effort"))
+    resolved_effort, effort_policy = enforce_codex_effort_policy(
+        {"effort": data.get("effort"), "user_requested_effort": bool(data.get("effort"))},
+        data.get("prompt") or "",
+        task_kind,
+        target_model,
+        resolved_effort,
+        None,
+    )
+    started_at = utc_now()
+    response = consult_codex(
+        data.get("root_path") or data.get("project"),
+        data.get("prompt") or "",
+        "read-only",
+        target_model,
+        resolved_effort,
+        CODEX_ASYNC_WORKER_TIMEOUT_SECONDS,
+    )
+    status, error = _consult_status(response)
+    completed_at = utc_now()
+    responder_model = f"codex:{target_model}" if target_model else "codex"
+    if resolved_effort:
+        responder_model += f" [{resolved_effort}]"
+    with db_connect() as conn:
+        conn.execute(
+            """
+            UPDATE codex_requests
+            SET status = ?, response = ?, error = ?, responder = ?,
+                responder_model = ?, completed_at = ?, worker_completed_at = ?
+            WHERE id = ? AND response IS NULL
+              AND status NOT IN ('completed','error','cancelled','canceled','expired','failed')
+            """,
+            (status, response, error, "codex-cli-worker", responder_model, completed_at, completed_at, rid),
+        )
+    try:
+        store_consultation(
+            ProjectInfo(data.get("project") or "", data.get("root_path") or str(Path.cwd())),
+            responder_model,
+            "read-only",
+            data.get("prompt") or "",
+            response,
+            "error" if error else "ok",
+            error,
+            started_at,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"codex worker consultation history failed for {rid}: {exc}")
+    try:
+        record_agent_event(
+            data.get("project"),
+            data.get("topic"),
+            "codex-cli-worker",
+            "codex_request_completed" if not error else "codex_request_failed",
+            f"Codex async worker {'failed' if error else 'completed'} request {rid}",
+            response[:2000],
+        )
+        render_request_ledger(data.get("project"), data.get("topic"))
+    except Exception as exc:  # noqa: BLE001
+        log(f"codex worker post-complete failed for {rid}: {exc}")
+    result: dict[str, Any] = {
+        "id": rid,
+        "status": status,
+        "responder_model": responder_model,
+        "response_chars": len(response or ""),
+        "completed_at": completed_at,
+    }
+    if effort_policy:
+        result["effort_policy"] = effort_policy
+    if error:
+        result["error"] = error[:1000]
+    return result
 
 
 def ledger_path(project_info: ProjectInfo, topic: str | None) -> Path:
@@ -4446,6 +4681,7 @@ TERMINAL_REQUEST_STATES = ("completed", "error", "cancelled", "canceled", "expir
 
 _CANONICAL_STATE_MAP = {
     "queued": "queued",
+    "running": "running",
     "notified": "delivered",
     "in_progress": "claimed",
     "claimed": "claimed",
@@ -4497,6 +4733,49 @@ def _find_request(rid: str) -> tuple[str, dict[str, Any]] | None:
             if row:
                 return (table, dict(row))
     return None
+
+
+def _refresh_stale_codex_request(table: str, row: dict[str, Any]) -> dict[str, Any]:
+    if table != "codex_requests" or row.get("response") or is_terminal_state(row.get("status")):
+        return row
+    now_epoch = _iso_epoch(utc_now()) or int(time.time())
+    status = str(row.get("status") or "").strip().lower()
+    reason = ""
+    if status == "running":
+        started = _iso_epoch(row.get("worker_started_at")) or _iso_epoch(row.get("created_at")) or now_epoch
+        if now_epoch - started > CODEX_ASYNC_WORKER_TIMEOUT_SECONDS + 120:
+            reason = (
+                f"Codex async worker exceeded {CODEX_ASYNC_WORKER_TIMEOUT_SECONDS} seconds without recording an answer. "
+                "Requeue with a smaller prompt or call consult_codex directly for a bounded synchronous attempt."
+            )
+    elif status in {"queued", "notified"}:
+        created = _iso_epoch(row.get("created_at")) or now_epoch
+        if now_epoch - created > CODEX_STALE_REQUEST_SECONDS:
+            reason = (
+                "Codex request expired before an answer was recorded. Older broker versions delivered Codex inbox "
+                "requests to the UI without a reliable answer-capture worker; requeue this request after updating."
+            )
+    if not reason:
+        return row
+    now = utc_now()
+    with db_connect() as conn:
+        conn.execute(
+            """
+            UPDATE codex_requests
+            SET status = 'error', error = ?, response = ?, completed_at = COALESCE(completed_at, ?),
+                worker_completed_at = COALESCE(worker_completed_at, ?)
+            WHERE id = ? AND response IS NULL
+              AND status NOT IN ('completed','error','cancelled','canceled','expired','failed')
+            """,
+            (reason, reason, now, now, row.get("id")),
+        )
+        conn.row_factory = sqlite3.Row
+        updated = conn.execute("SELECT * FROM codex_requests WHERE id = ?", (row.get("id"),)).fetchone()
+    try:
+        render_request_ledger(row.get("project"), row.get("topic"))
+    except Exception as exc:  # noqa: BLE001
+        log(f"ledger refresh after stale codex failure failed: {exc}")
+    return dict(updated) if updated else row
 
 
 def render_request_ledger(project: str | None, topic: str | None) -> dict[str, Any]:
@@ -4638,6 +4917,7 @@ def request_status(request_id: str) -> dict[str, Any]:
     if not found:
         return {"id": rid, "found": False, "error": "unknown request id"}
     table, row = found
+    row = _refresh_stale_codex_request(table, row)
     raw = row.get("status")
     return {
         "id": rid,
@@ -4669,6 +4949,7 @@ def request_result(request_id: str) -> dict[str, Any]:
     if not found:
         return {"id": rid, "found": False, "error": "unknown request id"}
     table, row = found
+    row = _refresh_stale_codex_request(table, row)
     response = row.get("response")
     state = canonical_request_state(row.get("status"))
     return {
@@ -5571,7 +5852,16 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         if guard:
             wrapped_prompt = guard + wrapped_prompt
     if target_agent == "codex":
-        queued = queue_codex_request(project, wrapped_prompt, topic, guard_label, strict_model)
+        queued = queue_codex_request(
+            project,
+            wrapped_prompt,
+            topic,
+            guard_label,
+            strict_model,
+            task_kind,
+            token_budget,
+            model_resolution.get("effort"),
+        )
         queued["route"] = "codex_inbox"
         queued["surface"] = surface
         queued["task_kind"] = task_kind
@@ -5584,7 +5874,17 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         queued["model_resolution"] = model_resolution
         return queued
     if target_agent == "codex_app":
-        queued = queue_codex_request(project, wrapped_prompt, topic, guard_label, strict_model)
+        queued = queue_codex_request(
+            project,
+            wrapped_prompt,
+            topic,
+            guard_label,
+            strict_model,
+            task_kind,
+            token_budget,
+            model_resolution.get("effort"),
+            autorun=False,
+        )
         project_info = resolve_project(project)
         handoff = write_app_handoff_file("codex", project_info, queued["id"], wrapped_prompt, topic, target_model)
         queued["route"] = "codex_app_handoff"
@@ -6160,7 +6460,7 @@ TOOLS = [
     },
     {
         "name": "queue_codex_request",
-        "description": "Queue a request or handoff for Codex. The Antigravity bridge will notify the user and write an inbox file. Pass target_model to require a specific Codex model; with strict_model the prompt tells Codex to STOP and ask the user to switch if it isn't that model (the broker can't switch the Codex extension's model itself).",
+        "description": "Queue a request or handoff for Codex. By default the broker also starts a bounded headless Codex CLI worker so request_result eventually returns an answer or error instead of staying delivered forever. Pass target_model/effort/task_kind to preserve model policy; set autorun=false only for manual app handoff.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -6169,6 +6469,10 @@ TOOLS = [
                 "prompt": {"type": "string"},
                 "target_model": {"type": "string"},
                 "strict_model": {"type": "boolean"},
+                "task_kind": {"type": "string"},
+                "token_budget": {"type": "integer"},
+                "effort": {"type": "string"},
+                "autorun": {"type": "boolean"},
             },
             "required": ["prompt"],
         },
@@ -7921,6 +8225,10 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             args.get("topic"),
             args.get("target_model"),
             args.get("strict_model"),
+            args.get("task_kind"),
+            int(args.get("token_budget") or 0) or None,
+            args.get("effort"),
+            args.get("autorun"),
         ))
     if name == "get_codex_requests":
         return text_content(get_codex_requests(args.get("project"), int(args.get("limit") or 20)))
@@ -8403,7 +8711,7 @@ def handle_bridge_cli(argv: list[str]) -> int:
             "claude-responses [project] | status <request_id> | result <request_id> | "
             "cancel <request_id> [reason] | reap [max_age_hours] | "
             "debate <project> <topic> <proposition> [rounds] [sideA[:model[:effort]]] [sideB[:model[:effort]]] | "
-            "codex-notified <request_id> | completed-unnotified [limit] | completion-notified <request_id> | "
+            "codex-notified <request_id> | run-codex-request <request_id> | completed-unnotified [limit] | completion-notified <request_id> | "
             "context-pack [project] [topic] [budget] | context-retrieve <ref> [query] [limit] | "
             "context-stats [project] [topic] | chat-bootstrap [project] [topic] [target_agent] [budget] | "
             "work-memory [project] [topic] [limit] | "
@@ -8557,6 +8865,10 @@ def handle_bridge_cli(argv: list[str]) -> int:
         if len(argv) < 2:
             raise ValueError("codex-notified requires <request_id>")
         result = mark_codex_request_notified(argv[1])
+    elif command == "run-codex-request":
+        if len(argv) < 2:
+            raise ValueError("run-codex-request requires <request_id>")
+        result = run_codex_request_worker(argv[1])
     elif command == "completed-unnotified":
         limit = int(argv[1]) if len(argv) > 1 else 20
         result = get_unnotified_antigravity_completions(limit)

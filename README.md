@@ -114,22 +114,22 @@ This is the cross-chat "peek" layer: agents and IDEs can see what another agent'
 
 ## Delivery, honestly
 
-There is a real difference between **delivered** (a file/prompt reached the surface), **auto-opened** (the bridge opened it for you), **submitted** (it was actually sent into a chat), and **completed back to broker state** (a model-tagged reply landed in the broker). Only Antigravity does the full structured round-trip.
+There is a real difference between **delivered** (a file/prompt reached the surface), **auto-opened** (the bridge opened it for you), **submitted** (it was actually sent into a chat), and **completed back to broker state** (a model-tagged reply landed in the broker). Antigravity is still the only true structured in-app round-trip; queued Codex requests also get a broker-owned CLI worker when the Codex CLI is available.
 
 | Target | Mechanism | How far it gets |
 |---|---|---|
 | **Antigravity** (in-app Gemini/Claude) | `antigravity.sendPromptToAgentPanel` (+ optional CDP model select) | delivered → submitted → **completed back to broker** (`complete_antigravity_request`) — the only structured round-trip |
 | **Claude extension** | `claude-inbox` markdown, **auto-opened** + best-effort CDP auto-submit | delivered → auto-opened → (often) submitted → **recorded back to broker**: the request now has a durable `claude_requests` row, so a reply via `respond_to_request` lands on it, or a file written to `claude-responses/` is ingested by `bridge claude-responses` |
 | **Claude CLI** | `claude -p` headless (prompt via stdin) | **completed** — full headless round-trip |
-| **Codex extension** | `codex-inbox` markdown, **auto-opened** | delivered → auto-opened → (with `respond_to_request`) **completed back to broker** |
+| **Codex extension / inbox** | `codex-inbox` markdown, **auto-opened**, plus bounded Codex CLI worker when available | delivered → auto-opened for visibility; the worker records **completed/failed** back to broker state so polling does not hang forever. Extension-only/no-CLI installs remain manual via `respond_to_request` |
 | **Codex CLI** | `codex exec` headless | **completed** — full headless round-trip |
 | **Gemini** | `gemini` CLI (`-m <model>` honored) or `GEMINI_API_KEY` | **completed** via CLI; the API path is an off-by-default escape hatch |
 
-> **Answer return-path:** any surface without a native completion API (Codex/Claude extensions) closes the loop by calling **`respond_to_request(request_id, response)`** — the broker records the answer + timing on the request and refreshes a per-topic **`ledger.md`** (`get_request_ledger`). So you no longer have to copy-paste a reply out of the chat panel.
+> **Answer return-path:** any surface without a native completion API closes the loop by calling **`respond_to_request(request_id, response)`** — the broker records the answer + timing on the request and refreshes a per-topic **`ledger.md`** (`get_request_ledger`). Codex inbox requests now also start a bounded CLI worker by default, so `request_result` returns an answer or a terminal error instead of staying `delivered` forever.
 
 > **Model enforcement, honestly:** the broker can only *switch the answering model programmatically* on **Antigravity** (CDP UI automation, best-effort) and the **CLIs** (`--model`/`-m` flag). It **cannot** drive the Codex- or Claude-*extension* model picker. So when a specific model is requested on those surfaces, the broker prepends a **strict guard** to the prompt — *"you must be `<model>`; state your model; if you're not, STOP and ask the user to switch"* — and the bridge pops a **notification** to select that model. This way a lesser/default model never silently answers in the requested model's place. A model named only in the prompt ("get Opus's opinion") is detected conservatively and treated as the requested model **for that one request** (it does not overwrite the topic default).
 
-> **Model + effort on the CLIs:** model and reasoning effort are **separate inputs**, never folded together. Pass **`effort`** (`minimal|low|medium|high|xhigh`; *"extra high" → xhigh*, *"ultra"/"max" → family top*) and the broker sets it as its own CLI flag (Codex `-c model_reasoning_effort=`, Claude `--effort`) — it is **never** appended to the model name. A bare family request (**"codex"**, **"claude"**) defaults to the **flagship model at the highest available effort** (Codex `gpt-5.5`/`xhigh`, Claude `opus`/`max`); a specific model is honored verbatim (*"sonnet 4.6 for implementation"*, *"gpt-5.4-mini"*). Effort phrases embedded in a model request (*"5.5 extra high"*) are split off before matching, so they resolve to model `gpt-5.5` + effort `xhigh` rather than an invalid model string.
+> **Model + effort on the CLIs:** model and reasoning effort are **separate inputs**, never folded together. Pass **`effort`** (`minimal|low|medium|high|xhigh|max`; *"extra high" -> xhigh*, *"ultra"/"max" -> family top*) and the broker sets it as its own CLI flag (Codex `-c model_reasoning_effort=`, Claude `--effort`) - it is **never** appended to the model name. A bare family request (**"codex"**, **"claude"**) defaults to the **flagship model at the highest available effort** (Codex `gpt-5.6-sol`/`max`, Claude `opus`/`max`); a specific model is honored verbatim (*"sonnet 4.6 for implementation"*, *"gpt-5.6-luna for cheap reading"*). Effort phrases embedded in a model request (*"5.6 sol extra high"*) are split off before matching, so they resolve to model `gpt-5.6-sol` + effort `xhigh` rather than an invalid model string.
 
 > The broker is **target-driven** when a target is named. If a Codex/Claude caller leaves the target completely empty, Switchboard uses the caller only as a fallback: Codex defaults to Claude, and Claude defaults to Codex. A named target or prompt phrase like "consult with Claude" still wins.
 
@@ -172,6 +172,11 @@ broker/bridge version drift and prints actionable next steps.
 ---
 
 ## Changelog
+
+### v1.0.13 (Codex inbox async worker)
+- **Claude -> Codex inbox requests no longer stay `delivered` forever.** Queued Codex requests now start a bounded headless Codex CLI worker that writes the answer/error back to the same request row.
+- **Old stuck Codex inbox requests now fail cleanly when polled.** `request_status` / `request_result` turns stale pre-fix Codex rows into terminal errors with a requeue note.
+- **Async Codex requests preserve model policy.** Task kind, token budget, target model, and effort are stored on the queued request, so serious Sol consults still run at `max`.
 
 ### v1.0.12 (Codex consult effort guard)
 - **Serious Codex Sol consults no longer silently run at medium.** Accidental lower efforts on `gpt-5.6-sol` consult/audit/review/debate routes are upgraded to `max`.
