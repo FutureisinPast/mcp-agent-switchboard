@@ -35,13 +35,19 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.13"
+BROKER_VERSION = "1.0.21"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
 
 # How long to wait for the SQLite write lock before raising "database is locked".
 DB_TIMEOUT_SECONDS = 30
+
+# Windows: suppress the console window for EVERY child process. The detached async worker
+# runs with no console of its own, so any console-subsystem child it spawns (the codex/claude
+# CLI, git, powershell) would otherwise pop a fresh empty cmd window that lingers on screen.
+# CREATE_NO_WINDOW prevents that. 0 on non-Windows (no-op).
+WINDOWS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -76,12 +82,18 @@ SYNC_CONSULT_TIMEOUT_SECONDS = min(
     _env_int("AGENT_BROKER_SYNC_CONSULT_TIMEOUT_SECONDS", 240),
     max(30, MCP_CLIENT_TIMEOUT_SECONDS - 30),
 )
-CODEX_ASYNC_WORKER_TIMEOUT_SECONDS = _env_int("AGENT_BROKER_CODEX_ASYNC_TIMEOUT_SECONDS", 900)
+# 30 min: a max-effort Sol consult on a real design prompt commonly runs 5-15 minutes; the
+# previous 900s cap risked killing legitimate long runs. The stale-expiry below tracks this.
+CODEX_ASYNC_WORKER_TIMEOUT_SECONDS = _env_int("AGENT_BROKER_CODEX_ASYNC_TIMEOUT_SECONDS", 1800)
 CODEX_STALE_REQUEST_SECONDS = _env_int(
     "AGENT_BROKER_CODEX_STALE_REQUEST_SECONDS",
     max(1800, CODEX_ASYNC_WORKER_TIMEOUT_SECONDS + 300),
 )
 CODEX_QUEUE_AUTORUN = _env_bool("AGENT_BROKER_CODEX_QUEUE_AUTORUN", True)
+# Claude inbox requests get the same detached-CLI-worker treatment as Codex ones (v1.0.19):
+# without it a queued Fable/Opus consult waits for an interactive session/bridge pickup that
+# never happens in a headless environment and sits "queued" forever.
+CLAUDE_QUEUE_AUTORUN = _env_bool("AGENT_BROKER_CLAUDE_QUEUE_AUTORUN", True)
 DEFAULT_CONTEXT_BUDGET = _env_int("AGENT_BROKER_CONTEXT_BUDGET", 2400)
 SHARED_CONTEXT_THRESHOLD_CHARS = _env_int("AGENT_BROKER_CONTEXT_THRESHOLD_CHARS", 1200)
 SHARED_CONTEXT_INLINE_CHARS = _env_int("AGENT_BROKER_CONTEXT_INLINE_CHARS", 700)
@@ -95,7 +107,13 @@ DEFAULT_WORK_MEMORY_LIMIT = _env_int("AGENT_BROKER_WORK_MEMORY_LIMIT", 5)
 DEFAULT_WORK_MEMORY_BUDGET_CHARS = _env_int("AGENT_BROKER_WORK_MEMORY_BUDGET_CHARS", 2600)
 DEFAULT_SNAPSHOT_TOKENS = _env_int("AGENT_BROKER_SNAPSHOT_TOKENS", 300)
 DEFAULT_SNAPSHOT_TURNS = _env_int("AGENT_BROKER_SNAPSHOT_TURNS", 4)
-DEFAULT_CONSULT_RESPONSE_CHARS = _env_int("AGENT_BROKER_CONSULT_RESPONSE_CHARS", 5000)
+# Inline consult-response budget. Limits are ADVISORY-first: the full response is always
+# stored (consultation history + request row + response_ref) and request_result returns it
+# untruncated; only the inline consult payload is ever cut, rarely (20k default, 200k hard
+# ceiling to protect the MCP channel), structure-preserving, and always with a ref to the
+# full text. Never silently force-shrink data moving between sessions.
+DEFAULT_CONSULT_RESPONSE_CHARS = _env_int("AGENT_BROKER_CONSULT_RESPONSE_CHARS", 20000)
+MAX_CONSULT_RESPONSE_CHARS = _env_int("AGENT_BROKER_CONSULT_RESPONSE_CHARS_MAX", 200000)
 CLAUDE_ASYNC_MIN_TOKEN_BUDGET = _env_int("AGENT_BROKER_CLAUDE_ASYNC_MIN_TOKEN_BUDGET", 3000)
 CLAUDE_ASYNC_MIN_PROMPT_TOKENS = _env_int("AGENT_BROKER_CLAUDE_ASYNC_MIN_PROMPT_TOKENS", 2200)
 CLAUDE_ASYNC_MIN_RESPONSE_CHARS = _env_int("AGENT_BROKER_CLAUDE_ASYNC_MIN_RESPONSE_CHARS", 8000)
@@ -128,7 +146,18 @@ CODEX_FLAGSHIP_MODEL = "gpt-5.6-sol"
 CODEX_BALANCED_MODEL = "gpt-5.6-terra"
 CODEX_CHEAP_MODEL = "gpt-5.6-luna"
 CODEX_DEFAULT_EFFORT = "max"
+# Consults/plans default to the flagship (gpt-5.6-sol) at max — quality is the priority.
+# Because max routinely overruns SYNC_CONSULT_TIMEOUT_SECONDS, a max/xhigh consult does NOT
+# block the sync window and does NOT get its effort silently lowered: it returns a pending
+# request_id immediately while the detached worker (1800s cap) records the answer, collected
+# via request_result(request_id, wait_seconds=...). Efforts that fit the window (high/medium/
+# low — e.g. cheap Luna reads) still return inline. See codex_effort_fits_sync_window.
+CODEX_CONSULT_DEFAULT_EFFORT = "max"
 CODEX_CHEAP_EFFORT = "low"
+# Reasoning efforts that reliably finish inside the ~240s sync window for a real consult.
+# max/xhigh are excluded: they route straight to the pending/worker path so the caller is
+# never blocked for the whole window only to then be told "pending".
+CODEX_SYNC_ELIGIBLE_EFFORTS = {"none", "minimal", "low", "medium", "high"}
 CODEX_SERIOUS_TASK_KINDS = {
     "consult",
     "co_audit",
@@ -626,6 +655,22 @@ def init_db() -> None:
             )
             """
         )
+        claude_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(claude_requests)").fetchall()
+        }
+        for column_name, column_sql in (
+            ("effort", "ALTER TABLE claude_requests ADD COLUMN effort TEXT"),
+            ("cli_model", "ALTER TABLE claude_requests ADD COLUMN cli_model TEXT"),
+            ("worker_pid", "ALTER TABLE claude_requests ADD COLUMN worker_pid INTEGER"),
+            ("worker_started_at", "ALTER TABLE claude_requests ADD COLUMN worker_started_at TEXT"),
+            ("worker_completed_at", "ALTER TABLE claude_requests ADD COLUMN worker_completed_at TEXT"),
+        ):
+            if column_name not in claude_columns:
+                try:
+                    conn.execute(column_sql)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS shared_context_blobs (
@@ -827,6 +872,7 @@ def run_git(root: str, args: list[str]) -> str | None:
             capture_output=True,
             timeout=10,
             check=False,
+            creationflags=WINDOWS_NO_WINDOW,
         )
     except Exception:
         return None
@@ -939,6 +985,7 @@ if ($match) { $match.AppID }
             timeout=8,
             env=env,
             check=False,
+            creationflags=WINDOWS_NO_WINDOW,
         )
     except Exception as exc:  # noqa: BLE001
         log(f"Get-StartApps lookup failed for {agent}: {exc}")
@@ -974,6 +1021,7 @@ def app_is_running(agent: str) -> bool:
             timeout=8,
             env=env,
             check=False,
+            creationflags=WINDOWS_NO_WINDOW,
         )
     except Exception as exc:  # noqa: BLE001
         log(f"app_is_running check failed for {agent}: {exc}")
@@ -1026,6 +1074,7 @@ def focus_app_window(agent: str) -> dict[str, Any]:
             timeout=8,
             env=env,
             check=False,
+            creationflags=WINDOWS_NO_WINDOW,
         )
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -1145,6 +1194,7 @@ if (-not $p) { 'no-window' } else {
             timeout=int(delay_ms) / 1000 + 25,
             env=env,
             check=False,
+            creationflags=WINDOWS_NO_WINDOW,
         )
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -1287,6 +1337,7 @@ def copy_to_clipboard(text: str) -> dict[str, Any]:
             timeout=8,
             env={**os.environ.copy(), "AGENT_BROKER_CLIP_FILE": str(temp_file)},
             check=False,
+            creationflags=WINDOWS_NO_WINDOW,
         )
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -1397,6 +1448,21 @@ def compact_text(value: Any, limit: int = 500, redact: bool = True) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 15)].rstrip() + " ... [truncated]"
+
+
+def truncate_preserving_structure(value: Any, limit: int, redact: bool = False) -> str:
+    """Tail-cut text at `limit` chars WITHOUT flattening whitespace. compact_text collapses
+    all newlines/indentation (fine for one-line excerpts, destructive for consult answers
+    containing code or diffs); use this for any payload another agent must act on."""
+    raw = redact_text(value) if redact else ("" if value is None else str(value))
+    if len(raw) <= limit:
+        return raw
+    cut = raw[: max(0, limit - 40)]
+    # Prefer a line boundary near the cut so we don't split mid-code-line.
+    nl = cut.rfind("\n")
+    if nl > limit * 0.8:
+        cut = cut[:nl]
+    return cut.rstrip() + "\n\n[... truncated inline; FULL response preserved — see response_ref]"
 
 
 _TIKTOKEN_ENC = None
@@ -1953,6 +2019,7 @@ def run_json_command(command: list[str], cwd: str | None = None, timeout: int = 
             capture_output=True,
             timeout=timeout,
             check=False,
+            creationflags=WINDOWS_NO_WINDOW,
         )
     except Exception as exc:  # noqa: BLE001
         log(f"json command failed: {command}: {exc}")
@@ -2469,15 +2536,24 @@ def pick_cli_model(family: str, model_text: Any) -> str | None:
     return text
 
 
-def resolve_cli_model_and_effort(family: str, raw_model: Any, effort_arg: Any = None) -> tuple[str | None, str | None]:
+def resolve_cli_model_and_effort(
+    family: str, raw_model: Any, effort_arg: Any = None, default_effort: Any = None
+) -> tuple[str | None, str | None]:
     """Single source of truth for CLI model+effort selection, shared by consult() and
     resolve_model_request(). Splits any effort out of the model string, resolves the
     model (generic -> flagship), and picks the effort: explicit arg > parsed-from-model
-    > family default (highest available)."""
+    > default_effort (when the caller supplies one) > family default (highest available).
+    `default_effort` lets the sync consult path default to high instead of the family max."""
     model_text, parsed_effort = split_model_and_effort(raw_model)
     model = pick_cli_model(family, model_text)
     canonical = normalize_effort_token(effort_arg) or parsed_effort
-    effort = effort_for_family(family, canonical) if canonical else family_max_effort(family)
+    if canonical:
+        effort = effort_for_family(family, canonical)
+    elif default_effort is not None:
+        fallback = normalize_effort_token(default_effort) or default_effort
+        effort = effort_for_family(family, fallback)
+    else:
+        effort = family_max_effort(family)
     return model, effort
 
 
@@ -2517,13 +2593,14 @@ def apply_codex_model_policy(
     raw_model: Any,
     raw_effort: Any,
 ) -> tuple[Any, Any, str | None]:
+    # Luna (cheap tier) is used ONLY when the caller EXPLICITLY opts in: model_policy=cheap_read
+    # or by naming a cheaper model/effort directly. We do NOT guess "this is a cheap read" from
+    # prompt keywords — that silently mis-routed real consults (e.g. a destructive-deletion
+    # review) to Luna/low and produced hedged, untrustworthy answers. A consult defaults to the
+    # flagship at max; the caller keeps full control by passing model_policy/target_model/effort.
     policy = normalize_lookup(str(args.get("model_policy") or ""))
     if policy in {"cheap read", "cheap_read", "cheap reader", "cheap"} and not str(raw_model or "").strip():
         return CODEX_CHEAP_MODEL, raw_effort or CODEX_CHEAP_EFFORT, "cheap_read"
-    if str(raw_model or "").strip() or str(raw_effort or "").strip():
-        return raw_model, raw_effort, None
-    if requested_codex_cheap_read_policy(args, prompt, task_kind):
-        return CODEX_CHEAP_MODEL, CODEX_CHEAP_EFFORT, "cheap_read"
     return raw_model, raw_effort, None
 
 
@@ -2746,6 +2823,11 @@ def ensure_ground_rules_file() -> Path:
         "These apply to every routed handoff. Read once; the broker references this file by",
         "path instead of re-sending the rules in each chat message.",
         "",
+        "Word budgets below are ADVISORY, not caps: aim lean, but never omit, truncate, or",
+        "summarize away data another agent needs for a correct/complete answer -- completeness",
+        "beats the budget. Token discipline means avoiding REDUNDANT content (re-pasting files or",
+        "context the receiver can read itself), never dropping unique data.",
+        "",
         "## Always (token discipline)",
     ]
     lines += [f"- {item}" for item in GENERIC_GROUND_RULES]
@@ -2774,7 +2856,8 @@ def task_contract_text(task_kind: str, token_budget: int | None = None, compact:
         essence = (TASK_CONTRACTS.get(kind) or ["Answer the request."])[0]
         rules_path = ensure_ground_rules_file()
         return (
-            f"[Agent Switchboard] task={kind} | budget ~{budget}w. {essence} "
+            f"[Agent Switchboard] task={kind} | budget ~{budget}w (ADVISORY: aim lean, but never omit or "
+            f"compress away data needed for a correct/complete answer -- completeness beats the budget). {essence} "
             f"Do not schedule follow-up chat turns or background wait/poll timers; report current status and stop if work is still running. "
             f"When done, return your answer via respond_to_request(this Request ID) -- don't make the user relay it. "
             f"Full ground rules: {rules_path} (read once; not re-sent each message)."
@@ -2782,7 +2865,8 @@ def task_contract_text(task_kind: str, token_budget: int | None = None, compact:
     # Legacy verbose contract (config compact_task_contract=false): inline every rule.
     lines = [
         f"Task kind: {kind}",
-        f"Response budget: about {budget} words or less unless the user explicitly asks for more.",
+        f"Response budget: about {budget} words -- ADVISORY, not a cap. Aim lean, but if the data needed "
+        f"for a correct/complete answer exceeds it, include the data; never omit or summarize away required content to fit.",
         "Ground rules:",
     ]
     lines.extend(f"- {item}" for item in TASK_CONTRACTS[kind])
@@ -2825,6 +2909,21 @@ def process_text(value: Any) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return str(value)
+
+
+def scrub_surrogates(value: Any) -> Any:
+    """Strip lone UTF-16 surrogates (e.g. '\\udc9d') that CLI output can carry on Windows.
+    These crash sqlite3 text binding with 'surrogates not allowed' and used to discard an
+    already-completed consult. Non-strings pass through unchanged."""
+    if not isinstance(value, str):
+        return value
+    if not value:
+        return value
+    try:
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        return value.encode("utf-8", "replace").decode("utf-8", "replace")
 
 
 def bounded_sync_timeout(value: Any = None) -> int:
@@ -2938,6 +3037,7 @@ def kill_process_tree(proc: subprocess.Popen[Any]) -> None:
                 stderr=subprocess.DEVNULL,
                 timeout=10,
                 check=False,
+                creationflags=WINDOWS_NO_WINDOW,
             )
             return
         except Exception as exc:  # noqa: BLE001
@@ -2956,7 +3056,9 @@ def run_process(
 ) -> tuple[int, str, str]:
     env = os.environ.copy()
     env["AGENT_BROKER_CHILD"] = "1"
-    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    # CREATE_NO_WINDOW so the CLI child (codex/claude/gemini) never pops a console window,
+    # even when spawned from the windowless detached worker.
+    creationflags = (subprocess.CREATE_NEW_PROCESS_GROUP | WINDOWS_NO_WINDOW) if os.name == "nt" else 0
     proc = subprocess.Popen(
         command,
         cwd=cwd,
@@ -3232,14 +3334,127 @@ def store_consultation(
                 caller,
                 consulted_model,
                 mode,
-                prompt,
-                response,
+                scrub_surrogates(prompt),
+                scrub_surrogates(response),
                 status,
-                error,
+                scrub_surrogates(error),
                 started_at,
                 utc_now(),
             ),
         )
+
+
+def _await_codex_row(request_id: str, timeout_seconds: int) -> dict[str, Any] | None:
+    """Poll the codex_requests row for `request_id` until it reaches a terminal state or the
+    (monotonic) deadline passes. Read-only: the detached worker is the sole finalizer, so this
+    never mutates the row beyond the stale-expiry refresh. Returns the latest row (or None)."""
+    rid = str(request_id or "").strip()
+    if not rid:
+        return None
+    margin = 8
+    deadline = time.monotonic() + max(15, int(timeout_seconds or SYNC_CONSULT_TIMEOUT_SECONDS) - margin)
+    row: dict[str, Any] | None = None
+    while True:
+        found = _find_request(rid)
+        if found:
+            _, row = found
+            row = _refresh_stale_codex_request("codex_requests", row)
+            if row.get("response") or is_terminal_state(row.get("status")):
+                return row
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return row
+        time.sleep(min(1.0, remaining))
+
+
+def codex_effort_fits_sync_window(effort: Any) -> bool:
+    """True when a Codex consult at this effort reliably finishes inside the ~240s sync window.
+    max/xhigh are excluded — they route straight to the pending/worker path so the caller is not
+    blocked for the whole window only to then be told 'pending'."""
+    return str(effort or "").strip().lower() in CODEX_SYNC_ELIGIBLE_EFFORTS
+
+
+def _run_codex_consult(
+    project_info: ProjectInfo,
+    prompt: str,
+    mode: str,
+    resolved_model: str | None,
+    effort: str | None,
+    timeout_seconds: int,
+    topic_arg: str | None,
+    task_kind: str,
+    token_budget: int | None,
+) -> dict[str, Any]:
+    """Run a Codex consult through the unified ledger+worker path instead of a blocking
+    subprocess. Queues the request (which spawns the detached worker), then routes by effort:
+    efforts that fit the sync window are polled and returned INLINE if they finish; max/xhigh
+    (which routinely overrun it) return a pending request_id up front without blocking. Either
+    way the worker records the answer, so the work is never discarded or its effort lowered."""
+    queued = queue_codex_request(
+        project_info.root_path,
+        prompt,
+        topic_arg,
+        resolved_model,
+        False,
+        task_kind,
+        token_budget,
+        effort,
+        True,
+    )
+    rid = queued.get("id")
+    worker = queued.get("async_worker") or {}
+    if rid and not worker.get("started") and not is_terminal_state(queued.get("status")):
+        worker = start_codex_request_worker(rid) or {}
+    # Effort-based routing (per Codex's design): don't lower the effort to fit the window —
+    # route by whether it fits. Efforts that fit poll to the deadline; max/xhigh get a single
+    # instant check (to catch a deduped/already-complete row) then return pending immediately.
+    sync_eligible = codex_effort_fits_sync_window(effort)
+    if sync_eligible:
+        row = _await_codex_row(rid, timeout_seconds) if rid else None
+    else:
+        found = _find_request(rid) if rid else None
+        row = _refresh_stale_codex_request("codex_requests", found[1]) if found else None
+    response = (row or {}).get("response")
+    if response:
+        return {
+            "pending": False,
+            "response": response,
+            "responder_model": (row or {}).get("responder_model"),
+            "request_id": rid,
+        }
+    state = canonical_request_state((row or {}).get("status")) if row else "queued"
+    model_label = (f"codex:{resolved_model}" if resolved_model else "codex") + (f" [{effort}]" if effort else "")
+    if sync_eligible:
+        note = (
+            f"Codex is still working (state={state}); the answer is recorded when it finishes even though this "
+            f"call returned first — the work is NOT lost. Collect it with "
+            f'request_result(request_id="{rid}", wait_seconds=120) and repeat until answered.'
+        )
+    else:
+        note = (
+            f"Routed async by effort: {effort} does not fit the {timeout_seconds}s sync window, so this returns a "
+            f"pending id up front instead of blocking. A {effort}-effort Sol consult TYPICALLY TAKES 5-15 MINUTES — "
+            f"'running' for several minutes is normal, not a hang. The detached worker "
+            f"({CODEX_ASYNC_WORKER_TIMEOUT_SECONDS}s cap) records the answer; collect it with "
+            f'request_result(request_id="{rid}", wait_seconds=180) and repeat until answered.'
+        )
+    payload = {
+        "project": project_info.name,
+        "root_path": project_info.root_path,
+        "model": model_label,
+        "effort": effort,
+        "mode": mode,
+        "status": "pending",
+        "routing": "async_by_effort" if not sync_eligible else "exceeded_sync_window",
+        "request_id": rid,
+        "state": state,
+        "retry_after_seconds": 120 if not sync_eligible else 20,
+        "typical_wait": "5-15 minutes at max/xhigh effort" if not sync_eligible else None,
+        "poll": {"tool": "request_result", "request_id": rid, "wait_seconds": 180 if not sync_eligible else 120},
+        "async_worker": worker or None,
+        "note": note,
+    }
+    return {"pending": True, "payload": payload, "request_id": rid}
 
 
 def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -3261,15 +3476,22 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             args, prompt, task_kind, requested_model, requested_effort
         )
     # Resolve the model (generic -> family flagship) and the reasoning effort
-    # (explicit arg > parsed from the model text > family default = highest available)
-    # in one place. This keeps effort OUT of the model string and gives a bare
-    # "codex"/"claude" the most-capable model at top effort by default.
+    # (explicit arg > parsed from the model text > default). This keeps effort OUT of the
+    # model string. A direct Codex consult defaults to the flagship at max (highest quality);
+    # apply_codex_model_policy above only downshifts to Luna when the caller EXPLICITLY opts in.
+    codex_default_effort = CODEX_CONSULT_DEFAULT_EFFORT if model == "codex" else None
     resolved_model, effort = resolve_cli_model_and_effort(
-        model, requested_model, requested_effort
+        model, requested_model, requested_effort, codex_default_effort
     )
+    # A serious consult/plan on Sol is forced to max — even if the caller fumbled and passed
+    # high/medium — unless it explicitly opted into a cheaper tier (model_policy=cheap_read /
+    # balanced / lower_effort, or a Luna/Terra model). This is SAFE now: max no longer blocks
+    # or times out; _run_codex_consult routes max/xhigh straight to the pending/worker path.
     effort_policy = None
     if model == "codex":
-        effort, effort_policy = enforce_codex_effort_policy(args, prompt, task_kind, resolved_model, effort, model_policy)
+        effort, effort_policy = enforce_codex_effort_policy(
+            args, prompt, task_kind, resolved_model, effort, model_policy
+        )
     timeout_seconds = bounded_sync_timeout(args.get("timeout_seconds"))
     project_info = resolve_project(str(project_arg) if project_arg is not None else None)
     if task_kind != "consult" or args.get("include_task_contract", True) is not False:
@@ -3295,31 +3517,54 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
                 token_budget,
                 args.get("new_chat"),
                 strict_model=True,
+                effort=effort,
+                cli_model=resolved_model,
             )
             consulted_name = f"claude:{resolved_model}" if resolved_model else "claude"
             if effort:
                 consulted_name += f" [{effort}]"
+            worker_started = bool((queued.get("async_worker") or {}).get("started"))
             queued.update(
                 {
                     "async": True,
-                    "route": "claude_inbox",
-                    "surface": "extension",
+                    "route": "claude_cli_worker" if worker_started else "claude_inbox",
+                    "surface": "cli" if worker_started else "extension",
                     "model": consulted_name,
                     "effort": effort,
                     "mode": mode,
                     "async_reason": async_reason,
+                    "typical_wait": "5-15 minutes at max effort",
                     "note": (
-                        "Queued through the Claude inbox instead of blocking inside the MCP "
-                        "timeout. This preserves the requested Claude Opus/max target; poll "
-                        "request_status/request_result with the returned id."
+                        "A detached Claude CLI worker is running this consult now (max-effort runs typically "
+                        "take 5-15 minutes) and records the answer; collect it with "
+                        "request_result(request_id, wait_seconds=180) and repeat until answered."
+                        if worker_started
+                        else "Queued through the Claude inbox; no CLI worker could run this target, so it "
+                        "requires an interactive Claude session/bridge pickup. Poll request_status/"
+                        "request_result with the returned id."
                     ),
                 }
             )
             return queued
     started_at = utc_now()
     try:
+        # The Codex consult runs through the unified ledger+worker path: it either returns
+        # the answer inline (fast consults) or a pending id (slow/explicit-max), and the
+        # worker records the answer either way, so a slow consult never discards the work.
+        # The worker also writes the consultation-history row, so consult() must not store a
+        # second one for codex (already_stored).
+        already_stored = False
+        responder_model = None
         if model == "codex":
-            response = consult_codex(project_info.root_path, prompt, mode, resolved_model, effort, timeout_seconds)
+            codex_outcome = _run_codex_consult(
+                project_info, prompt, mode, resolved_model, effort,
+                timeout_seconds, topic_arg, task_kind, token_budget,
+            )
+            if codex_outcome.get("pending"):
+                return codex_outcome["payload"]
+            response = codex_outcome["response"]
+            responder_model = codex_outcome.get("responder_model")
+            already_stored = True
         elif model == "claude":
             claude_workspace = None
             if topic_arg and load_config().get("topic_workspaces", True):
@@ -3331,18 +3576,19 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"unknown model: {model}")
         status = "error" if response.startswith(CONSULT_FAILURE_PREFIXES) else "ok"
         error = response if status == "error" else None
-        consulted_name = f"{model}:{resolved_model}" if resolved_model else model
-        if effort:
+        consulted_name = responder_model or (f"{model}:{resolved_model}" if resolved_model else model)
+        if not responder_model and effort:
             consulted_name += f" [{effort}]"
-        store_consultation(project_info, consulted_name, mode, prompt, response, status, error, started_at)
-        max_response_chars = max(800, min(int(args.get("max_response_chars") or DEFAULT_CONSULT_RESPONSE_CHARS), 40000))
+        if not already_stored:
+            store_consultation(project_info, consulted_name, mode, prompt, response, status, error, started_at)
+        max_response_chars = max(800, min(int(args.get("max_response_chars") or DEFAULT_CONSULT_RESPONSE_CHARS), MAX_CONSULT_RESPONSE_CHARS))
         response_ref = None
         response_payload = response
         response_truncated = False
         redact_response = status != "ok"
         if len(response or "") > max_response_chars:
             response_truncated = True
-            response_payload = compact_text(response, max_response_chars, redact=redact_response)
+            response_payload = truncate_preserving_structure(response, max_response_chars, redact=redact_response)
             try:
                 response_ref = store_shared_context(
                     project_info.name,
@@ -4486,7 +4732,12 @@ def start_codex_request_worker(request_id: str) -> dict[str, Any]:
                 "worker_started_at": data.get("worker_started_at"),
             }
         now = utc_now()
-        conn.execute(
+        # Atomic claim: only ONE starter may transition the row to running. The extra
+        # worker_started_at guard (NULL or older than a dead worker) lets a stale/crashed
+        # worker be reclaimed while blocking two simultaneous starters from both spawning.
+        stale_epoch = (_iso_epoch(now) or int(time.time())) - (CODEX_ASYNC_WORKER_TIMEOUT_SECONDS + 120)
+        stale_cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stale_epoch))
+        cur = conn.execute(
             """
             UPDATE codex_requests
             SET status = 'running',
@@ -4494,9 +4745,18 @@ def start_codex_request_worker(request_id: str) -> dict[str, Any]:
                 notified_at = COALESCE(notified_at, ?)
             WHERE id = ? AND response IS NULL
               AND status NOT IN ('completed','error','cancelled','canceled','expired','failed')
+              AND (worker_started_at IS NULL OR worker_started_at < ?)
             """,
-            (now, now, rid),
+            (now, now, rid, stale_cutoff),
         )
+        if cur.rowcount != 1:
+            # Another starter won the claim between our SELECT and UPDATE.
+            return {
+                "started": False,
+                "reason": "worker already claimed",
+                "pid": data.get("worker_pid"),
+                "worker_started_at": data.get("worker_started_at"),
+            }
     try:
         tmp_dir = BROKER_DIR / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -4584,12 +4844,14 @@ def run_codex_request_worker(request_id: str) -> dict[str, Any]:
         CODEX_ASYNC_WORKER_TIMEOUT_SECONDS,
     )
     status, error = _consult_status(response)
+    response = scrub_surrogates(response)
+    error = scrub_surrogates(error)
     completed_at = utc_now()
     responder_model = f"codex:{target_model}" if target_model else "codex"
     if resolved_effort:
         responder_model += f" [{resolved_effort}]"
     with db_connect() as conn:
-        conn.execute(
+        cur = conn.execute(
             """
             UPDATE codex_requests
             SET status = ?, response = ?, error = ?, responder = ?,
@@ -4599,6 +4861,11 @@ def run_codex_request_worker(request_id: str) -> dict[str, Any]:
             """,
             (status, response, error, "codex-cli-worker", responder_model, completed_at, completed_at, rid),
         )
+        finalized = cur.rowcount == 1
+    if not finalized:
+        # Lost the finalize race (request was cancelled/expired/completed elsewhere). Do NOT
+        # emit history/events for a row we did not actually complete.
+        return {"id": rid, "status": "superseded", "skipped": True, "reason": "already finalized by another path"}
     try:
         store_consultation(
             ProjectInfo(data.get("project") or "", data.get("root_path") or str(Path.cwd())),
@@ -4633,6 +4900,245 @@ def run_codex_request_worker(request_id: str) -> dict[str, Any]:
     }
     if effort_policy:
         result["effort_policy"] = effort_policy
+    if error:
+        result["error"] = error[:1000]
+    return result
+
+
+def claude_cli_model_for_request(row: dict[str, Any]) -> str | None:
+    """Resolve a claude_requests row to a Claude-CLI-runnable model alias (opus/sonnet/
+    fable/haiku). Prefers the cli_model stored at queue time; falls back to matching the
+    display label. Returns None when the target is not CLI-runnable (e.g. an Antigravity
+    panel model) — those rows stay on the UI/bridge delivery path."""
+    explicit = str(row.get("cli_model") or "").strip()
+    if explicit:
+        return explicit
+    text = re.sub(r"\(effort=[^)]*\)", " ", str(row.get("target_model") or ""))
+    model_text, _ = split_model_and_effort(text)
+    if not model_text or "extension-selected" in model_text.lower():
+        return None
+    match = match_model_request("claude", model_text)
+    if match.get("status") == "matched":
+        return match["model"]
+    return None
+
+
+def claude_effort_for_request(row: dict[str, Any]) -> str | None:
+    stored = normalize_effort_token(row.get("effort"))
+    if stored:
+        return effort_for_family("claude", stored)
+    m = re.search(r"effort=([a-z-]+)", str(row.get("target_model") or "").lower())
+    if m:
+        canonical = normalize_effort_token(m.group(1))
+        if canonical:
+            return effort_for_family("claude", canonical)
+    return None
+
+
+def start_claude_request_worker(request_id: str) -> dict[str, Any]:
+    """Start a detached CLI worker for a queued Claude request (mirror of the Codex worker).
+
+    Without this, a queued Fable/Opus consult depends on an interactive session or the
+    bridge to pick the inbox file up — in a headless environment nothing ever does and the
+    request sits 'queued' forever. Only starts when the target resolves to a Claude-CLI
+    model; Antigravity-panel targets keep the UI delivery path."""
+    init_db()
+    rid = str(request_id or "").strip()
+    if not rid:
+        return {"started": False, "reason": "empty request id"}
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM claude_requests WHERE id = ?", (rid,)).fetchone()
+        if not row:
+            return {"started": False, "reason": "unknown request"}
+        data = dict(row)
+        if data.get("response") or is_terminal_state(data.get("status")):
+            return {"started": False, "reason": "request already terminal", "status": data.get("status")}
+        if not claude_cli_model_for_request(data):
+            return {"started": False, "reason": "target model is not Claude-CLI-runnable; left for UI/bridge delivery"}
+        if _worker_recent_enough(data):
+            return {
+                "started": False,
+                "reason": "worker already running",
+                "pid": data.get("worker_pid"),
+                "worker_started_at": data.get("worker_started_at"),
+            }
+        now = utc_now()
+        stale_epoch = (_iso_epoch(now) or int(time.time())) - (CODEX_ASYNC_WORKER_TIMEOUT_SECONDS + 120)
+        stale_cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stale_epoch))
+        cur = conn.execute(
+            """
+            UPDATE claude_requests
+            SET status = 'running',
+                worker_started_at = ?,
+                notified_at = COALESCE(notified_at, ?)
+            WHERE id = ? AND response IS NULL
+              AND status NOT IN ('completed','error','cancelled','canceled','expired','failed')
+              AND (worker_started_at IS NULL OR worker_started_at < ?)
+            """,
+            (now, now, rid, stale_cutoff),
+        )
+        if cur.rowcount != 1:
+            return {
+                "started": False,
+                "reason": "worker already claimed",
+                "pid": data.get("worker_pid"),
+                "worker_started_at": data.get("worker_started_at"),
+            }
+    try:
+        tmp_dir = BROKER_DIR / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        out_path = tmp_dir / f"claude-worker-{safe_slug(rid)}.log"
+        env = os.environ.copy()
+        env.pop("AGENT_BROKER_CHILD", None)
+        env["AGENT_BROKER_CALLER"] = "agent-broker-claude-worker"
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+        with out_path.open("ab") as fh:
+            proc = subprocess.Popen(
+                _broker_bridge_command("run-claude-request", rid),
+                cwd=str(BROKER_DIR),
+                stdin=subprocess.DEVNULL,
+                stdout=fh,
+                stderr=fh,
+                env=env,
+                creationflags=creationflags,
+            )
+        with db_connect() as conn:
+            conn.execute("UPDATE claude_requests SET worker_pid = ? WHERE id = ?", (proc.pid, rid))
+        return {"started": True, "pid": proc.pid, "timeout_seconds": CODEX_ASYNC_WORKER_TIMEOUT_SECONDS, "log": str(out_path)}
+    except Exception as exc:  # noqa: BLE001
+        now = utc_now()
+        err = f"failed to start Claude async worker: {type(exc).__name__}: {exc}"
+        with db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE claude_requests
+                SET status = 'error', error = ?, response = ?, completed_at = ?,
+                    worker_completed_at = ?
+                WHERE id = ?
+                """,
+                (err, err, now, now, rid),
+            )
+        return {"started": False, "reason": err}
+
+
+def run_claude_request_worker(request_id: str) -> dict[str, Any]:
+    init_db()
+    rid = str(request_id or "").strip()
+    if not rid:
+        raise ValueError("request_id is required")
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM claude_requests WHERE id = ?", (rid,)).fetchone()
+        if not row:
+            raise ValueError(f"unknown Claude request: {rid}")
+        data = dict(row)
+        if data.get("response") or is_terminal_state(data.get("status")):
+            return {"id": rid, "status": data.get("status"), "skipped": True, "reason": "already terminal"}
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE claude_requests
+            SET status = 'running',
+                worker_started_at = COALESCE(worker_started_at, ?),
+                worker_pid = ?
+            WHERE id = ?
+            """,
+            (now, os.getpid(), rid),
+        )
+    cli_model = claude_cli_model_for_request(data)
+    if not cli_model:
+        err = "target model is not Claude-CLI-runnable; no worker path available"
+        with db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE claude_requests SET status = 'error', error = ?, response = ?,
+                    completed_at = ?, worker_completed_at = ?
+                WHERE id = ? AND response IS NULL
+                  AND status NOT IN ('completed','error','cancelled','canceled','expired','failed')
+                """,
+                (err, err, utc_now(), utc_now(), rid),
+            )
+        return {"id": rid, "status": "error", "error": err}
+    resolved_effort = claude_effort_for_request(data)
+    started_at = utc_now()
+    response = consult_claude(
+        data.get("root_path") or data.get("project"),
+        data.get("prompt") or "",
+        "plan",
+        cli_model,
+        None,
+        resolved_effort,
+        CODEX_ASYNC_WORKER_TIMEOUT_SECONDS,
+    )
+    status, error = _consult_status(response)
+    response = scrub_surrogates(response)
+    error = scrub_surrogates(error)
+    completed_at = utc_now()
+    responder_model = f"claude:{cli_model}"
+    if resolved_effort:
+        responder_model += f" [{resolved_effort}]"
+    with db_connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE claude_requests
+            SET status = ?, response = ?, error = ?, responder = ?,
+                responder_model = ?, completed_at = ?, worker_completed_at = ?
+            WHERE id = ? AND response IS NULL
+              AND status NOT IN ('completed','error','cancelled','canceled','expired','failed')
+            """,
+            (status, response, error, "claude-cli-worker", responder_model, completed_at, completed_at, rid),
+        )
+        finalized = cur.rowcount == 1
+    if not finalized:
+        return {"id": rid, "status": "superseded", "skipped": True, "reason": "already finalized by another path"}
+    # Remove any inbox copies so the bridge cannot ALSO open this already-answered request
+    # as a new Claude tab (covers rows queued by pre-v1.0.20 servers that wrote the files).
+    for inbox_dir in (BROKER_DIR / "claude-inbox", Path(data.get("root_path") or ".") / ".agent-broker" / "claude-inbox"):
+        try:
+            target = inbox_dir / f"{rid}.md"
+            if target.exists():
+                target.unlink()
+        except Exception as exc:  # noqa: BLE001
+            log(f"claude worker inbox cleanup failed for {rid}: {exc}")
+    try:
+        store_consultation(
+            ProjectInfo(data.get("project") or "", data.get("root_path") or str(Path.cwd())),
+            responder_model,
+            "plan",
+            data.get("prompt") or "",
+            response,
+            "error" if error else "ok",
+            error,
+            started_at,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"claude worker consultation history failed for {rid}: {exc}")
+    try:
+        record_agent_event(
+            data.get("project"),
+            data.get("topic"),
+            "claude-cli-worker",
+            "claude_request_completed" if not error else "claude_request_failed",
+            f"Claude async worker {'failed' if error else 'completed'} request {rid}",
+            response[:2000],
+        )
+        render_request_ledger(data.get("project"), data.get("topic"))
+    except Exception as exc:  # noqa: BLE001
+        log(f"claude worker post-complete failed for {rid}: {exc}")
+    result: dict[str, Any] = {
+        "id": rid,
+        "status": status,
+        "responder_model": responder_model,
+        "response_chars": len(response or ""),
+        "completed_at": completed_at,
+    }
     if error:
         result["error"] = error[:1000]
     return result
@@ -4736,8 +5242,12 @@ def _find_request(rid: str) -> tuple[str, dict[str, Any]] | None:
 
 
 def _refresh_stale_codex_request(table: str, row: dict[str, Any]) -> dict[str, Any]:
-    if table != "codex_requests" or row.get("response") or is_terminal_state(row.get("status")):
+    """Turn abandoned codex/claude worker requests into terminal errors when polled.
+    (Name kept for call-site compatibility; since v1.0.19 it also covers claude_requests,
+    whose queued rows previously sat 'queued' forever when nothing picked the inbox up.)"""
+    if table not in ("codex_requests", "claude_requests") or row.get("response") or is_terminal_state(row.get("status")):
         return row
+    agent_label = "Codex" if table == "codex_requests" else "Claude"
     now_epoch = _iso_epoch(utc_now()) or int(time.time())
     status = str(row.get("status") or "").strip().lower()
     reason = ""
@@ -4745,23 +5255,30 @@ def _refresh_stale_codex_request(table: str, row: dict[str, Any]) -> dict[str, A
         started = _iso_epoch(row.get("worker_started_at")) or _iso_epoch(row.get("created_at")) or now_epoch
         if now_epoch - started > CODEX_ASYNC_WORKER_TIMEOUT_SECONDS + 120:
             reason = (
-                f"Codex async worker exceeded {CODEX_ASYNC_WORKER_TIMEOUT_SECONDS} seconds without recording an answer. "
-                "Requeue with a smaller prompt or call consult_codex directly for a bounded synchronous attempt."
+                f"{agent_label} async worker exceeded {CODEX_ASYNC_WORKER_TIMEOUT_SECONDS} seconds without recording an answer. "
+                "Requeue with a smaller prompt for a fresh attempt."
             )
     elif status in {"queued", "notified"}:
         created = _iso_epoch(row.get("created_at")) or now_epoch
         if now_epoch - created > CODEX_STALE_REQUEST_SECONDS:
-            reason = (
-                "Codex request expired before an answer was recorded. Older broker versions delivered Codex inbox "
-                "requests to the UI without a reliable answer-capture worker; requeue this request after updating."
-            )
+            if table == "codex_requests":
+                reason = (
+                    "Codex request expired before an answer was recorded. Older broker versions delivered Codex inbox "
+                    "requests to the UI without a reliable answer-capture worker; requeue this request after updating."
+                )
+            else:
+                reason = (
+                    "Claude request expired: no CLI worker ran it (target not CLI-runnable or pre-v1.0.19 broker) and "
+                    "no interactive Claude session/bridge picked the inbox up. Requeue with a CLI model "
+                    "(opus/sonnet/fable/haiku) after updating."
+                )
     if not reason:
         return row
     now = utc_now()
     with db_connect() as conn:
         conn.execute(
-            """
-            UPDATE codex_requests
+            f"""
+            UPDATE {table}
             SET status = 'error', error = ?, response = ?, completed_at = COALESCE(completed_at, ?),
                 worker_completed_at = COALESCE(worker_completed_at, ?)
             WHERE id = ? AND response IS NULL
@@ -4770,11 +5287,11 @@ def _refresh_stale_codex_request(table: str, row: dict[str, Any]) -> dict[str, A
             (reason, reason, now, now, row.get("id")),
         )
         conn.row_factory = sqlite3.Row
-        updated = conn.execute("SELECT * FROM codex_requests WHERE id = ?", (row.get("id"),)).fetchone()
+        updated = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (row.get("id"),)).fetchone()
     try:
         render_request_ledger(row.get("project"), row.get("topic"))
     except Exception as exc:  # noqa: BLE001
-        log(f"ledger refresh after stale codex failure failed: {exc}")
+        log(f"ledger refresh after stale {agent_label.lower()} failure failed: {exc}")
     return dict(updated) if updated else row
 
 
@@ -4906,18 +5423,58 @@ def get_request_ledger(project: str | None, topic: str | None) -> dict[str, Any]
     return render_request_ledger(project, topic)
 
 
-def request_status(request_id: str) -> dict[str, Any]:
+def _bounded_wait_seconds(value: Any) -> int:
+    """Clamp a caller's requested long-poll wait to [0, min(180, MCP window)]. Reuses the
+    same MCP-client-timeout headroom as SYNC_CONSULT_TIMEOUT_SECONDS so a long poll can never
+    out-wait the client that called it."""
+    try:
+        requested = int(str(value).strip()) if value is not None and str(value).strip() else 0
+    except (TypeError, ValueError):
+        requested = 0
+    if requested <= 0:
+        return 0
+    cap = max(0, min(180, MCP_CLIENT_TIMEOUT_SECONDS - 30))
+    return min(requested, cap)
+
+
+def _poll_request(rid: str, wait_seconds: Any) -> tuple[str, dict[str, Any]] | None:
+    """Locate a request and, if `wait_seconds` > 0, long-poll until it reaches a terminal
+    state or the (monotonic) deadline passes. Each iteration takes a fresh short-lived DB read
+    and runs the stale-expiry refresh, so the 1020s running-expiry still fires while waiting."""
+    found = _find_request(rid)
+    if not found:
+        return None
+    table, row = found
+    row = _refresh_stale_codex_request(table, row)
+    wait = _bounded_wait_seconds(wait_seconds)
+    if wait <= 0 or row.get("response") or is_terminal_state(row.get("status")):
+        return table, row
+    deadline = time.monotonic() + wait
+    interval = 0.75
+    while time.monotonic() < deadline:
+        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+        found = _find_request(rid)
+        if not found:
+            break
+        table, row = found
+        row = _refresh_stale_codex_request(table, row)
+        if row.get("response") or is_terminal_state(row.get("status")):
+            break
+    return table, row
+
+
+def request_status(request_id: str, wait_seconds: Any = None) -> dict[str, Any]:
     """Read-only lookup of any routed request across all tables, normalized to the
-    canonical lifecycle. Never mutates state."""
+    canonical lifecycle. Never mutates state (beyond stale-expiry). With wait_seconds > 0 it
+    long-polls until the request reaches a terminal state or the bounded deadline passes."""
     init_db()
     rid = str(request_id or "").strip()
     if not rid:
         raise ValueError("request_id is required")
-    found = _find_request(rid)
-    if not found:
+    polled = _poll_request(rid, wait_seconds)
+    if not polled:
         return {"id": rid, "found": False, "error": "unknown request id"}
-    table, row = found
-    row = _refresh_stale_codex_request(table, row)
+    table, row = polled
     raw = row.get("status")
     return {
         "id": rid,
@@ -4938,31 +5495,46 @@ def request_status(request_id: str) -> dict[str, Any]:
     }
 
 
-def request_result(request_id: str) -> dict[str, Any]:
-    """Read-only: return the recorded answer for a request, or its current state if
-    it has not been answered yet."""
+def request_result(request_id: str, wait_seconds: Any = None) -> dict[str, Any]:
+    """Read-only: return the recorded answer for a request, or its current state if it has
+    not been answered yet. With wait_seconds > 0, long-poll (single call) until the answer
+    lands or the bounded deadline passes — the reliable way for a turn-based MCP caller to
+    collect a pending consult without ending its turn empty-handed."""
     init_db()
     rid = str(request_id or "").strip()
     if not rid:
         raise ValueError("request_id is required")
-    found = _find_request(rid)
-    if not found:
+    polled = _poll_request(rid, wait_seconds)
+    if not polled:
         return {"id": rid, "found": False, "error": "unknown request id"}
-    table, row = found
-    row = _refresh_stale_codex_request(table, row)
+    table, row = polled
     response = row.get("response")
     state = canonical_request_state(row.get("status"))
+    created_epoch = _iso_epoch(row.get("created_at"))
+    elapsed = max(0, int(time.time()) - created_epoch) if created_epoch else None
+    pending_note = None
+    if not response:
+        pending_note = (
+            f"No answer recorded yet; the request is still {state}"
+            + (f" ({elapsed // 60}m{elapsed % 60:02d}s elapsed)" if elapsed is not None else "")
+            + ". "
+        )
+        effort_label = str(row.get("effort") or "")
+        if table == "codex_requests" and (effort_label in {"top", "max", "xhigh"} or "max" in str(row.get("target_model") or "")):
+            pending_note += "Max/xhigh-effort Sol consults typically take 5-15 minutes — this is normal, not a hang. "
+        pending_note += f'Call request_result(request_id="{rid}", wait_seconds=180) to wait for it.'
     return {
         "id": rid,
         "found": True,
         "kind": _REQUEST_KIND.get(table, table),
         "state": state,
         "answered": bool(response),
+        "elapsed_seconds": elapsed,
         "responder": row.get("responder"),
         "responder_model": row.get("responder_model"),
         "completed_at": row.get("completed_at"),
         "response": response or None,
-        "note": None if response else f"No answer recorded yet; the request is still {state}.",
+        "note": pending_note,
     }
 
 
@@ -5383,13 +5955,14 @@ def queue_claude_request(
     token_budget: int | None = None,
     new_chat: Any = None,
     strict_model: Any = None,
+    effort: str | None = None,
+    cli_model: str | None = None,
+    autorun: Any = None,
 ) -> dict[str, Any]:
-    """Default 'Claude Code extension' delivery: write an inbox markdown file.
-
-    The bridge extension polls this inbox and attempts to open/submit it in
-    Claude Code. The inbox file remains the durable fallback; the CLI route
-    (claude_code) is the headless app fallback.
-    """
+    """Queue a Claude request: write the inbox markdown (UI delivery path) AND, when the
+    target resolves to a Claude-CLI model, start a detached CLI worker (v1.0.19) so the
+    answer is recorded even when no interactive session/bridge ever picks the inbox up —
+    previously such requests sat 'queued' forever in headless environments."""
     init_db()
     if not prompt or not prompt.strip():
         raise ValueError("prompt is required")
@@ -5432,22 +6005,15 @@ def queue_claude_request(
         f"{compact_section}"
         f"{clean_prompt}\n"
     )
-    written: list[str] = []
-    for inbox_dir in (BROKER_DIR / "claude-inbox", Path(project_info.root_path) / ".agent-broker" / "claude-inbox"):
-        try:
-            inbox_dir.mkdir(parents=True, exist_ok=True)
-            target = inbox_dir / f"{request_id}.md"
-            target.write_text(body, encoding="utf-8")
-            written.append(str(target))
-        except Exception as exc:  # noqa: BLE001
-            log(f"claude inbox write failed for {inbox_dir}: {exc}")
+    stored_effort = normalize_effort_token(effort) or (str(effort).strip().lower() if effort else None)
+    stored_cli_model = (str(cli_model).strip() or None) if cli_model else None
     with db_connect() as conn:
         conn.execute(
             """
             INSERT INTO claude_requests (
                 id, project, root_path, topic, prompt, status, created_by, created_at,
-                target_model, strict_model, task_kind, token_budget
-            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+                target_model, strict_model, task_kind, token_budget, effort, cli_model
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request_id,
@@ -5461,6 +6027,8 @@ def queue_claude_request(
                 strict_flag,
                 normalize_task_kind(task_kind),
                 int(token_budget or 0) or None,
+                stored_effort,
+                stored_cli_model,
             ),
         )
         conn.execute(
@@ -5484,6 +6052,24 @@ def queue_claude_request(
         render_request_ledger(project_info.name, topic)
     except Exception as exc:  # noqa: BLE001
         log(f"ledger refresh after queue-claude failed: {exc}")
+    autorun_enabled = CLAUDE_QUEUE_AUTORUN if autorun is None else truthy(autorun)
+    async_worker = None
+    if autorun_enabled:
+        async_worker = start_claude_request_worker(request_id)
+    worker_started = bool((async_worker or {}).get("started"))
+    # Inbox files are the UI/bridge delivery path. Write them ONLY when no CLI worker took
+    # the request — otherwise the bridge would ALSO open the prompt as a new Claude tab in
+    # the IDE (double delivery: the worker answers headless while a stray tab pops up).
+    written: list[str] = []
+    if not worker_started:
+        for inbox_dir in (BROKER_DIR / "claude-inbox", Path(project_info.root_path) / ".agent-broker" / "claude-inbox"):
+            try:
+                inbox_dir.mkdir(parents=True, exist_ok=True)
+                target = inbox_dir / f"{request_id}.md"
+                target.write_text(body, encoding="utf-8")
+                written.append(str(target))
+            except Exception as exc:  # noqa: BLE001
+                log(f"claude inbox write failed for {inbox_dir}: {exc}")
     return {
         "id": request_id,
         "project": project_info.name,
@@ -5494,9 +6080,18 @@ def queue_claude_request(
         "new_chat": force_new_chat,
         "task_kind": normalize_task_kind(task_kind),
         "token_budget": int(token_budget or 0) or None,
+        "effort": stored_effort,
+        "cli_model": stored_cli_model,
         "inbox_files": written,
-        "status": "queued",
-        "note": "Queued for the bridge to open/submit in Claude Code. The inbox file is the durable fallback; CLI is the headless fallback.",
+        "status": "running" if worker_started else "queued",
+        "async_worker": async_worker,
+        "note": (
+            "A detached Claude CLI worker is running this now and records the answer; poll "
+            "request_result(request_id, wait_seconds=180). Max-effort runs typically take 5-15 minutes. "
+            "The inbox file remains as the UI fallback."
+            if worker_started
+            else "Queued for the bridge to open/submit in Claude Code. The inbox file is the durable fallback."
+        ),
     }
 
 
@@ -5611,9 +6206,10 @@ def prompt_budget_notice(
         log(f"prompt_budget_notice: could not stash oversized prompt: {exc}")
     message = (
         f"This handoff prompt is ~{tokens} tokens (soft limit {PROMPT_SOFT_LIMIT_TOKENS}). "
-        "The broker is built for token economy: send a SHORT instruction and reference large "
-        "context with a context_ref instead of inlining it — a long prompt usually duplicates "
-        "files/state the receiver can read itself (see AGENT_COOP_RULES 'Token Rules')."
+        "ADVISORY ONLY — the prompt was delivered IN FULL. Token economy means avoiding REDUNDANT "
+        "content: reference files/state the receiver can read itself with a context_ref instead of "
+        "re-pasting them. Unique data the receiver cannot obtain otherwise belongs inline — never "
+        "drop it to satisfy this notice (see AGENT_COOP_RULES 'Token Rules')."
     )
     if ref:
         message += f" The full prompt was stashed as {ref}; use retrieve_shared_context(ref, query) if needed."
@@ -6039,7 +6635,7 @@ TOOLS = [
     },
     {
         "name": "consult_codex",
-        "description": "Ask Codex for a bounded synchronous consultation. Defaults to gpt-5.6-sol/max for serious consult/audit/review/debate. If the user explicitly asks for cheap/fast reading or sample prep, set model_policy='cheap_read' to use gpt-5.6-luna/low. Keep direct consults small enough to finish within the MCP timeout.",
+        "description": "Ask Codex for a consultation/plan. ALWAYS runs gpt-5.6-sol at MAX effort (a serious consult is forced to max even if a lower effort is passed) — never silently downgraded. Because max overruns the sync window, the call returns a pending request_id up front (not a timeout) while a detached worker finishes it; collect with request_result(request_id, wait_seconds=180). The ONLY way to use the cheap tier is to explicitly set model_policy='cheap_read' (or name gpt-5.6-luna) for reading/labour/sample-prep — the broker never guesses 'cheap' from the prompt.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -6051,7 +6647,7 @@ TOOLS = [
                 "task_kind": {"type": "string"},
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
-                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 40000},
+                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
                 "model_policy": {"type": "string", "description": "Optional policy hint. Use 'cheap_read' for explicit cheap/fast reading, extraction, summarizing, sample prep, drafting, or boilerplate. Use 'balanced'/'efficient'/'lower_effort' when a deliberate medium/lower serious consult is acceptable. Omit for flagship consult/audit/review/debate."},
                 "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'gpt-5.5', 'gpt-5.4-mini'."},
                 "effort": {"type": "string", "description": "Reasoning effort: minimal|low|medium|high|xhigh ('extra high'/'max'/'ultra' => xhigh). Omit for highest available (default)."},
@@ -6073,7 +6669,7 @@ TOOLS = [
                 "task_kind": {"type": "string"},
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
-                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 40000},
+                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
                 "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'opus', 'sonnet', 'fable'."},
                 "effort": {"type": "string", "description": "Reasoning effort: low|medium|high|xhigh|max ('extra high' => xhigh, 'ultra' => max). Omit for highest available (default)."},
                 "async": {"type": "boolean", "description": "Queue through the Claude inbox and return a request id immediately instead of waiting synchronously."},
@@ -6097,7 +6693,7 @@ TOOLS = [
                 "task_kind": {"type": "string"},
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
-                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 40000},
+                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
                 "target_model": {"type": "string"},
             },
             "required": ["prompt"],
@@ -6184,7 +6780,7 @@ TOOLS = [
                 "strict_model": {"type": "boolean"},
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "mode": {"type": "string"},
-                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 40000},
+                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
                 "model_policy": {"type": "string", "description": "Optional policy hint. Use 'cheap_read' for explicit cheap/fast reading, extraction, summarizing, sample prep, drafting, or boilerplate. Use 'balanced'/'efficient'/'lower_effort' when a deliberate medium/lower serious consult is acceptable; omit for flagship consult/audit/review/debate."},
                 "prompt": {"type": "string"},
             },
@@ -6535,22 +7131,24 @@ TOOLS = [
     },
     {
         "name": "request_status",
-        "description": "Check the lifecycle state of a queued Codex, Claude, or Antigravity request by id.",
+        "description": "Check the lifecycle state of a queued Codex, Claude, or Antigravity request by id. Pass wait_seconds to long-poll until it reaches a terminal state.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "request_id": {"type": "string"},
+                "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 180, "description": "Long-poll up to this many seconds (bounded to the MCP window) for a terminal state before returning. 0/omitted = return immediately."},
             },
             "required": ["request_id"],
         },
     },
     {
         "name": "request_result",
-        "description": "Return the recorded answer for a queued request by id, or report its current state if no answer is recorded yet.",
+        "description": "Return the recorded answer for a queued request by id, or report its current state if no answer is recorded yet. Pass wait_seconds to long-poll (single call) until the answer lands — the reliable way to collect a pending consult.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "request_id": {"type": "string"},
+                "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 180, "description": "Long-poll up to this many seconds (bounded to the MCP window) for the answer before returning. 0/omitted = return immediately."},
             },
             "required": ["request_id"],
         },
@@ -6745,8 +7343,8 @@ COMPACT_TOOL_DESCRIPTIONS = {
     "get_latest_context_snapshot": "Read the latest completed snapshot, capped by max_tokens.",
     "list_live_surfaces": "List recent bridge heartbeats and capabilities.",
     "respond_to_request": "Attach a finished answer to a queued broker request.",
-    "request_status": "Check queued request state by id.",
-    "request_result": "Read a queued request answer by id.",
+    "request_status": "Check queued request state by id (wait_seconds long-polls).",
+    "request_result": "Read a queued request answer by id (wait_seconds long-polls until it lands).",
     "get_request_ledger": "Return the per-topic request ledger.",
     "store_shared_context": "Store large context locally and return a compact ref.",
     "compact_topic": "Compact topic state and return a retrievable ref.",
@@ -8250,9 +8848,9 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             args.get("project"), args.get("topic"), str(args.get("request_id") or ""),
             str(args.get("response") or ""), args.get("agent"), args.get("model")))
     if name == "request_status":
-        return text_content(request_status(str(args.get("request_id") or "")))
+        return text_content(request_status(str(args.get("request_id") or ""), args.get("wait_seconds")))
     if name == "request_result":
-        return text_content(request_result(str(args.get("request_id") or "")))
+        return text_content(request_result(str(args.get("request_id") or ""), args.get("wait_seconds")))
     if name == "get_request_ledger":
         return text_content(get_request_ledger(args.get("project"), args.get("topic")))
     if name == "request_context_snapshot":
@@ -8711,7 +9309,7 @@ def handle_bridge_cli(argv: list[str]) -> int:
             "claude-responses [project] | status <request_id> | result <request_id> | "
             "cancel <request_id> [reason] | reap [max_age_hours] | "
             "debate <project> <topic> <proposition> [rounds] [sideA[:model[:effort]]] [sideB[:model[:effort]]] | "
-            "codex-notified <request_id> | run-codex-request <request_id> | completed-unnotified [limit] | completion-notified <request_id> | "
+            "codex-notified <request_id> | run-codex-request <request_id> | run-claude-request <request_id> | completed-unnotified [limit] | completion-notified <request_id> | "
             "context-pack [project] [topic] [budget] | context-retrieve <ref> [query] [limit] | "
             "context-stats [project] [topic] | chat-bootstrap [project] [topic] [target_agent] [budget] | "
             "work-memory [project] [topic] [limit] | "
@@ -8869,6 +9467,10 @@ def handle_bridge_cli(argv: list[str]) -> int:
         if len(argv) < 2:
             raise ValueError("run-codex-request requires <request_id>")
         result = run_codex_request_worker(argv[1])
+    elif command == "run-claude-request":
+        if len(argv) < 2:
+            raise ValueError("run-claude-request requires <request_id>")
+        result = run_claude_request_worker(argv[1])
     elif command == "completed-unnotified":
         limit = int(argv[1]) if len(argv) > 1 else 20
         result = get_unnotified_antigravity_completions(limit)

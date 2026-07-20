@@ -173,6 +173,43 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.21 (limits are advisory — stop force-shrinking data between sessions)
+- **Inline consult responses: default 5k → 20k chars, hard ceiling 40k → 200k** (`AGENT_BROKER_CONSULT_RESPONSE_CHARS` / `_MAX`). Full responses were always preserved (history + request row + `response_ref`), but the small inline cap force-shrank what the calling session actually saw.
+- **Truncation no longer mangles structure.** The old path collapsed all newlines/indentation (destroying code blocks and diffs). The rare over-ceiling cut is now a clean tail-cut at a line boundary with an explicit `[... truncated inline; FULL response preserved — see response_ref]` marker.
+- **Word budgets are now explicitly ADVISORY** in the task contract, ground-rules file, and the prompt-size notice: aim lean, avoid *redundant* content (re-pasted files the receiver can read itself), but **never omit unique data** needed for a correct/complete answer. The prompt notice now states the prompt was delivered in full.
+- Audited the full transfer path: prompts (MCP → DB → stdin → CLI) and responses (CLI pipe → DB → `request_result`) move **untruncated**; only display excerpts (history, event log) are shortened.
+
+### v1.0.20 (no stray Claude tabs — worker requests skip the UI inbox)
+- **Worker-handled Claude requests no longer open a new Claude tab.** v1.0.19 wrote the inbox `.md` *and* started the CLI worker, so the bridge also delivered the prompt into the IDE — a stray tab popped up while the worker answered headless. Inbox files are now written **only when no CLI worker took the request** (UI fallback path), and the worker deletes any leftover inbox copies when it finalizes (covers rows queued by older servers).
+
+### v1.0.19 (Claude/Fable requests get the CLI worker too)
+- **Queued Claude consults no longer sit "queued" forever.** A Claude inbox request (e.g. Opus consulting Fable) used to depend entirely on an interactive session or the bridge picking the inbox file up — in a headless environment nothing ever did. Queueing now also starts a detached **Claude CLI worker** (`claude -p --model fable/opus/sonnet/haiku --effort …`, same machinery as the Codex worker: atomic claim, 1800s cap, rowcount-gated side effects, no console window) that records the answer; collect it with `request_result(request_id, wait_seconds=180)`. The inbox file stays as the UI fallback. Disable via `AGENT_BROKER_CLAUDE_QUEUE_AUTORUN=0`.
+- **Targets that aren't CLI-runnable** (e.g. Antigravity panel models) keep the UI delivery path, and now **expire with a clear error** after ~35 min instead of hanging forever; stale-expiry covers `claude_requests` like it covers `codex_requests`.
+- Schema: `claude_requests` gained `effort`, `cli_model`, `worker_pid`, `worker_started_at`, `worker_completed_at` (auto-migrated).
+
+### v1.0.18 (max-effort headroom + honest wait expectations)
+- **Worker cap raised 900s → 1800s.** A max-effort Sol consult on a real design prompt commonly runs 5-15 minutes (live-measured: 8m21s); the old cap risked killing legitimate long runs. Override via `AGENT_BROKER_CODEX_ASYNC_TIMEOUT_SECONDS`.
+- **Pending/running responses now state the real ETA.** The pending payload carries `typical_wait: "5-15 minutes at max/xhigh effort"` and `retry_after_seconds: 120` (was a hammer-inducing 20), and `request_result` reports `elapsed_seconds` plus a "this is normal, not a hang" note for max/xhigh — so callers stop reading a 8-minute run as stuck.
+
+### v1.0.17 (consult is always Sol/max — no silent downgrade)
+- **Removed the prompt-keyword "cheap read" guesser.** It was silently routing real consults to `gpt-5.6-luna` at low effort whenever the prompt mentioned reading/lines/deleting — producing hedged, untrustworthy answers. Luna now runs **only** when the caller explicitly sets `model_policy='cheap_read'` or names a Luna model.
+- **A serious consult on Sol is forced to `max`.** Even if the caller passes `high`/`medium`, a consult/plan/audit/review/debate is clamped up to `max` (unless it explicitly opted into a cheaper tier). Safe now that max routes async instead of hanging — so the earlier hang fix no longer costs you effort.
+
+### v1.0.16 (no more stray cmd windows)
+- **Consults no longer pop an empty `cmd.exe` window on Windows.** The detached async worker runs without a console of its own, so the Codex/Claude CLI (and git/powershell helpers) it spawned were getting a fresh console window that lingered on screen. Every child process now spawns with `CREATE_NO_WINDOW`, so all consultation work happens silently in the background.
+
+### v1.0.15 (highest-effort default + effort-based async routing)
+- **Consults/plans default to `gpt-5.6-sol` at `max` again** (v1.0.14 had dropped this to `high`). Quality is the default; latency is handled by routing, not by lowering effort.
+- **`max`/`xhigh` consults route async up front.** Instead of blocking the 240s sync window and then reporting pending, an effort that doesn't fit the window returns a pending `request_id` immediately while the detached worker finishes it — collect with `request_result(request_id, wait_seconds=180)`. Efforts that fit (`high`/`medium`/`low`) still return **inline**.
+- **Reading/labour stays on Luna.** `model_policy='cheap_read'` (and cheap/reader-shaped requests) run `gpt-5.6-luna` at `low` and return inline.
+- **Defaults only — the caller always overrides.** An explicit `effort`, `target_model`, or `model_policy` wins: request Luna for a consult, or Sol/max for anything, as the task needs.
+
+### v1.0.14 (Codex consult no longer hangs / times out)
+- **Direct `consult_codex` no longer times out and discards the work.** A consult now runs through the same ledger+worker path as queued requests: it returns the answer inline when it finishes inside the sync window, otherwise it returns a `status: "pending"` payload with a `request_id` — the detached worker keeps running to its own cap and records the answer, so nothing is lost. Collect a pending answer with `request_result(request_id, wait_seconds=120)`.
+- **Consults default to `high` effort, not `max`.** At `max`, `gpt-5.6-sol` routinely overran the 240s sync window and the timeout threw the work away. `high` finishes inline for typical consults; the sync path no longer clamps serious consults *up* to `max` (the async routing paths still do). Pass `effort: "max"` explicitly when you want it — that request just returns a pending id.
+- **`request_result` / `request_status` gained `wait_seconds` long-poll.** One call blocks (bounded to the MCP window) until the request reaches a terminal state, the reliable way for a turn-based caller to collect a pending consult.
+- **Worker hardening.** Atomic single-writer claim (no duplicate workers on a simultaneous start); post-completion history/events are skipped when a worker loses the finalize race; lone UTF-16 surrogates in CLI output are scrubbed before the DB write (previously crashed `store_consultation` *after* a successful consult, discarding the answer).
+
 ### v1.0.13 (Codex inbox async worker)
 - **Claude -> Codex inbox requests no longer stay `delivered` forever.** Queued Codex requests now start a bounded headless Codex CLI worker that writes the answer/error back to the same request row.
 - **Old stuck Codex inbox requests now fail cleanly when polled.** `request_status` / `request_result` turns stale pre-fix Codex rows into terminal errors with a requeue note.

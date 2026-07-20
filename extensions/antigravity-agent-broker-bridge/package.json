@@ -2,7 +2,7 @@
   "name": "antigravity-agent-broker-bridge",
   "displayName": "Agent Switchboard Bridge",
   "description": "Routes queued Agent Broker requests into Antigravity's in-app agent panel.",
-  "version": "1.0.13",
+  "version": "1.0.21",
   "publisher": "futureisinpast",
   "license": "PolyForm-Noncommercial-1.0.0",
   "engines": {
