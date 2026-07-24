@@ -39,6 +39,7 @@ Two supported install paths — pick one:
 
 Other notes:
 - Windows 10/11 for the installer, bridge auto-select, and shortcut patching (the broker itself is cross-platform; the installer/CDP layer is Windows-first today).
+- **Antigravity CLI (`agy`)** is required for the default headless Antigravity route. Install it from the [official Antigravity CLI docs](https://antigravity.google/docs/cli/installation); without it, Switchboard falls back to the existing in-app bridge/inbox.
 - **Node.js on PATH** is needed only for the CDP helpers (Antigravity model auto-select, Codex/Claude webview submit).
 - Optional: `pip install tiktoken` for exact token accounting (a `chars/4` estimate is used if it's absent; the exe bundles it).
 
@@ -77,8 +78,8 @@ Other notes:
 | Keep a short per-topic **work memory** so the next model sees what changed, where, why, checks, risks, and next step | ✅ |
 | **Peek at another open chat** — fetch a *compact snapshot* of what another agent's session knows, on request (opt-in, local, never silent scraping) | ✅ active context snapshots; **Codex & Claude Code read on disk**, with **Antigravity local task/log/activity fallback** (`request_context_snapshot` → `get_latest_context_snapshot`) |
 | **Cross-model debate** — two assistants debate N rounds headless on your subscriptions, then a synthesis judge writes a verdict | ✅ (`agent-switchboard debate`) |
-| Route Codex/Claude to the **headless CLI** by default; the **in-app chat** ("in app") or **desktop app** only when asked | ✅ |
-| Keep **Gemini** + **Antigravity-hosted** models on in-app automation by default, with the Gemini CLI available when explicitly requested | ✅ |
+| Route Codex, Claude, and Antigravity to their **headless CLIs** by default; use the **in-app chat/inbox** only when asked or as fallback | ✅ |
+| Select Antigravity CLI models naturally (`flash high 3.6`) and discover future models from live `agy models` output | ✅ |
 | Fall back to the in-app extension / app automatically when a CLI isn't installed | ✅ (see caveats in the docs) |
 | Send a prompt straight into Antigravity's chat panel + get a structured reply back | ✅ (`antigravity.sendPromptToAgentPanel`, the only full in-app round-trip) |
 | Pick the Antigravity model automatically | ✅ **Offered at install** (default on) when Antigravity is detected — patches the launcher to open a local CDP debug port so the broker auto-selects the model in-app; just decline at the prompt to skip |
@@ -91,8 +92,8 @@ The broker is a dependency-free Python MCP server. Each assistant talks to it ov
 
 **Routing priority:**
 
-1. **Surface** — Codex/Claude default to the **headless CLI** (reliable, model-switchable via `-m`, answer returned inline); say **"in app"** (or `surface: extension`) for the IDE chat panel, or "app" for a visible desktop-app handoff. **Gemini** and **Antigravity-hosted** models stay on **in-app automation** by default; only an explicit "gemini cli" uses the standalone Gemini CLI. Antigravity-hosted Claude/Gemini never use a CLI. If a CLI is absent, auto-routing degrades to the extension, then the app.
-2. **Model** — vague requests ("ask Opus") resolve against a per-topic default; explicit requests ("claude opus") become the new default. Sending to **Antigravity always requires naming a model** (it hosts a separate, subscription-backed Claude/Gemini). Versioned names that the CLI can't pin (e.g. "opus 4.8") still resolve to the CLI's `opus` alias but now carry a **`note`** warning that the running version may differ.
+1. **Surface** — Codex, Claude, and Antigravity default to the **headless CLI** (reliable, model-switchable, answer returned inline). For Antigravity, that means the standalone `agy` executable, not the IDE's `antigravity chat` launcher. Say **"in app"** / **"inbox"**, pass `surface: extension` / `surface: inbox`, or set `use_inbox: true` to force the bridge panel. If `agy` is absent, an automatic Antigravity route falls back to that bridge/inbox.
+2. **Model** — vague Codex/Claude requests resolve to their flagship; bare Antigravity defaults to `gemini-3.6-flash-high`. Natural requests such as **"Flash High 3.6"** resolve to the stable CLI slug. `list_agent_models` merges the static aliases with live `agy models` output, so a future model such as Gemini 4 Pro becomes routable as soon as the installed CLI advertises it; before release, an unavailable model fails honestly instead of silently downgrading.
 3. **Token budget** — every routed task carries a task contract (`implementation_plan`, `co_audit`, `debate`, `review`, …) with a word budget, and a compressed context pack instead of raw history. If a caller inlines a bloated `prompt` (over a soft token limit), the broker stashes the full text as a retrievable `context_ref` and returns a `prompt_notice` nudging it to send a short instruction + ref next time — so token discipline is enforced by the system, not left to each agent.
 
 ---
@@ -118,6 +119,7 @@ There is a real difference between **delivered** (a file/prompt reached the surf
 
 | Target | Mechanism | How far it gets |
 |---|---|---|
+| **Antigravity CLI** (default) | `agy --print <prompt> --model … --effort …` (direct argument-array invocation, no shell) | **completed** — full headless round-trip; `plan` is sandboxed, while `task_kind=implementation` defaults to `accept-edits` |
 | **Antigravity** (in-app Gemini/Claude) | `antigravity.sendPromptToAgentPanel` (+ optional CDP model select) | delivered → submitted → **completed back to broker** (`complete_antigravity_request`) — the only structured round-trip |
 | **Claude extension** | `claude-inbox` markdown, **auto-opened** + best-effort CDP auto-submit | delivered → auto-opened → (often) submitted → **recorded back to broker**: the request now has a durable `claude_requests` row, so a reply via `respond_to_request` lands on it, or a file written to `claude-responses/` is ingested by `bridge claude-responses` |
 | **Claude CLI** | `claude -p` headless (prompt via stdin) | **completed** — full headless round-trip |
@@ -129,7 +131,7 @@ There is a real difference between **delivered** (a file/prompt reached the surf
 
 > **Model enforcement, honestly:** the broker can only *switch the answering model programmatically* on **Antigravity** (CDP UI automation, best-effort) and the **CLIs** (`--model`/`-m` flag). It **cannot** drive the Codex- or Claude-*extension* model picker. So when a specific model is requested on those surfaces, the broker prepends a **strict guard** to the prompt — *"you must be `<model>`; state your model; if you're not, STOP and ask the user to switch"* — and the bridge pops a **notification** to select that model. This way a lesser/default model never silently answers in the requested model's place. A model named only in the prompt ("get Opus's opinion") is detected conservatively and treated as the requested model **for that one request** (it does not overwrite the topic default).
 
-> **Model + effort on the CLIs:** model and reasoning effort are **separate inputs**, never folded together. Pass **`effort`** (`minimal|low|medium|high|xhigh|max`; *"extra high" -> xhigh*, *"ultra"/"max" -> family top*) and the broker sets it as its own CLI flag (Codex `-c model_reasoning_effort=`, Claude `--effort`) - it is **never** appended to the model name. A bare family request (**"codex"**, **"claude"**) defaults to the **flagship model at the highest available effort** (Codex `gpt-5.6-sol`/`max`, Claude `opus`/`max`); a specific model is honored verbatim (*"sonnet 4.6 for implementation"*, *"gpt-5.6-luna for cheap reading"*). Effort phrases embedded in a model request (*"5.6 sol extra high"*) are split off before matching, so they resolve to model `gpt-5.6-sol` + effort `xhigh` rather than an invalid model string.
+> **Model + effort on the CLIs:** model and reasoning effort are **separate inputs**, never folded together. Pass **`effort`** and the broker sets the CLI's own effort flag. A bare family request defaults to Codex `gpt-5.6-sol`/`max`, Claude `opus`/`max`, or Antigravity `gemini-3.6-flash-high`/`high`. For Antigravity, effort selects the matching low/medium/high live model variant when available. Implementation routes use `accept-edits`; permission bypass is never implicit and requires the explicit `danger-full-access` mode.
 
 > The broker is **target-driven** when a target is named. If a Codex/Claude caller leaves the target completely empty, Switchboard uses the caller only as a fallback: Codex defaults to Claude, and Claude defaults to Codex. A named target or prompt phrase like "consult with Claude" still wins.
 
@@ -172,6 +174,13 @@ broker/bridge version drift and prints actionable next steps.
 ---
 
 ## Changelog
+
+### v1.0.22 (Antigravity CLI-first routing)
+- **Antigravity now defaults to the standalone `agy` CLI**, matching Codex and Claude's CLI-first behavior. Calls return stdout directly; if `agy` is missing, automatic routing falls back to the existing in-app bridge/inbox.
+- **Explicit surface intent always wins.** `surface="extension"` / `"inbox"` or `use_inbox=true` forces the in-app bridge; `surface="cli"` requires the headless CLI.
+- **Model selection uses stable, live CLI slugs.** `"flash high 3.6"` resolves to `gemini-3.6-flash-high`, and `list_agent_models` merges `agy models` output so newly released models become available without hardcoding another broker release.
+- **Execution mode follows task intent.** Consult/review defaults to sandboxed `plan`; `task_kind="implementation"` defaults to `accept-edits`; bypassing permission prompts remains an explicit `danger-full-access` choice.
+- Added `consult_antigravity`, `antigravity_cli_path`, doctor reporting for `agy`, installer detection, and CLI/inbox fallback guidance.
 
 ### v1.0.21 (limits are advisory — stop force-shrinking data between sessions)
 - **Inline consult responses: default 5k → 20k chars, hard ceiling 40k → 200k** (`AGENT_BROKER_CONSULT_RESPONSE_CHARS` / `_MAX`). Full responses were always preserved (history + request row + `response_ref`), but the small inline cap force-shrank what the calling session actually saw.

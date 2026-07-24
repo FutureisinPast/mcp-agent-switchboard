@@ -14,6 +14,7 @@ import hashlib
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -35,7 +36,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.21"
+BROKER_VERSION = "1.0.22"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -114,6 +115,7 @@ DEFAULT_SNAPSHOT_TURNS = _env_int("AGENT_BROKER_SNAPSHOT_TURNS", 4)
 # full text. Never silently force-shrink data moving between sessions.
 DEFAULT_CONSULT_RESPONSE_CHARS = _env_int("AGENT_BROKER_CONSULT_RESPONSE_CHARS", 20000)
 MAX_CONSULT_RESPONSE_CHARS = _env_int("AGENT_BROKER_CONSULT_RESPONSE_CHARS_MAX", 200000)
+ANTIGRAVITY_MODEL_CACHE_SECONDS = _env_int("AGENT_BROKER_ANTIGRAVITY_MODEL_CACHE_SECONDS", 60)
 CLAUDE_ASYNC_MIN_TOKEN_BUDGET = _env_int("AGENT_BROKER_CLAUDE_ASYNC_MIN_TOKEN_BUDGET", 3000)
 CLAUDE_ASYNC_MIN_PROMPT_TOKENS = _env_int("AGENT_BROKER_CLAUDE_ASYNC_MIN_PROMPT_TOKENS", 2200)
 CLAUDE_ASYNC_MIN_RESPONSE_CHARS = _env_int("AGENT_BROKER_CLAUDE_ASYNC_MIN_RESPONSE_CHARS", 8000)
@@ -145,6 +147,7 @@ SECRET_WORDS = {
 CODEX_FLAGSHIP_MODEL = "gpt-5.6-sol"
 CODEX_BALANCED_MODEL = "gpt-5.6-terra"
 CODEX_CHEAP_MODEL = "gpt-5.6-luna"
+ANTIGRAVITY_DEFAULT_MODEL = "gemini-3.6-flash-high"
 CODEX_DEFAULT_EFFORT = "max"
 # Consults/plans default to the flagship (gpt-5.6-sol) at max — quality is the priority.
 # Because max routinely overruns SYNC_CONSULT_TIMEOUT_SECONDS, a max/xhigh consult does NOT
@@ -171,8 +174,14 @@ CODEX_SERIOUS_TASK_KINDS = {
 }
 
 MODEL_ALIASES = {
-    "gemini flash": "Gemini 3.5 Flash (High)",
-    "gemini flash high": "Gemini 3.5 Flash (High)",
+    "gemini flash": "Gemini 3.6 Flash (High)",
+    "gemini flash high": "Gemini 3.6 Flash (High)",
+    "gemini 3.6 flash": "Gemini 3.6 Flash (High)",
+    "gemini 3.6 flash high": "Gemini 3.6 Flash (High)",
+    "gemini 3.6 high": "Gemini 3.6 Flash (High)",
+    "flash 3.6": "Gemini 3.6 Flash (High)",
+    "flash 3.6 high": "Gemini 3.6 Flash (High)",
+    "flash high 3.6": "Gemini 3.6 Flash (High)",
     "gemini 3.5 flash high": "Gemini 3.5 Flash (High)",
     "gemini 3.5 high": "Gemini 3.5 Flash (High)",
     "flash 3.5 high": "Gemini 3.5 Flash (High)",
@@ -214,15 +223,14 @@ GENERIC_MODEL_REQUESTS = {
     "antigravity",
 }
 
-# Most-capable ("flagship") CLI model per family — what a bare "codex"/"claude"
-# request routes to by default ("highest model available"). The Claude "opus" and
-# Codex "gpt-5.5" aliases track whatever the installed CLI maps them to; bump these
-# one-liners when a new top model ships. None => no auto-flagship (caller must name
-# a model, or the family's own config/default applies).
+# Default CLI model per family. Codex and Claude use their highest-quality
+# defaults; Antigravity uses the current fast implementation default and still
+# honors any explicitly named model from the live CLI catalog.
 FAMILY_FLAGSHIP = {
     "codex": CODEX_FLAGSHIP_MODEL,
     "claude": "opus",
     "gemini": None,
+    "antigravity": ANTIGRAVITY_DEFAULT_MODEL,
 }
 
 # Reasoning-effort ladders per family, lowest -> highest. The last entry is the
@@ -231,6 +239,7 @@ FAMILY_FLAGSHIP = {
 FAMILY_EFFORTS = {
     "codex": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
     "claude": ["low", "medium", "high", "xhigh", "max"],
+    "antigravity": ["low", "medium", "high"],
 }
 
 PEER_CONSULT_DEFAULTS = {
@@ -254,14 +263,64 @@ _EFFORT_SYNONYMS = {
 _EFFORT_PHRASES = sorted(_EFFORT_SYNONYMS, key=len, reverse=True)
 
 STATIC_ANTIGRAVITY_MODELS = [
-    "Gemini 3.5 Flash (Medium)",
-    "Gemini 3.5 Flash (High)",
-    "Gemini 3.5 Flash (Low)",
-    "Gemini 3.1 Pro (Low)",
-    "Gemini 3.1 Pro (High)",
-    "Claude Sonnet 4.6 (Thinking)",
-    "Claude Opus 4.6 (Thinking)",
-    "GPT-OSS 120B (Medium)",
+    {
+        "id": "gemini-3.6-flash-high",
+        "display": "Gemini 3.6 Flash (High)",
+        "aliases": [
+            "gemini 3.6 flash high", "gemini 3.6 flash", "gemini flash",
+            "flash 3.6 high", "flash high 3.6", "flash 3.6",
+        ],
+    },
+    {
+        "id": "gemini-3.6-flash-medium",
+        "display": "Gemini 3.6 Flash (Medium)",
+        "aliases": ["gemini 3.6 flash medium", "flash 3.6 medium", "flash medium 3.6"],
+    },
+    {
+        "id": "gemini-3.6-flash-low",
+        "display": "Gemini 3.6 Flash (Low)",
+        "aliases": ["gemini 3.6 flash low", "flash 3.6 low", "flash low 3.6"],
+    },
+    {
+        "id": "gemini-3.5-flash-high",
+        "display": "Gemini 3.5 Flash (High)",
+        "aliases": ["gemini 3.5 flash high", "gemini 3.5 flash", "flash 3.5 high", "flash 3.5"],
+    },
+    {
+        "id": "gemini-3.5-flash-medium",
+        "display": "Gemini 3.5 Flash (Medium)",
+        "aliases": ["gemini 3.5 flash medium", "flash 3.5 medium"],
+    },
+    {
+        "id": "gemini-3.5-flash-low",
+        "display": "Gemini 3.5 Flash (Low)",
+        "aliases": ["gemini 3.5 flash low", "flash 3.5 low"],
+    },
+    {
+        "id": "gemini-3.1-pro-high",
+        "display": "Gemini 3.1 Pro (High)",
+        "aliases": ["gemini 3.1 pro high", "gemini 3.1 pro", "3.1 pro high", "3.1 pro"],
+    },
+    {
+        "id": "gemini-3.1-pro-low",
+        "display": "Gemini 3.1 Pro (Low)",
+        "aliases": ["gemini 3.1 pro low", "3.1 pro low"],
+    },
+    {
+        "id": "claude-sonnet-4-6",
+        "display": "Claude Sonnet 4.6 (Thinking)",
+        "aliases": ["antigravity sonnet", "claude sonnet 4.6", "sonnet 4.6"],
+    },
+    {
+        "id": "claude-opus-4-6-thinking",
+        "display": "Claude Opus 4.6 (Thinking)",
+        "aliases": ["antigravity opus", "claude opus 4.6", "opus 4.6"],
+    },
+    {
+        "id": "gpt-oss-120b-medium",
+        "display": "GPT-OSS 120B (Medium)",
+        "aliases": ["gpt oss 120b", "gpt-oss 120b", "gpt oss 120b medium"],
+    },
 ]
 
 STATIC_CLAUDE_MODELS = [
@@ -1411,6 +1470,28 @@ def discover_codex(config: dict[str, Any]) -> str | None:
     return None
 
 
+def discover_antigravity_cli(config: dict[str, Any]) -> str | None:
+    """Find the standalone Antigravity CLI (`agy`), not the IDE launcher.
+
+    The IDE also installs an `antigravity` command, but that command only opens
+    windows/chat panels and cannot provide a headless stdout return path.
+    """
+    found = find_executable(config, "antigravity_cli_path", ["agy", "agy.exe"])
+    if found:
+        return found
+    local_appdata = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    for candidate in (
+        local_appdata / "agy" / "bin" / "agy.exe",
+        local_appdata / "agy" / "bin" / "agy",
+    ):
+        try:
+            if candidate.is_file():
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
 def sanitize_prompt(prompt: str) -> str:
     blocked = ", ".join(sorted(SECRET_NAMES))
     return (
@@ -1983,7 +2064,7 @@ def default_target_agent_for_family(family: str) -> str:
         return "claude_code"
     if family == "gemini":
         return "gemini_cli"
-    return "antigravity"
+    return "antigravity_cli"
 
 
 def family_from_caller() -> str | None:
@@ -2096,32 +2177,152 @@ def discover_claude_models() -> list[dict[str, Any]]:
     return [item for item in models if item["id"]]
 
 
+def antigravity_model_entry_from_slug(slug: str, source: str = "antigravity-cli") -> dict[str, Any]:
+    """Turn a stable `agy models` slug into an agent-friendly catalog entry."""
+    model_id = str(slug or "").strip()
+    effort_match = re.search(r"-(low|medium|high)$", model_id, re.I)
+    effort = effort_match.group(1).lower() if effort_match else None
+    base = model_id[: effort_match.start()] if effort_match else model_id
+    display = model_id
+    aliases = [model_id, model_id.replace("-", " ")]
+
+    gemini_match = re.fullmatch(r"gemini-([0-9]+(?:\.[0-9]+)?)-(flash|pro)", base, re.I)
+    claude_match = re.fullmatch(r"claude-(sonnet|opus)-([0-9]+)-([0-9]+)(-thinking)?", base, re.I)
+    if gemini_match:
+        version, tier = gemini_match.groups()
+        display = f"Gemini {version} {tier.title()}"
+        short = f"{version} {tier}"
+        aliases.extend([f"gemini {short}", short, f"{tier} {version}"])
+        if effort:
+            display += f" ({effort.title()})"
+            aliases.extend(
+                [
+                    f"gemini {short} {effort}",
+                    f"{short} {effort}",
+                    f"{tier} {effort} {version}",
+                ]
+            )
+        # A bare base request selects High when that variant exists.
+        if effort != "high":
+            aliases = [item for item in aliases if normalize_lookup(item) != normalize_lookup(f"gemini {short}")]
+    elif claude_match:
+        tier, major, minor, thinking = claude_match.groups()
+        display = f"Claude {tier.title()} {major}.{minor}"
+        if thinking:
+            display += " (Thinking)"
+        aliases.extend([f"claude {tier} {major}.{minor}", f"{tier} {major}.{minor}", f"antigravity {tier}"])
+    elif base == "gpt-oss-120b":
+        display = "GPT-OSS 120B"
+        if effort:
+            display += f" ({effort.title()})"
+        aliases.extend(["gpt oss 120b", "gpt-oss 120b"])
+    return model_entry(model_id, display, list(dict.fromkeys(aliases)), source)
+
+
+_ANTIGRAVITY_MODEL_CACHE: list[dict[str, Any]] | None = None
+_ANTIGRAVITY_MODEL_CACHE_AT = 0.0
+
+
+def local_port_open(port: int, timeout: float = 0.2) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def discover_antigravity_models() -> list[dict[str, Any]]:
+    global _ANTIGRAVITY_MODEL_CACHE, _ANTIGRAVITY_MODEL_CACHE_AT
+    if (
+        _ANTIGRAVITY_MODEL_CACHE is not None
+        and time.monotonic() - _ANTIGRAVITY_MODEL_CACHE_AT < ANTIGRAVITY_MODEL_CACHE_SECONDS
+    ):
+        return [dict(item) for item in _ANTIGRAVITY_MODEL_CACHE]
     config = load_config()
-    names = list(STATIC_ANTIGRAVITY_MODELS)
+    models: list[dict[str, Any]] = [
+        model_entry(item["id"], item["display"], item.get("aliases") or [], "static")
+        for item in STATIC_ANTIGRAVITY_MODELS
+    ]
     for item in config.get("antigravity_models") or []:
         if isinstance(item, dict):
-            value = item.get("display") or item.get("id") or item.get("model")
-        else:
-            value = item
-        if str(value or "").strip():
-            names.append(str(value).strip())
+            models.append(
+                model_entry(
+                    str(item.get("id") or item.get("slug") or item.get("model") or ""),
+                    str(item.get("display") or item.get("id") or item.get("model") or ""),
+                    [str(alias) for alias in item.get("aliases") or []],
+                    "config",
+                )
+            )
+        elif str(item).strip():
+            models.append(antigravity_model_entry_from_slug(str(item).strip(), "config"))
+
+    agy = discover_antigravity_cli(config)
+    if agy:
+        try:
+            proc = subprocess.run(
+                [agy, "models"],
+                cwd=str(Path.cwd()),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=20,
+                check=False,
+                creationflags=WINDOWS_NO_WINDOW,
+            )
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    slug = line.strip()
+                    if slug and re.fullmatch(r"[a-z0-9][a-z0-9.-]*", slug):
+                        models.append(antigravity_model_entry_from_slug(slug))
+            else:
+                log(f"agy models exited {proc.returncode}: {proc.stderr[:500]}")
+        except Exception as exc:  # noqa: BLE001
+            log(f"agy model discovery failed: {exc}")
+
+    # Keep models visible only in the IDE picker as inbox choices too.
     helper = BROKER_DIR / "extensions" / "antigravity-agent-broker-bridge" / "cdp_list_models.mjs"
     node = config.get("node_path") or shutil.which("node")
     port = int(config.get("antigravity_cdp_port") or 9000)
-    if node and helper.exists():
+    if node and helper.exists() and local_port_open(port):
         data = run_json_command([str(node), str(helper), "--port", str(port), "--timeout", "5000"], timeout=8)
         for item in (data or {}).get("models", []):
             if str(item).strip():
-                names.append(str(item).strip())
+                display = str(item).strip()
+                if not any(normalize_lookup(existing.get("display")) == normalize_lookup(display) for existing in models):
+                    models.append(model_entry(display, display, [display], "antigravity-cdp"))
     seen: set[str] = set()
     result: list[dict[str, Any]] = []
-    for name in names:
-        key = normalize_lookup(name)
+    for item in models:
+        key = normalize_lookup(item.get("id"))
         if key and key not in seen:
             seen.add(key)
-            result.append(model_entry(name, name, [name], "antigravity-cdp" if "cdp" in key else "catalog"))
+            result.append(item)
+    _ANTIGRAVITY_MODEL_CACHE = [dict(item) for item in result]
+    _ANTIGRAVITY_MODEL_CACHE_AT = time.monotonic()
     return result
+
+
+def antigravity_model_for_effort(model: str | None, effort: str | None) -> str | None:
+    """Select the requested low/medium/high variant when the live catalog has it."""
+    model_id = str(model or "").strip()
+    level = str(effort or "").strip().lower()
+    if not model_id or level not in {"low", "medium", "high"}:
+        return model_id or None
+    candidate = re.sub(r"-(?:low|medium|high)$", f"-{level}", model_id, flags=re.I)
+    if candidate == model_id and re.match(r"^gemini-", model_id):
+        candidate = f"{model_id}-{level}"
+    available = {str(item.get("id") or "").lower() for item in discover_antigravity_models()}
+    return candidate if candidate.lower() in available else model_id
+
+
+def antigravity_display_model(model: Any) -> str:
+    """Map a CLI slug back to the IDE model label for explicit inbox delivery."""
+    raw = str(model or "").strip()
+    for item in discover_antigravity_models():
+        if normalize_lookup(item.get("id")) == normalize_lookup(raw):
+            return str(item.get("display") or raw)
+    return normalize_model_name(raw)
 
 
 def cdp_select_antigravity_model(target_model: Any, timeout_ms: int = 15000) -> dict[str, Any]:
@@ -2200,6 +2401,13 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                 "effort": "medium",
                 "rule": "Use Terra or model_policy='balanced' when the user asks for a middle ground, or when the caller deliberately judges medium/lower effort sufficient.",
             },
+            "antigravity_cli": {
+                "target_agent": "antigravity",
+                "target_model": ANTIGRAVITY_DEFAULT_MODEL,
+                "effort": "high",
+                "surface": "cli",
+                "rule": "Antigravity routes through the agy CLI by default. Name a live model explicitly when requested; use surface='extension' or 'inbox' only for the in-app bridge.",
+            },
         },
         "caller_examples": {
             "serious_consult": {
@@ -2221,9 +2429,26 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                 },
                 "broker_resolves_to": {"target_model": CODEX_CHEAP_MODEL, "effort": CODEX_CHEAP_EFFORT},
             },
+            "antigravity_implementation": {
+                "tool": "route_agent_task",
+                "args": {
+                    "target_agent": "antigravity",
+                    "target_model": "flash high 3.6",
+                    "task_kind": "implementation",
+                    "prompt": "Implement the requested change and run focused checks.",
+                },
+                "broker_resolves_to": {
+                    "route": "antigravity_cli",
+                    "target_model": "gemini-3.6-flash-high",
+                    "effort": "high",
+                    "mode": "accept-edits",
+                },
+            },
         },
         "notes": [
             "Use target_model for the model slug only; put reasoning in effort.",
+            "Antigravity CLI models are discovered live with `agy models`; newly released models become routable without changing the static catalog.",
+            "An automatic Antigravity route falls back to the in-app bridge if agy is missing. An explicit surface='cli' reports a missing CLI instead of silently changing surfaces.",
             "For serious Sol consult/audit/review/debate, medium/high is allowed only when the caller explicitly marks the downshift with model_policy such as 'balanced', 'efficient', or 'lower_effort', or the prompt says medium/lower effort is enough.",
             "The broker maps bare Codex/GPT requests to gpt-5.6-sol instead of the bare gpt-5.6 alias because ChatGPT-auth Codex can reject that alias.",
             "Use list_agent_models for the raw catalog; this guide adds the default-routing policy.",
@@ -2367,6 +2592,11 @@ _PROMPT_MODEL_PATTERNS: list[tuple[str, str]] = [
     (r"gpt[-\s]?5\.5", "gpt-5.5"),
     (r"gpt[-\s]?5\.4[-\s]?mini", "gpt-5.4-mini"),
     (r"gpt[-\s]?5\.4", "gpt-5.4"),
+    (r"(?:gemini\s*)?4(?:\.0)?\s*pro\s*\(?\s*high\s*\)?", "gemini 4 pro high"),
+    (r"(?:gemini\s*)?4(?:\.0)?\s*pro", "gemini 4 pro"),
+    (r"gemini\s*3\.6\s*flash\s*\(?\s*high\s*\)?", "gemini 3.6 flash high"),
+    (r"(?:flash\s*high\s*3\.6|flash\s*3\.6\s*high)", "gemini 3.6 flash high"),
+    (r"gemini\s*3\.6\s*flash", "gemini 3.6 flash"),
     (r"gemini\s*(?:3\.5\s*)?flash\s*\(?\s*high\s*\)?", "gemini 3.5 flash high"),
     (r"gemini\s*(?:3\.5\s*)?flash", "gemini flash"),
 ]
@@ -2408,6 +2638,7 @@ def detect_target_family_in_prompt(prompt: Any) -> str | None:
     if not text:
         return None
     family_patterns = [
+        (r"antigravity", "antigravity"),
         (r"(?:claude|claude\s+code)", "claude"),
         (r"(?:codex|gpt|openai)", "codex"),
         (r"gemini", "gemini"),
@@ -2707,9 +2938,14 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
     if match["status"] == "generic":
         default = find_model_default(project, topic, family)
         if default:
+            default_model = (
+                antigravity_model_for_effort(default["target_model"], resolved_effort)
+                if family == "antigravity"
+                else default["target_model"]
+            )
             final_effort, effort_policy = enforce_codex_effort_policy(
                 args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")),
-                default["target_model"], resolved_effort, model_policy,
+                default_model, resolved_effort, model_policy,
             ) if family == "codex" else (resolved_effort, None)
             result = {
                 "status": "resolved",
@@ -2717,7 +2953,7 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
                 "topic": topic,
                 "model_family": family,
                 "target_agent": default["target_agent"],
-                "target_model": default["target_model"],
+                "target_model": default_model,
                 "effort": final_effort,
                 "source": "topic_default",
             }
@@ -2730,6 +2966,11 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
         # interrupting to ask. Families with no flagship (antigravity / gemini) still ask.
         flagship = FAMILY_FLAGSHIP.get(family)
         if flagship is not None:
+            flagship = (
+                antigravity_model_for_effort(flagship, resolved_effort)
+                if family == "antigravity"
+                else flagship
+            )
             final_effort, effort_policy = enforce_codex_effort_policy(
                 args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")),
                 flagship, resolved_effort, model_policy,
@@ -2762,27 +3003,32 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
 
     if match["status"] == "matched":
         resolved_agent = default_target_agent_for_family(family)
+        matched_model = (
+            antigravity_model_for_effort(match["model"], resolved_effort)
+            if family == "antigravity"
+            else match["model"]
+        )
         final_effort, effort_policy = enforce_codex_effort_policy(
             args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")),
-            match["model"], resolved_effort, model_policy,
+            matched_model, resolved_effort, model_policy,
         ) if family == "codex" else (resolved_effort, None)
         # Only pin as the topic default when the caller EXPLICITLY opts in. Auto-pinning
         # every explicit pick made model selection sticky and surprising on later
         # generic requests; bare "codex"/"claude" should mean "flagship", not "last used".
         if truthy(args.get("remember_model", False)):
-            set_model_default(project, topic, family, resolved_agent, match["model"])
+            set_model_default(project, topic, family, resolved_agent, matched_model)
         resolved = {
             "status": "resolved",
             "project": resolve_project(project).name,
             "topic": topic,
             "model_family": family,
             "target_agent": resolved_agent,
-            "target_model": match["model"],
-            "display": match.get("display"),
+            "target_model": matched_model,
+            "display": antigravity_display_model(matched_model) if family == "antigravity" else match.get("display"),
             "effort": final_effort,
             "source": "explicit_request",
         }
-        note = version_collapse_note(family, target_model, match["model"])
+        note = version_collapse_note(family, target_model, matched_model)
         if note:
             resolved["note"] = note
         if model_policy:
@@ -2881,6 +3127,8 @@ def wrap_task_prompt(prompt: str, task_kind: str, token_budget: int | None = Non
 def infer_target_agent(target_agent: Any, target_model: Any = None) -> str:
     raw = f"{target_agent or ''} {target_model or ''}".lower()
     # Explicit CLI/app surfaces win over family defaults.
+    if "antigravity_cli" in raw or "antigravity cli" in raw or re.search(r"\bagy\b", raw):
+        return "antigravity_cli"
     if "claude code" in raw or "claude_cli" in raw or "claude cli" in raw:
         return "claude_code"
     if "codex_cli" in raw or "codex cli" in raw:
@@ -3245,6 +3493,63 @@ def consult_claude(
     return parsed or stdout or stderr or "Claude returned no output."
 
 
+def consult_antigravity_cli(
+    project: str | None,
+    prompt: str,
+    mode: str = "plan",
+    model_name: str | None = None,
+    effort: str | None = None,
+    timeout: int = SYNC_CONSULT_TIMEOUT_SECONDS,
+) -> str:
+    config = load_config()
+    agy = discover_antigravity_cli(config)
+    if not agy:
+        return (
+            "Antigravity CLI was not found. Install `agy` or set antigravity_cli_path in "
+            f"{CONFIG_PATH}. Use route_agent_task with surface='extension' for the inbox fallback."
+        )
+    project_info = resolve_project(project)
+    requested_mode = normalize_lookup(mode)
+    implementation_mode = requested_mode in {
+        "accept edits", "accept-edits", "workspace write", "workspace-write",
+        "implementation", "implement", "edit",
+    }
+    bypass_permissions = requested_mode in {
+        "danger full access", "danger-full-access", "bypass permissions",
+        "bypasspermissions", "unrestricted",
+    }
+    command = [agy]
+    if model_name:
+        command.extend(["--model", str(model_name)])
+    if effort:
+        command.extend(["--effort", str(effort)])
+    if implementation_mode or bypass_permissions:
+        command.extend(["--mode", "accept-edits"])
+    else:
+        command.extend(["--mode", "plan", "--sandbox"])
+    if bypass_permissions:
+        command.append("--dangerously-skip-permissions")
+    command.extend(
+        [
+            "--print-timeout",
+            f"{int(timeout)}s",
+            "--print",
+            sanitize_prompt(prompt),
+        ]
+    )
+    code, stdout, stderr = run_process(
+        command,
+        project_info.root_path,
+        None,
+        timeout=timeout,
+    )
+    if code == 124:
+        return consult_timeout_message("Antigravity CLI", timeout, stdout)
+    if code != 0:
+        return f"Antigravity CLI exited with code {code}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}".strip()
+    return stdout or stderr or "Antigravity CLI returned no output."
+
+
 def consult_gemini(
     project: str | None,
     prompt: str,
@@ -3467,7 +3772,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     topic_arg = str(args.get("topic") or "").strip() or None
     task_kind = normalize_task_kind(args.get("task_kind"))
     token_budget = int(args.get("token_budget") or TASK_BUDGETS.get(task_kind, TASK_BUDGETS["consult"]))
-    mode = str(args.get("mode") or ("plan" if model == "claude" else "read-only"))
+    mode = str(args.get("mode") or ("plan" if model in {"claude", "antigravity"} else "read-only"))
     requested_model = args.get("target_model") or args.get("model_name") or args.get("model")
     requested_effort = args.get("effort") or args.get("reasoning_effort")
     model_policy = None
@@ -3483,6 +3788,8 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     resolved_model, effort = resolve_cli_model_and_effort(
         model, requested_model, requested_effort, codex_default_effort
     )
+    if model == "antigravity":
+        resolved_model = antigravity_model_for_effort(resolved_model, effort)
     # A serious consult/plan on Sol is forced to max — even if the caller fumbled and passed
     # high/medium — unless it explicitly opted into a cheaper tier (model_policy=cheap_read /
     # balanced / lower_effort, or a Luna/Terra model). This is SAFE now: max no longer blocks
@@ -3570,6 +3877,10 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             if topic_arg and load_config().get("topic_workspaces", True):
                 claude_workspace = str(topic_workspace_dir(project_info, topic_arg))
             response = consult_claude(project_info.root_path, prompt, mode, resolved_model, claude_workspace, effort, timeout_seconds)
+        elif model == "antigravity":
+            response = consult_antigravity_cli(
+                project_info.root_path, prompt, mode, resolved_model, effort, timeout_seconds
+            )
         elif model == "gemini":
             response = consult_gemini(project_info.root_path, prompt, mode, resolved_model, timeout_seconds)
         else:
@@ -4678,6 +4989,9 @@ CONSULT_FAILURE_PREFIXES = (
     "Claude Code CLI was not found.",
     "Claude Code timed out after",
     "Claude exited with code",
+    "Antigravity CLI was not found.",
+    "Antigravity CLI timed out after",
+    "Antigravity CLI exited with code",
     "Gemini is not configured.",
     "Gemini CLI timed out after",
     "Gemini CLI exited with code",
@@ -5923,9 +6237,11 @@ def surface_available(family: str, surface: str) -> bool:
 def resolve_surface(args: dict[str, Any]) -> str:
     """Decide the delivery surface. Returns 'cli', 'extension' (in-app chat panel),
     'app' (visible desktop app), or 'auto' (no explicit intent -> the family picks
-    its default: Codex/Claude -> headless CLI, Gemini/Antigravity -> in-app automation)."""
+    its default: Codex/Claude/Antigravity -> headless CLI, Gemini -> in-app automation)."""
+    if truthy(args.get("use_inbox") or args.get("inbox")):
+        return "extension"
     explicit = str(args.get("surface") or "").strip().lower()
-    if explicit in {"extension", "ext", "panel", "ide", "chat", "in_app", "inapp", "in-app"}:
+    if explicit in {"extension", "ext", "panel", "ide", "chat", "inbox", "in_app", "inapp", "in-app"}:
         return "extension"
     if explicit in {"app", "desktop", "gui", "standalone", "standalone_app"}:
         return "app"
@@ -6335,11 +6651,9 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
     surface_note: str | None = None
     ide_host = resolve_ide_host(args, target_agent)
     cfg = load_config()
-    # Default surface is the headless CLI for Codex/Claude (reliable, model-switchable,
-    # and what the user routes to most). Explicit 'extension'/'in app' or 'app' is
-    # always honored. Gemini and Antigravity stay on in-app automation by default
-    # (the Gemini CLI on Pro plans only serves lesser models, and the CLI cannot reach
-    # Antigravity-hosted Claude/Gemini at all).
+    # Default surface is the headless CLI for Codex/Claude/Antigravity (reliable,
+    # model-switchable, and returns stdout). Explicit extension/inbox/app intent is
+    # always honored. The old standalone Gemini family keeps its legacy behavior.
     if family == "claude":
         if surface == "app":
             target_agent = "claude_app"
@@ -6380,6 +6694,17 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
             else:
                 target_agent = "codex_app"
                 surface_note = "Codex CLI not found; fell back to visible Codex app handoff."
+    elif family == "antigravity":
+        if surface in {"extension", "app"}:
+            target_agent = "antigravity"
+        elif surface == "cli":
+            target_agent = "antigravity_cli"
+        else:  # auto: prefer agy, then fall back to the existing bridge/inbox
+            if discover_antigravity_cli(cfg):
+                target_agent = "antigravity_cli"
+            else:
+                target_agent = "antigravity"
+                surface_note = "Antigravity CLI not found; routed to the in-app bridge/inbox instead."
     elif family == "gemini":
         # Gemini defaults to the Antigravity in-app automation (Antigravity hosts Gemini
         # natively); only an explicit 'cli' request uses the standalone Gemini CLI.
@@ -6418,15 +6743,16 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         # instance), then drive its model chooser over CDP so the requested model
         # is actually selected before the prompt is sent — this is the broker-side
         # equivalent of picking the model by hand in the app.
+        in_app_model = antigravity_display_model(target_model)
         launch = launch_ide_host("antigravity", resolve_project(project).root_path)
         model_selection = None
         if load_config().get("antigravity_cdp_autoselect", False):
-            model_selection = cdp_select_antigravity_model(target_model)
+            model_selection = cdp_select_antigravity_model(in_app_model)
         queued = queue_antigravity_request(
             project,
             prompt,
             topic,
-            target_model,
+            in_app_model,
             args.get("request_type") or "consult",
             task_kind,
             strict_model,
@@ -6436,6 +6762,8 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         queued["surface"] = "extension"
         queued["launch"] = launch
         queued["model_selection"] = model_selection
+        if surface_note:
+            queued["surface_note"] = surface_note
         queued["model_resolution"] = model_resolution
         return queued
 
@@ -6598,6 +6926,31 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
             result["surface_note"] = surface_note
         result["model_resolution"] = model_resolution
         return result
+    if target_agent == "antigravity_cli":
+        antigravity_mode = args.get("mode")
+        if not antigravity_mode:
+            antigravity_mode = "accept-edits" if task_kind == "implementation" else "plan"
+        result = consult(
+            "antigravity",
+            {
+                "project": project,
+                "topic": topic,
+                "prompt": prompt,
+                "mode": antigravity_mode,
+                "task_kind": task_kind,
+                "token_budget": token_budget,
+                "target_model": target_model,
+                "effort": resolved_effort,
+                "max_response_chars": args.get("max_response_chars"),
+                "timeout_seconds": args.get("timeout_seconds"),
+            },
+        )
+        result["route"] = "antigravity_cli"
+        result["surface"] = "cli"
+        if surface_note:
+            result["surface_note"] = surface_note
+        result["model_resolution"] = model_resolution
+        return result
     if target_agent == "gemini_cli":
         result = consult(
             "gemini",
@@ -6680,6 +7033,32 @@ TOOLS = [
         },
     },
     {
+        "name": "consult_antigravity",
+        "description": "Ask Antigravity through the standalone agy CLI. Defaults to Gemini 3.6 Flash High in plan/sandbox mode and returns stdout directly. Name any model from list_agent_models; live agy model discovery makes newly released model slugs available without a broker update. Use route_agent_task with surface='extension' or surface='inbox' for the in-app bridge instead.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "topic": {"type": "string"},
+                "prompt": {"type": "string"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["plan", "accept-edits", "danger-full-access"],
+                    "description": "plan is read-only/sandboxed; accept-edits permits implementation; danger-full-access also bypasses permission prompts and must be explicit.",
+                },
+                "include_context_pack": {"type": "boolean"},
+                "task_kind": {"type": "string"},
+                "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
+                "include_task_contract": {"type": "boolean"},
+                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
+                "target_model": {"type": "string", "description": "Model name or stable agy slug, e.g. 'flash high 3.6' or 'gemini-3.6-flash-high'."},
+                "effort": {"type": "string", "description": "Antigravity reasoning effort: low|medium|high. Explicit effort selects the matching live model variant when available."},
+                "timeout_seconds": {"type": "integer", "minimum": 15, "maximum": 240},
+            },
+            "required": ["prompt"],
+        },
+    },
+    {
         "name": "consult_gemini",
         "description": "Ask Gemini for consultation through Gemini CLI or Gemini API.",
         "inputSchema": {
@@ -6732,15 +7111,15 @@ TOOLS = [
     },
     {
         "name": "route_agent_task",
-        "description": "Route a task to Antigravity, Codex, Claude, or Gemini. MODEL DEFAULTS: a bare family ('codex'/'gpt' or 'claude') uses that family's MOST CAPABLE model at the HIGHEST reasoning effort (Codex gpt-5.5/xhigh, Claude opus/max) — no prompt to pick. Name target_model for a specific model (e.g. 'sonnet', 'gpt-5.4-mini', 'fable') and it is honored; put reasoning effort in the 'effort' field, never in target_model. SURFACE DEFAULTS: Codex/Claude default to the headless CLI (reliable, model-switchable, returns the answer inline); pass surface='extension' (or say 'in app'/'in the chat') to use the in-app IDE panel instead, or surface='app' for a visible desktop-app handoff. Gemini defaults to the Antigravity in-app automation (the Gemini CLI on Pro plans only serves lesser models); pass surface='cli' to force the standalone Gemini CLI. Antigravity-hosted models (e.g. Antigravity's Opus/Gemini) ALWAYS use Antigravity automation, never a CLI, and require naming a specific Antigravity model. KEEP `prompt` SHORT: write a brief instruction and let the receiver read the files/work-memory itself; do NOT inline large context — stash it with store_shared_context and pass the context_ref. Oversized prompts trip a token-economy notice (`prompt_notice`).",
+        "description": "Route a task to Antigravity, Codex, Claude, or Gemini. CLI-FIRST DEFAULTS: Codex, Claude, and Antigravity use their headless CLIs unless a surface is explicitly requested. Bare Antigravity defaults to Gemini 3.6 Flash High; a request such as target_model='flash high 3.6' resolves to the stable agy slug. Live agy model discovery exposes future models when installed. Pass surface='extension' or surface='inbox' (or use_inbox=true) for the Antigravity in-app bridge, or surface='app' for visible-app delivery. If agy is missing, an automatic Antigravity route falls back to the bridge/inbox. Name target_model for a specific model and keep effort in the effort field. KEEP prompt SHORT: let the receiver read project files/work-memory and use context refs for large unique data.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": {"type": "string"},
                 "topic": {"type": "string"},
                 "target_agent": {"type": "string"},
-                "target_model": {"type": "string", "description": "Model only (e.g. 'opus', 'sonnet', 'gpt-5.5', 'gpt-5.4-mini'). A bare family ('codex'/'claude') routes to that family's most-capable model. Keep reasoning effort OUT of this string — use the 'effort' field."},
-                "effort": {"type": "string", "description": "Reasoning effort for CLI surfaces. Codex: minimal|low|medium|high|xhigh; Claude: low|medium|high|xhigh|max ('extra high' => xhigh, 'max'/'ultra' => family top). Omit for highest available (default)."},
+                "target_model": {"type": "string", "description": "Model only (e.g. 'opus', 'gpt-5.6-sol', 'flash high 3.6', 'gemini-3.6-flash-high'). Bare Codex/Claude/Antigravity requests resolve to their family defaults. Keep reasoning effort in the effort field."},
+                "effort": {"type": "string", "description": "Reasoning effort for CLI surfaces. Codex: minimal|low|medium|high|xhigh|max; Claude: low|medium|high|xhigh|max; Antigravity: low|medium|high."},
                 "target_host": {
                     "type": "string",
                     "description": "IDE host to open for extension delivery, such as 'antigravity' or 'vscode'.",
@@ -6759,9 +7138,10 @@ TOOLS = [
                 },
                 "surface": {
                     "type": "string",
-                    "enum": ["extension", "ide", "app", "desktop", "cli", "headless", "auto"],
-                    "description": "Delivery surface. 'extension'/'ide' opens the requested IDE host and uses the bridge extension; 'app'/'desktop' opens the visible desktop app and writes a handoff; 'cli'/'headless' uses the backend without a GUI.",
+                    "enum": ["extension", "inbox", "ide", "app", "desktop", "cli", "headless", "auto"],
+                    "description": "Delivery surface. Omit/auto for CLI-first routing. 'extension'/'inbox' uses the in-app bridge; 'app'/'desktop' opens the visible app; 'cli'/'headless' requires the backend CLI.",
                 },
+                "use_inbox": {"type": "boolean", "description": "Force the in-app extension/inbox route instead of the default CLI."},
                 "task_kind": {
                     "type": "string",
                     "enum": [
@@ -7263,6 +7643,7 @@ TOOLS = [
 
 CLAUDE_LITE_TOOL_NAMES = {
     "consult_codex",
+    "consult_antigravity",
     "consult_gemini",
     "route_agent_task",
     "queue_codex_request",
@@ -7312,9 +7693,9 @@ PUBLIC_TOOL_NAMES = CLAUDE_LITE_TOOL_NAMES | {
 
 TOOL_DESCRIPTION_OVERRIDES = {
     "route_agent_task": (
-        "Route a task to Antigravity, Codex, Claude, or Gemini. DEFAULTS: bare 'codex'/'gpt' "
-        "means Codex CLI gpt-5.6-sol/max for consult, co-op, audit, review, debate, bug hunt, "
-        "or serious second opinion; bare 'claude' means opus/max. CHEAP CODEX READER: only "
+        "Route a task to Antigravity, Codex, Claude, or Gemini. CLI-FIRST: bare Antigravity "
+        "uses agy with Gemini 3.6 Flash High; bare Codex uses gpt-5.6-sol/max; bare Claude "
+        "uses opus/max. Use surface='extension'/'inbox' to force in-app delivery. CHEAP CODEX READER: only "
         "when the user explicitly asks for cheap/fast/efficient reading, extraction, summarizing, "
         "sample prep, drafting, or boilerplate, use model_policy='cheap_read' and the broker "
         "selects gpt-5.6-luna/low. Call get_model_routing_guide/list_agent_models if unsure."
@@ -7324,8 +7705,9 @@ TOOL_DESCRIPTION_OVERRIDES = {
 COMPACT_TOOL_DESCRIPTIONS = {
     "consult_codex": "Ask Codex for a bounded consultation. Long answers return an excerpt plus response_ref.",
     "consult_claude": "Ask Claude Code; heavy Opus/max Codex requests queue to Claude inbox with a request id.",
+    "consult_antigravity": "Ask Antigravity through agy CLI; defaults to Gemini 3.6 Flash High in plan mode.",
     "consult_gemini": "Ask Gemini through the configured CLI/API. Long answers return an excerpt plus response_ref.",
-    "route_agent_task": "Route a short task to Codex, Claude, Gemini, or Antigravity. Keep prompt brief; use refs for large context.",
+    "route_agent_task": "Route a short task CLI-first; surface='extension'/'inbox' explicitly uses the in-app bridge.",
     "queue_codex_request": "Queue a request for Codex extension pickup.",
     "get_codex_requests": "List recent queued/completed Codex extension requests.",
     "queue_claude_request": "Queue a request for Claude extension pickup.",
@@ -8668,6 +9050,8 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return text_content(consult("codex", args))
     if name == "consult_claude":
         return text_content(consult("claude", args))
+    if name == "consult_antigravity":
+        return text_content(consult("antigravity", args))
     if name == "consult_gemini":
         return text_content(consult("gemini", args))
     if name == "get_consultation_history":
@@ -9022,6 +9406,8 @@ def _cli_probe(config: dict[str, Any], family: str) -> dict[str, Any]:
         path = find_executable(config, "claude_path", ["claude", "claude.cmd", "claude.ps1"])
     elif family == "gemini":
         path = find_executable(config, "gemini_path", ["gemini", "gemini.cmd"])
+    elif family == "antigravity":
+        path = discover_antigravity_cli(config)
     else:
         path = None
     from_bundle = False
@@ -9178,14 +9564,29 @@ def broker_doctor() -> dict[str, Any]:
         "reply_path": ("stdout" if gemini_full else "none"),
     }
 
-    # --- Antigravity (only true in-app structured round-trip) ---
+    # --- Antigravity CLI first, in-app bridge fallback ---
+    antigravity_cli = _cli_probe(config, "antigravity")
+    antigravity_full = bool(antigravity_cli["found"] and antigravity_cli["smoke_ok"])
+    antigravity_routes: list[str] = []
+    if antigravity_full:
+        antigravity_routes.append("antigravity_cli (agy; full headless round-trip, default)")
+    antigravity_routes.append("antigravity_inbox (in-app bridge; explicit/fallback)")
     surfaces["antigravity"] = {
+        "cli": antigravity_cli,
         "extension": "driven via antigravity.sendPromptToAgentPanel (only true in-app structured round-trip)",
         "cdp_port": antigravity_cdp,
         "needs_node_cdp": True,
-        "reply_path": "complete_antigravity_request",
-        "best_quality": "full (structured) when Antigravity is running",
+        "routes": antigravity_routes,
+        "default_route": "antigravity_cli" if antigravity_full else "antigravity_inbox",
+        "reply_path": "stdout" if antigravity_full else "complete_antigravity_request",
+        "best_quality": "full" if antigravity_full else "full (structured) when Antigravity is running",
     }
+    if antigravity_cli["found"] and not antigravity_cli["smoke_ok"]:
+        recommendations.append("Antigravity agy binary was found but `--version` failed; verify the CLI install.")
+    if not antigravity_cli["found"]:
+        recommendations.append(
+            "Antigravity CLI (agy) not found - automatic Antigravity routes will use the in-app bridge fallback."
+        )
 
     # --- Debate readiness: a headless autonomous debate needs BOTH sides headless ---
     codex_side = (

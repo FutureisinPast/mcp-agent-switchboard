@@ -2,6 +2,7 @@
   "_comment": "Copy to config.json. Leave paths empty to auto-detect via PATH. No personal paths are required.",
   "codex_path": "",
   "antigravity_path": "",
+  "antigravity_cli_path": "",
   "vscode_path": "",
   "claude_path": "",
   "claude_model": "sonnet",

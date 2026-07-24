@@ -275,6 +275,23 @@ def antigravity_cli() -> str | None:
     )
 
 
+def antigravity_agent_cli() -> str | None:
+    """Standalone headless Antigravity CLI (`agy`), separate from the IDE launcher."""
+    cfg = broker_config()
+    for raw in (os.environ.get("ANTIGRAVITY_CLI_PATH"), cfg.get("antigravity_cli_path")):
+        resolved = existing_file(raw)
+        if resolved:
+            return resolved
+    for candidate in (
+        LOCALAPPDATA / "agy" / "bin" / "agy.exe",
+        LOCALAPPDATA / "agy" / "bin" / "agy",
+    ):
+        resolved = existing_file(candidate)
+        if resolved:
+            return resolved
+    return which("agy") or which("agy.exe")
+
+
 def vscode_cli() -> str | None:
     cfg = broker_config()
     for raw in (os.environ.get("VSCODE_PATH"), cfg.get("vscode_path")):
@@ -552,6 +569,7 @@ def write_config(dry: bool) -> str:
     desired = {
         "codex_path": which("codex") or "",
         "antigravity_path": antigravity_cli() or "",
+        "antigravity_cli_path": antigravity_agent_cli() or "",
         "vscode_path": vscode_cli() or "",
         "claude_path": which("claude") or "",
         "claude_model": "sonnet",
@@ -578,6 +596,12 @@ def write_config(dry: bool) -> str:
     # Fill the executable paths only if currently empty/missing (don't clobber a working path).
     if not existing.get("codex_path"):
         existing["codex_path"] = which("codex") or ""
+    resolved_antigravity_agent_cli = antigravity_agent_cli() or ""
+    current_antigravity_agent_cli = str(existing.get("antigravity_cli_path") or "")
+    if resolved_antigravity_agent_cli and (
+        not current_antigravity_agent_cli or not Path(current_antigravity_agent_cli).exists()
+    ):
+        existing["antigravity_cli_path"] = resolved_antigravity_agent_cli
     resolved_antigravity = antigravity_cli() or ""
     current_antigravity = str(existing.get("antigravity_path") or "")
     if (
