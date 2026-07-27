@@ -36,7 +36,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.22"
+BROKER_VERSION = "1.0.23"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -466,6 +466,9 @@ TASK_CONTRACTS = {
         "Findings first, ordered by severity, with evidence.",
         "Do not rewrite the solution unless asked.",
         "Keep the audit bounded to the provided topic/context.",
+        "Report every substantiated in-scope finding; no arbitrary count cap, and never silently omit secondary regressions caused by the reviewed change.",
+        "Keep genuinely unrelated observations separate from the main findings.",
+        "If there are no findings, say so and name the residual verification gaps.",
     ],
     "debate": [
         "Argue the strongest technical case for and against the proposal.",
@@ -482,11 +485,17 @@ TASK_CONTRACTS = {
         "Use code-review style: bugs, regressions, missing tests, and risks first.",
         "Cite exact files/lines when available.",
         "Avoid summaries unless there are no issues.",
+        "Report every substantiated in-scope finding; no arbitrary count cap, and never silently omit secondary regressions caused by the reviewed change.",
+        "Keep genuinely unrelated observations separate from the main findings.",
+        "If there are no findings, say so and name the residual verification gaps.",
     ],
     "bug_hunt": [
         "Focus on reproducing, isolating, and explaining the bug.",
         "List likely root causes with evidence and next diagnostic command.",
         "Do not propose broad rewrites.",
+        "Report every substantiated in-scope finding; no arbitrary count cap, and never silently omit secondary regressions caused by the reviewed change.",
+        "Keep genuinely unrelated observations separate from the main findings.",
+        "If there are no findings, say so and name the residual verification gaps.",
     ],
     "sanity_check": [
         "Check whether the plan/request is coherent and safe.",
@@ -512,6 +521,10 @@ GENERIC_GROUND_RULES = [
     "When finished, return your answer by calling `respond_to_request` with this Request ID (and your model name) so it lands in the broker ledger -- do NOT make the user copy-paste your reply from the chat. If broker tools are unavailable, write the answer under `## Answer for <request-id>` so it can be ingested.",
     "After meaningful planning, edits, audits, or handoffs, call `record_work_memory` with what changed, where, why, checks, risks, and next step.",
     "Record important evidence as context events when tools are available.",
+    "Start with the requested result, verdict, or action; no greetings, throat-clearing, or ceremonial closers.",
+    "Describe failures as observed behavior, impact, known cause, next action; no dramatization or reassurance.",
+    "Do not invent duration or effort estimates; report observed elapsed time only, and forecast only if explicitly asked.",
+    "Prefer plain language over corporate jargon; keep technical and domain terminology intact.",
 ]
 
 
