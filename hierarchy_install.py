@@ -245,20 +245,21 @@ def routing_rules_body(codex_roles: dict, claude_roles: dict) -> str:
     return f"""## Cost-aware model hierarchy
 
 - The model selected for the main session is the brain. Never rewrite that user choice. The brain owns requirements, architecture, planning, decomposition, hard diagnosis, high-risk decisions, and final sign-off.
+- Native-first routing order is mandatory. For same-vendor bounded labour, use native subagents first: a Codex brain uses the managed `explorer` (`{reader}`/low) and `worker` (`{workhorse}`/medium); a Claude brain uses managed `Explore` (`{claude_roles.get('reader') or 'haiku'}`) and `economy-worker` (`{claude_roles.get('workhorse') or 'sonnet'}`/medium). Do not use Agent Switchboard to launch same-vendor labour unless the named native role is unavailable or fails to start, and record that fallback.
 - For non-trivial planning or a hard issue, the brain must obtain one opposite-vendor maximum-effort consultation: a Codex brain uses Claude `{claude_chain}` with runtime attestation; a Claude brain uses the live Codex frontier `{frontier}` at the highest available single-agent effort. On explicit availability/entitlement failure, use the next advertised frontier candidate and report the fallback.
-- Delegate bounded labour when handoff is cheaper than direct work and verification is cheap: bulk reading/search/extraction/formatting to a reader; routine writing, light implementation, tests, scripts, and reversible deployment steps from an approved plan to a workhorse. Reader routes: Codex `{reader}`/low or Claude `{claude_roles.get('reader') or 'haiku'}`. Workhorse routes: Codex `{workhorse}`/medium or Claude `{claude_roles.get('workhorse') or 'sonnet'}`/medium.
+- Delegate when handoff is cheaper than direct work and verification is cheap: bulk reading/search/extraction/formatting to the native reader; routine writing, light implementation, tests, scripts, and reversible deployment steps from an approved plan to the native workhorse.
+- Plans are portable across vendors. Every package states `Lane | mechanism | exact resolved model/effort | deliverable | verification | escalation`, where Lane is semantic (`brain`, `reader`, or `workhorse`). At execution start, resolve the semantic lane to the executing brain's current same-vendor native role and record the exact model/effort. Never follow an imported foreign-vendor labour model literally; re-resolve it for the current executor.
 - Keep ambiguous architecture, security/auth/payment/data-loss/migration work, irreversible actions, and approval with the brain. Workers stop on ambiguity, plan deviation, high-risk scope, or a failed fix; the brain diagnoses before redelegating a deterministic remainder.
-- Every non-trivial implementation plan must split work into packages stating `Route | exact resolved model/effort | deliverable | verification | escalation`. Do not use role words as the route. Use `override: brain - reason` when coordination costs more than direct work or routing is unavailable.
+- A dirty worktree, same-session ownership, or deployment authority is not a blanket reason to keep reading, test execution, evidence gathering, documentation, or isolated mechanical edits on the brain. Retain only the specific overlapping write or high-risk state transition.
+- Brain overrides are package-specific and use exactly `override: brain - <WP-ID>: <specific reason>`. Bare/global overrides are invalid. After ten mutating operations without a completed native cheap-role agent, stop at the next package boundary and re-evaluate delegation.
 - Readers return file:line evidence. The brain reviews actual diffs and verification output. Reads may run in parallel; writes are serial unless files are demonstrably independent.
-- Do not claim implementation complete without a `Routing audit` mapping each work package to its requested route, broker request UUID, broker-attested actual model/effort, verification, and override. Never trust prose self-identification as attestation; label unavailable attestation unverified.
+- Do not claim implementation complete without a `Routing audit` mapping each package to its lane, mechanism, resolved model/effort, verification, and one receipt: `native:<agent-id>` for a host-attested completed managed subagent, `broker:<uuid>` for an Agent Switchboard call, or the structured per-package brain override. Native lifecycle attests agent id/type/completion; its checksum-protected role file attests configured model/effort unless the runtime exposes stronger attestation. Never treat prose self-identification as proof; label unavailable runtime model attestation unverified.
 """
 
 
 def role_file_bodies(codex_roles: dict, claude_roles: dict) -> dict[str, str]:
-    frontier_fallback = "gpt-5.6-sol"
-    reader = str((codex_roles.get("reader") or {}).get("id") or "gpt-5.6-luna")
-    workhorse = str((codex_roles.get("workhorse") or {}).get("id") or "gpt-5.6-terra")
-    _ = str((codex_roles.get("frontier") or {}).get("id") or frontier_fallback)
+    reader = str((codex_roles.get("reader") or {}).get("id") or "").strip()
+    workhorse = str((codex_roles.get("workhorse") or {}).get("id") or "").strip()
     return {
         "codex_explorer": f'''name = "explorer"
 description = "Cost-efficient read-only exploration. Use proactively for search, bulk reading, extraction, inventories, and evidence gathering before the brain decides."
@@ -266,17 +267,17 @@ model = "{reader}"
 model_reasoning_effort = "low"
 sandbox_mode = "read-only"
 developer_instructions = """
-Read and search only the assigned scope. Return concise findings with exact file:line evidence. Do not make architecture, risk, or approval decisions. Stop on ambiguity, high-risk scope, or a broader handoff.
+You are the same-vendor native reader. Never route this package through Agent Switchboard. Read and search only the assigned scope. Return concise findings with exact file:line evidence. Do not make architecture, risk, or approval decisions. Stop on ambiguity, high-risk scope, or a broader handoff.
 """
-''',
+''' if reader else "",
         "codex_worker": f'''name = "worker"
 description = "Cost-efficient worker for bounded writing, implementation, tests, scripts, and reversible deployment steps after an approved plan."
 model = "{workhorse}"
 model_reasoning_effort = "medium"
 developer_instructions = """
-Require a work package with Route, exact model/effort, deliverable, verification, and escalation. Implement only that package. Stop on ambiguity, plan deviation, high-risk scope, or the first failed fix and return evidence to the brain.
+You are the same-vendor native workhorse. Never route this package through Agent Switchboard. Require a work package with Lane, mechanism, exact resolved model/effort, deliverable, verification, and escalation. Implement only that package. Stop on ambiguity, plan deviation, high-risk scope, or the first failed fix and return evidence to the brain.
 """
-''',
+''' if workhorse else "",
         "claude_explore": f'''---
 name: Explore
 description: Cost-efficient read-only exploration. Use proactively for search, bulk reading, extraction, inventories, and evidence gathering before the brain decides.
@@ -284,7 +285,7 @@ tools: Read, Grep, Glob
 model: {claude_roles.get('reader') or 'haiku'}
 ---
 
-Read and search only the assigned scope. Return concise findings with exact file:line evidence. Do not make architecture, risk, or approval decisions. Stop on ambiguity, high-risk scope, or a broader handoff.
+You are the same-vendor native reader. Never route this package through Agent Switchboard. Read and search only the assigned scope. Return concise findings with exact file:line evidence. Do not make architecture, risk, or approval decisions. Stop on ambiguity, high-risk scope, or a broader handoff.
 ''',
         "claude_worker": f'''---
 name: economy-worker
@@ -293,7 +294,7 @@ model: {claude_roles.get('workhorse') or 'sonnet'}
 effort: medium
 ---
 
-Require a work package with Route, exact model/effort, deliverable, verification, and escalation. Implement only that package. Stop on ambiguity, plan deviation, high-risk scope, or the first failed fix and return evidence to the brain.
+You are the same-vendor native workhorse. Never route this package through Agent Switchboard. Require a work package with Lane, mechanism, exact resolved model/effort, deliverable, verification, and escalation. Implement only that package. Stop on ambiguity, plan deviation, high-risk scope, or the first failed fix and return evidence to the brain.
 ''',
     }
 
@@ -339,20 +340,28 @@ def _merge_hook_event(data: dict, event: str, command: str, matcher: str | None)
     hooks[event] = kept
 
 
-def update_hooks(path: Path, command_prefix: str, backup: BackupFn, dry: bool = False) -> str:
+def update_hooks(
+    path: Path,
+    command_prefix: str,
+    host: str,
+    backup: BackupFn,
+    dry: bool = False,
+) -> str:
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     try:
         data = json.loads(existing) if existing else {}
         if not isinstance(data, dict):
             raise ValueError("top-level JSON must be an object")
-        _merge_hook_event(data, "UserPromptSubmit", f"{command_prefix} UserPromptSubmit agent-switchboard", None)
+        _merge_hook_event(data, "UserPromptSubmit", f"{command_prefix} UserPromptSubmit agent-switchboard {host}", None)
+        _merge_hook_event(data, "SubagentStart", f"{command_prefix} SubagentStart agent-switchboard {host}", None)
+        _merge_hook_event(data, "SubagentStop", f"{command_prefix} SubagentStop agent-switchboard {host}", None)
         _merge_hook_event(
             data,
             "PostToolUse",
-            f"{command_prefix} PostToolUse agent-switchboard",
+            f"{command_prefix} PostToolUse agent-switchboard {host}",
             "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch",
         )
-        _merge_hook_event(data, "Stop", f"{command_prefix} Stop agent-switchboard", None)
+        _merge_hook_event(data, "Stop", f"{command_prefix} Stop agent-switchboard {host}", None)
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: {path.name} is not safely mergeable ({exc}); left untouched"
     rendered = json.dumps(data, indent=2) + "\n"
@@ -388,6 +397,8 @@ def remove_hooks(path: Path, backup: BackupFn, dry: bool = False) -> str:
                 filtered = routing_gate.remove_owned_hook_entries(handlers)
                 if filtered != handlers:
                     changed = True
+                # Keep non-empty user handlers, or untouched groups that never
+                # contained one of ours. Drop owned-only groups completely.
                 if filtered or filtered == handlers:
                     new_group = copy.deepcopy(group)
                     new_group["hooks"] = filtered
@@ -419,15 +430,29 @@ def refresh(
         with atomic_io.FileLock(paths.lock):
             body = routing_rules_body(codex_roles, claude_roles)
             role_bodies = role_file_bodies(codex_roles, claude_roles)
+            def write_codex_role(path: Path, body: str, role_name: str) -> str:
+                if not body:
+                    if not path.exists():
+                        return "skipped (live role unavailable; no stale model installed)"
+                    existing = path.read_text(encoding="utf-8")
+                    if _managed_file_body(existing):
+                        if _managed_file_valid(existing):
+                            return "unchanged (live role unavailable; kept last-known managed role)"
+                        return "ERROR: managed role file was edited; live role unavailable; left untouched"
+                    return "skipped (live role unavailable; existing role is user-owned)"
+                return write_managed_file(
+                    path, body, False, _legacy_codex_role(role_name), backup, dry
+                )
+
             return {
                 "Codex global hierarchy": update_instruction_block(paths.codex_agents_md, body, backup, dry),
                 "Claude global hierarchy": update_instruction_block(paths.claude_md, body, backup, dry),
-                "Codex explorer role": write_managed_file(paths.codex_explorer, role_bodies["codex_explorer"], False, _legacy_codex_role("explorer"), backup, dry),
-                "Codex worker role": write_managed_file(paths.codex_worker, role_bodies["codex_worker"], False, _legacy_codex_role("worker"), backup, dry),
+                "Codex explorer role": write_codex_role(paths.codex_explorer, role_bodies["codex_explorer"], "explorer"),
+                "Codex worker role": write_codex_role(paths.codex_worker, role_bodies["codex_worker"], "worker"),
                 "Claude Explore role": write_managed_file(paths.claude_explore, role_bodies["claude_explore"], True, _legacy_claude_role("Explore"), backup, dry),
                 "Claude worker role": write_managed_file(paths.claude_worker, role_bodies["claude_worker"], True, _legacy_claude_role("economy-worker"), backup, dry),
-                "Codex routing hooks": update_hooks(paths.codex_hooks, hook_command_prefix, backup, dry),
-                "Claude routing hooks": update_hooks(paths.claude_settings, hook_command_prefix, backup, dry),
+                "Codex routing hooks": update_hooks(paths.codex_hooks, hook_command_prefix, "codex", backup, dry),
+                "Claude routing hooks": update_hooks(paths.claude_settings, hook_command_prefix, "claude", backup, dry),
             }
     except TimeoutError as exc:
         return {"Hierarchy": f"ERROR: {exc}; left untouched"}

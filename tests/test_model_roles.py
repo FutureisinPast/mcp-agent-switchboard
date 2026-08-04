@@ -140,6 +140,30 @@ class SelectCodexRolesTests(unittest.TestCase):
         roles = model_roles.select_codex_roles({"models": models})
         self.assertEqual(roles.frontier["id"], "top")
 
+    def test_frontier_keywords_never_make_it_workhorse_or_reader_when_alternatives_exist(self):
+        models = [
+            {
+                "id": "top",
+                "priority": 1,
+                "description": "flagship that is also balanced, affordable, and fast",
+            },
+            {"id": "mid", "priority": 5, "description": "balanced everyday driver"},
+            {"id": "low", "priority": 9, "description": "affordable cost-efficient reader"},
+        ]
+        roles = model_roles.select_codex_roles({"models": models})
+        self.assertEqual(roles.frontier["id"], "top")
+        self.assertNotEqual(roles.workhorse["id"], roles.frontier["id"])
+        self.assertNotEqual(roles.reader["id"], roles.frontier["id"])
+
+    def test_two_model_catalog_uses_non_frontier_for_both_cheap_roles(self):
+        models = [
+            {"id": "top", "priority": 1, "description": "balanced affordable fast flagship"},
+            {"id": "economy", "priority": 9, "description": "general purpose"},
+        ]
+        roles = model_roles.select_codex_roles({"models": models})
+        self.assertEqual(roles.workhorse["id"], "economy")
+        self.assertEqual(roles.reader["id"], "economy")
+
 
 class SelectClaudeRolesTests(unittest.TestCase):
     def test_frontier_chain_is_fable_then_opus(self):

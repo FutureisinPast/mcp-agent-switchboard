@@ -59,6 +59,32 @@ class HierarchyInstallTests(unittest.TestCase):
         self.paths.codex_worker.write_text(
             'name = "worker"\ndescription = "Cost-efficient old role"\n', encoding="utf-8"
         )
+        self.paths.codex_hooks.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "SubagentStart": [
+                            {
+                                "matcher": "user-agent",
+                                "hooks": [
+                                    {"type": "command", "command": "user-subagent-start.ps1"}
+                                ],
+                            }
+                        ],
+                        "SubagentStop": [
+                            {
+                                "matcher": "user-agent",
+                                "hooks": [
+                                    {"type": "command", "command": "user-subagent-stop.ps1"}
+                                ],
+                            }
+                        ],
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         self.paths.claude_explore.parent.mkdir(parents=True, exist_ok=True)
         self.paths.claude_explore.write_text(
             "---\nname: Explore\ndescription: Cost-efficient old role\n---\n", encoding="utf-8"
@@ -112,7 +138,33 @@ class HierarchyInstallTests(unittest.TestCase):
             for item in group.get("hooks", [])
         ]
         self.assertIn("shutdown-if-armed.ps1", stop_commands)
-        self.assertTrue(any("routing-hook Stop agent-switchboard" in item for item in stop_commands))
+        self.assertTrue(any(item.endswith("routing-hook Stop agent-switchboard claude") for item in stop_commands))
+
+        codex_hooks = json.loads(self.paths.codex_hooks.read_text(encoding="utf-8"))["hooks"]
+        for event, user_command in (
+            ("SubagentStart", "user-subagent-start.ps1"),
+            ("SubagentStop", "user-subagent-stop.ps1"),
+        ):
+            commands = [
+                item["command"]
+                for group in codex_hooks[event]
+                for item in group.get("hooks", [])
+            ]
+            self.assertIn(user_command, commands)
+            self.assertTrue(
+                any(item.endswith(f"routing-hook {event} agent-switchboard codex") for item in commands)
+            )
+
+        hierarchy_lower = codex_text.lower()
+        self.assertIn("same-vendor", hierarchy_lower)
+        self.assertIn("native subagents first", hierarchy_lower)
+        self.assertIn("agent switchboard", hierarchy_lower)
+        self.assertIn("opposite-vendor", hierarchy_lower)
+        self.assertIn("fallback", hierarchy_lower)
+        self.assertIn("imported", hierarchy_lower)
+        self.assertIn("semantic", hierarchy_lower)
+        self.assertIn("resolve", hierarchy_lower)
+        self.assertIn("execution", hierarchy_lower)
 
         before = {path: path.read_bytes() for path in (
             self.paths.codex_agents_md,
@@ -145,6 +197,57 @@ class HierarchyInstallTests(unittest.TestCase):
         result = self.refresh()["Claude routing hooks"]
         self.assertTrue(result.startswith("ERROR"), result)
         self.assertEqual(self.paths.claude_settings.read_bytes(), before)
+
+    def test_catalog_failure_keeps_last_known_roles_and_never_installs_stale_ids(self):
+        empty_roles = {"frontier": None, "workhorse": None, "reader": None}
+        first = hierarchy_install.refresh(
+            self.paths,
+            empty_roles,
+            CLAUDE_ROLES,
+            '"C:\\Agent Switchboard\\agent-switchboard.exe" routing-hook',
+            self.backup,
+        )
+        self.assertIn("no stale model installed", first["Codex explorer role"])
+        self.assertIn("no stale model installed", first["Codex worker role"])
+        self.assertFalse(self.paths.codex_explorer.exists())
+        self.assertFalse(self.paths.codex_worker.exists())
+
+        self.refresh()
+        explorer_before = self.paths.codex_explorer.read_bytes()
+        worker_before = self.paths.codex_worker.read_bytes()
+        second = hierarchy_install.refresh(
+            self.paths,
+            empty_roles,
+            CLAUDE_ROLES,
+            '"C:\\Agent Switchboard\\agent-switchboard.exe" routing-hook',
+            self.backup,
+        )
+        self.assertIn("kept last-known managed role", second["Codex explorer role"])
+        self.assertIn("kept last-known managed role", second["Codex worker role"])
+        self.assertEqual(explorer_before, self.paths.codex_explorer.read_bytes())
+        self.assertEqual(worker_before, self.paths.codex_worker.read_bytes())
+
+    def test_catalog_failure_never_trusts_tampered_or_user_owned_role(self):
+        empty_roles = {"frontier": None, "workhorse": None, "reader": None}
+        self.refresh()
+        explorer = self.paths.codex_explorer.read_text(encoding="utf-8")
+        tampered = explorer.replace('model = "gpt-next-luna"', 'model = "user-edited"')
+        self.paths.codex_explorer.write_text(tampered, encoding="utf-8")
+        user_worker = 'name = "worker"\nmodel = "user-owned"\n'
+        self.paths.codex_worker.write_text(user_worker, encoding="utf-8")
+
+        result = hierarchy_install.refresh(
+            self.paths,
+            empty_roles,
+            CLAUDE_ROLES,
+            '"C:\\Agent Switchboard\\agent-switchboard.exe" routing-hook',
+            self.backup,
+        )
+
+        self.assertTrue(result["Codex explorer role"].startswith("ERROR"))
+        self.assertIn("user-owned", result["Codex worker role"])
+        self.assertEqual(self.paths.codex_explorer.read_text(encoding="utf-8"), tampered)
+        self.assertEqual(self.paths.codex_worker.read_text(encoding="utf-8"), user_worker)
 
     def test_uninstall_removes_owned_content_and_preserves_existing_hook(self):
         self.seed_legacy_files()

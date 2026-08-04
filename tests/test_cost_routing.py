@@ -266,12 +266,12 @@ class ResolveCodexPathTests(unittest.TestCase):
 
 
 class RoutingContractStringsTests(unittest.TestCase):
-    def test_implementation_plan_contract_has_route_fields(self):
+    def test_implementation_plan_contract_has_portable_lane_fields(self):
         contract = broker.TASK_CONTRACTS["implementation_plan"]
-        matches = [line for line in contract if "Route |" in line]
-        self.assertTrue(matches, "expected a Route | ... work-package line")
+        matches = [line for line in contract if "Lane |" in line]
+        self.assertTrue(matches, "expected a portable Lane | ... work-package line")
         route_line = matches[0]
-        for field in ("Route", "deliverable", "verification", "escalation"):
+        for field in ("Lane", "mechanism", "model/effort", "deliverable", "verification", "escalation"):
             self.assertIn(field, route_line)
 
     def test_ascii_override_marker_present_and_ascii_only(self):
@@ -286,13 +286,63 @@ class RoutingContractStringsTests(unittest.TestCase):
         for line in cost_aware_matches:
             line.encode("ascii")
 
-    def test_actual_model_ledger_audit_required(self):
+    def test_mixed_native_and_broker_receipt_audit_required(self):
         matches = [
             line
             for line in broker.COST_AWARE_ROUTING_RULES
-            if "actual-model ledger" in line and "never a worker's self-reported" in line
+            if "native:<agent-id>" in line
+            and "broker:<uuid>" in line
+            and "structured per-package brain override" in line
         ]
-        self.assertTrue(matches, "expected the actual-model ledger audit rule")
+        self.assertTrue(matches, "expected the mixed native/broker routing audit rule")
+
+
+class NativeFirstBrokerGuardTests(unittest.TestCase):
+    def test_direct_same_vendor_codex_queue_is_rejected_before_enqueue(self):
+        with mock.patch.object(broker, "_MCP_CLIENT_NAME", "codex-vscode"), mock.patch.object(
+            broker, "queue_codex_request"
+        ) as enqueue:
+            with self.assertRaisesRegex(ValueError, "native subagents first"):
+                broker.handle_tool("queue_codex_request", {"prompt": "routine implementation"})
+        enqueue.assert_not_called()
+
+    def test_direct_same_vendor_claude_queue_allows_concrete_native_failure(self):
+        args = {
+            "prompt": "routine implementation",
+            "native_unavailable_reason": "economy-worker failed to start twice",
+        }
+        with mock.patch.object(broker, "_MCP_CLIENT_NAME", "claude-code"), mock.patch.object(
+            broker, "queue_claude_request", return_value={"queued": True}
+        ) as enqueue:
+            broker.handle_tool("queue_claude_request", args)
+        enqueue.assert_called_once()
+
+    def test_cross_vendor_queue_does_not_require_native_failure(self):
+        with mock.patch.object(broker, "_MCP_CLIENT_NAME", "claude-code"), mock.patch.object(
+            broker, "queue_codex_request", return_value={"queued": True}
+        ) as enqueue:
+            broker.handle_tool("queue_codex_request", {"prompt": "frontier consult"})
+        enqueue.assert_called_once()
+
+    def test_route_agent_task_cannot_bypass_same_vendor_guard(self):
+        resolved = {
+            "status": "resolved",
+            "target_agent": "codex_cli",
+            "target_model": "gpt-5.6-terra",
+            "effort": "medium",
+            "source": "explicit_request",
+        }
+        args = {
+            "prompt": "implement the approved mechanical package",
+            "target_agent": "codex",
+            "target_model": "gpt-5.6-terra",
+            "model_policy": "balanced",
+        }
+        with mock.patch.object(broker, "_MCP_CLIENT_NAME", "codex-vscode"), mock.patch.object(
+            broker, "resolve_model_request", return_value=resolved
+        ):
+            with self.assertRaisesRegex(ValueError, "native subagents first"):
+                broker.route_agent_task(args)
 
 
 if __name__ == "__main__":

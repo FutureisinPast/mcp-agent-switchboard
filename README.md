@@ -176,6 +176,13 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.27 (native-first labour routing)
+- Same-vendor labour now uses native subagents first: Codex `explorer`/Luna-low and `worker`/Terra-medium, or Claude `Explore`/Haiku and `economy-worker`/Sonnet-medium. Agent Switchboard is reserved for opposite-vendor maximum-effort consultation and an explicitly recorded native-unavailable fallback.
+- Plans now carry a portable semantic lane plus execution mechanism and executor-resolved exact model/effort. A Claude-authored Sonnet/Haiku package is re-resolved to Codex's current native worker/reader when Codex executes it, and vice versa.
+- The completion gate records host-issued `SubagentStart`/`SubagentStop` ids and accepts mixed `native:<agent-id>` and `broker:<uuid>` receipts. Bare brain overrides no longer bypass the whole audit; retained work uses a package-specific `override: brain - <WP-ID>: <specific reason>`.
+- A one-shot native-first checkpoint fires after ten mutating operations without a completed cheap native agent. Dirty-worktree or deployment ownership no longer excuses read-only, test, evidence, documentation, or isolated mechanical labour.
+- Dynamic Codex role selection excludes the frontier brain from cheaper roles when alternatives exist. A transient catalog failure keeps the last-known managed native roles instead of installing stale hard-coded model ids.
+
 ### v1.0.26 (future-proof brain/labour hierarchy)
 - The install/repair flow now owns checksum-marked global Codex and Claude hierarchy blocks, cheap reader/workhorse role files, and merge-safe prompt/tool/stop hooks. It preserves existing hooks and main model/effort settings; the same refresh runs whenever the installed MCP server starts.
 - Codex brain/worker/reader roles are selected from live `codex debug models` priority/visibility/description metadata. Claude uses moving family aliases: Fable/max for the peer brain, Opus/max only on an explicit Fable availability failure, Sonnet/medium for workhorse implementation, and Haiku for read-only labour.

@@ -38,7 +38,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.26"
+BROKER_VERSION = "1.0.27"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -465,7 +465,8 @@ TASK_CONTRACTS = {
         "Favor the smallest sufficient design: prefer the standard library, native platform features, or an already-installed dependency over new code or new dependencies -- without dropping required validation, error handling, security, or tests.",
         "If handing to a weaker/cheaper model, make the plan deterministic: include acceptance criteria and forbidden changes.",
         "Do not continue if critical context is missing; ask one concise blocking question.",
-        "Break the plan into work packages; each one states Route | exact model/effort | deliverable | verification | escalation.",
+        "Break the plan into portable work packages; each one states Lane | mechanism | exact model/effort resolved by the executor | deliverable | verification | escalation.",
+        "Use semantic brain/reader/workhorse lanes in imported plans. At execution start, translate a foreign-vendor labour route to the current executor's same-vendor native role instead of following the foreign model literally.",
         "Reclassify risk/difficulty at each work-package boundary instead of routing the whole plan once up front.",
     ],
     "implementation": [
@@ -475,7 +476,8 @@ TASK_CONTRACTS = {
         "Do not refactor unrelated code or change behavior outside scope.",
         "Prefer the smallest sufficient implementation: write no new code when configuration, removal, or an existing call suffices; otherwise prefer the standard library, then native platform features, then an already-installed dependency, before adding bespoke code or a new dependency.",
         "This minimalism never overrides required validation, error handling, security checks, or tests; if the plan looks unsafe or materially over-built, stop and report it instead of silently trimming.",
-        "Follow the work package's assigned Route (model/effort); if you deviate, record the ASCII line `override: brain - <reason>` in your report.",
+        "Follow the package's semantic Lane, but resolve it to the current executor's same-vendor native role and record the exact model/effort. Never call Agent Switchboard for same-vendor labour unless the native role is unavailable.",
+        "If the brain retains a package, record `override: brain - <WP-ID>: <specific reason>` under the final Routing audit; bare/global overrides are invalid.",
         "If any plan step is impossible or ambiguous, or a fix attempt fails, stop at the first such point, return that item to the brain, and let the brain delegate the remaining deterministic work rather than improvising past it.",
         "Default to parallel execution for read-only work packages and serial execution for write/edit work packages unless the plan states otherwise.",
         "Report files changed, checks run, and remaining risks.",
@@ -549,14 +551,16 @@ GENERIC_GROUND_RULES = [
 COST_AWARE_ROUTING_RULES = [
     "The model selected for the main session is the brain; never rewrite that user choice. It owns requirements, architecture, planning, hard diagnosis, risk decisions, and final signoff.",
     "For non-trivial planning or a hard issue, obtain one opposite-vendor maximum-effort consultation: Codex brain -> moving Claude Fable alias (Opus only when Fable is explicitly unavailable); Claude brain -> the live Codex frontier at its highest single-agent effort.",
-    "Classify risk and difficulty at every work-package boundary. Resolve current role ids from the broker: reader/low for bounded reading, search, extraction, and formatting; workhorse/medium for routine writing, light implementation, tests, scripts, and reversible deployment steps from an approved plan.",
-    "Every work package handed to a worker states Route | exact model/effort | deliverable | verification | escalation -- no vague model families and no unstated effort level.",
-    "A worker must follow the assigned Route as given; if it deviates it must record the ASCII line `override: brain - <reason>` in its report so the deviation is auditable.",
+    "Native first: same-vendor labour uses the host's managed native subagents (Codex explorer/worker; Claude Explore/economy-worker). Agent Switchboard is only for opposite-vendor consultation or an explicitly documented native-unavailable fallback.",
+    "Classify risk and difficulty at every work-package boundary. Reader/low handles bounded reading, search, extraction, and formatting; workhorse/medium handles routine writing, light implementation, tests, scripts, and reversible deployment from an approved plan.",
+    "Portable packages state Lane | mechanism | exact resolved model/effort | deliverable | verification | escalation. Imported foreign-vendor reader/workhorse routes are re-resolved to the executor's current same-vendor native role at execution start.",
+    "A worker follows the resolved package. A retained package uses `override: brain - <WP-ID>: <specific reason>` in the Routing audit; bare/global overrides are invalid.",
     "A worker must stop and escalate on security, authentication, payments, destructive operations, schema or data migrations, plan deviation, ambiguous requirements, or failed verification.",
     "On the first ambiguity or failed fix, the item returns to the brain immediately; the brain resolves it and re-delegates only the remaining deterministic work, instead of letting the worker improvise past the blocker.",
     "Default execution order: read-only work packages run in parallel, write/edit work packages run serially, unless the plan explicitly overrides this.",
+    "A dirty worktree or same-session ownership never excuses keeping read-only inventory, tests, evidence, docs, or isolated mechanical work on the brain; only the exact overlapping write or high-risk state transition may be retained.",
     "Do not accept a worker summary as proof. Validate file-and-line evidence, the actual diff, and check output before signoff.",
-    "The final routing audit cross-checks the broker's actual-model ledger (real model/effort used per call), never a worker's self-reported model or effort.",
+    "The final routing audit uses host-attested native:<agent-id> receipts for native labour, broker:<uuid> ledger receipts for Switchboard calls, or a structured per-package brain override. Native model/effort is configured by the checksum-protected role and labeled unverified if the host exposes no runtime model attestation.",
     "Skip delegation when specifying and verifying the handoff would cost more than doing the small task directly.",
 ]
 
@@ -2521,6 +2525,11 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
     codex_reader = str((codex_roles.get("reader") or {}).get("id") or CODEX_CHEAP_MODEL)
     guide: dict[str, Any] = {
         "purpose": "Use this before routing if you are unsure which model/effort to request.",
+        "execution_precedence": [
+            "Same-vendor bounded labour uses native subagents first: Codex explorer/worker or Claude Explore/economy-worker.",
+            "Use Agent Switchboard for opposite-vendor maximum-effort consultation.",
+            "Use a same-vendor broker worker only when the named native role is unavailable or failed to start, and record the fallback.",
+        ],
         "defaults": {
             "consult_audit_review_debate": {
                 "target_agent": "codex",
@@ -2532,13 +2541,13 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                 "target_agent": "codex",
                 "target_model": codex_reader,
                 "effort": CODEX_CHEAP_EFFORT,
-                "rule": "Only use this when the user explicitly asks for cheap/fast/efficient reading, extraction, summarizing, sample preparation, drafting, or boilerplate.",
+                "rule": "Broker fallback only: a Codex main session should use its native explorer first. Use this route for an opposite-vendor caller or when the native role is explicitly unavailable.",
             },
             "balanced_optional": {
                 "target_agent": "codex",
                 "target_model": codex_workhorse,
                 "effort": "medium",
-                "rule": "Use model_policy='balanced' for bounded writing, light implementation, tests, scripts, and reversible deployment steps from an approved plan; it resolves to the live Codex workhorse/medium unless a model is named explicitly.",
+                "rule": "Broker fallback only: a Codex main session should use its native worker first. Otherwise model_policy='balanced' resolves to the live Codex workhorse/medium.",
             },
             "claude_consult_audit_review_debate": {
                 "target_agent": "claude",
@@ -2549,13 +2558,13 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
             "claude_cheap_read_sample_prep": {
                 "target_agent": "claude",
                 "target_model": "haiku",
-                "rule": "Use model_policy='cheap_read' for explicit reading, extraction, summaries, sample preparation, drafting, or boilerplate. Haiku receives no effort override.",
+                "rule": "Broker fallback only: a Claude main session should use its native Explore agent first. Otherwise cheap_read resolves to Haiku with no effort override.",
             },
             "claude_balanced_implementation": {
                 "target_agent": "claude",
                 "target_model": CLAUDE_BALANCED_MODEL,
                 "effort": CLAUDE_BALANCED_EFFORT,
-                "rule": "Use model_policy='balanced' for bounded writing, light implementation, tests, scripts, and reversible deployment steps from an approved plan; it resolves to the moving Sonnet alias at medium unless a model is named explicitly.",
+                "rule": "Broker fallback only: a Claude main session should use its native economy-worker first. Otherwise balanced resolves to the moving Sonnet alias at medium.",
             },
             "antigravity_cli": {
                 "target_agent": "antigravity",
@@ -3042,6 +3051,25 @@ def apply_claude_model_policy(
     if policy in {"balanced", "efficient", "lower effort", "lower_effort", "workhorse"} and not str(raw_model or "").strip():
         return CLAUDE_BALANCED_MODEL, raw_effort or CLAUDE_BALANCED_EFFORT, "balanced"
     return raw_model, raw_effort, None
+
+
+def enforce_native_first_broker_fallback(args: dict[str, Any], target_family: str) -> None:
+    """Reject same-vendor MCP sessions unless native delegation is unavailable.
+
+    MCP is the cross-vendor bridge, not the normal transport for a provider's
+    own labour. Unknown callers are left alone because older/third-party MCP
+    clients may not identify themselves; installed Codex/Claude clients do.
+    """
+    caller_family = family_from_caller()
+    if caller_family != target_family:
+        return
+    reason = str(args.get("native_unavailable_reason") or "").strip()
+    if len(reason) < 12:
+        raise ValueError(
+            f"Same-vendor {target_family} work must use native subagents first. "
+            "Agent Switchboard requires native_unavailable_reason with the concrete "
+            "native-role startup/access failure before it can be used as fallback."
+        )
 
 
 def is_codex_flagship_model(model: Any) -> bool:
@@ -4361,10 +4389,12 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     requested_effort = args.get("effort") or args.get("reasoning_effort")
     model_policy = None
     if model == "codex":
+        enforce_native_first_broker_fallback(args, "codex")
         requested_model, requested_effort, model_policy = apply_codex_model_policy(
             args, prompt, task_kind, requested_model, requested_effort
         )
     elif model == "claude":
+        enforce_native_first_broker_fallback(args, "claude")
         requested_model, requested_effort, model_policy = apply_claude_model_policy(
             args, requested_model, requested_effort
         )
@@ -6450,6 +6480,18 @@ def request_status(request_id: str, wait_seconds: Any = None) -> dict[str, Any]:
         return {"id": rid, "found": False, "error": "unknown request id"}
     table, row = polled
     raw = row.get("status")
+    responder_model = str(row.get("responder_model") or "").strip().lower()
+    responder = str(row.get("responder") or "").strip().lower()
+    # Only detached CLI workers have runtime model evidence. Responses returned
+    # through respond_to_request carry a model string supplied by the receiver,
+    # so expose them honestly as unverified instead of treating prose as proof.
+    model_attested = bool(
+        canonical_request_state(raw) == "completed"
+        and responder in {"codex-cli-worker", "claude-cli-worker"}
+        and responder_model.startswith(("codex:", "claude:"))
+        and "unverified" not in responder_model
+        and "<synthetic>" not in responder_model
+    )
     return {
         "id": rid,
         "found": True,
@@ -6463,6 +6505,7 @@ def request_status(request_id: str, wait_seconds: Any = None) -> dict[str, Any]:
         "target_model": row.get("target_model"),
         "responder": row.get("responder"),
         "responder_model": row.get("responder_model"),
+        "model_attested": model_attested,
         "created_at": row.get("created_at"),
         "completed_at": row.get("completed_at"),
         "latency": _latency(row.get("created_at"), row.get("completed_at")),
@@ -7317,6 +7360,10 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
     # Antigravity host but a real family was named with extension/host intent.
     if family == "antigravity" and intent_family in ("claude", "codex", "gemini"):
         family = intent_family
+    if family in {"codex", "claude"}:
+        # route_agent_task calls the queue/CLI implementations directly, so it
+        # must enforce the same native-first boundary as consult_* and queue_*.
+        enforce_native_first_broker_fallback(args, family)
     surface_note: str | None = None
     ide_host = resolve_ide_host(args, target_agent)
     cfg = load_config()
@@ -7658,7 +7705,7 @@ TOOLS = [
     },
     {
         "name": "consult_codex",
-        "description": "Ask the live Codex frontier for a consultation/plan at MAX single-agent effort. Serious consults are never silently downgraded and can return a pending request_id while a detached worker finishes; collect it with request_result. Explicit model_policy='cheap_read' or 'balanced' resolves the current live reader/workhorse instead.",
+        "description": "Ask Codex from another vendor for a frontier/MAX consultation. A Codex caller must use native subagents; same-vendor broker fallback requires native_unavailable_reason. Long work can return a request_id for request_result.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -7672,6 +7719,7 @@ TOOLS = [
                 "include_task_contract": {"type": "boolean"},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
                 "model_policy": {"type": "string", "description": "Explicit cost policy: 'cheap_read' -> current live Codex reader/low; 'balanced'/'efficient'/'lower_effort' -> current live Codex workhorse/medium. Omit for frontier/max consultation."},
+                "native_unavailable_reason": {"type": "string", "description": "Required only when a Codex caller falls back to a Codex MCP session after the named native role failed to start or was unavailable."},
                 "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'gpt-5.5', 'gpt-5.4-mini'."},
                 "effort": {"type": "string", "description": "Single-agent reasoning effort: minimal|low|medium|high|xhigh|max. Omit for max (default); Ultra is an orchestration/delegation mode rather than a deeper single-agent consult tier."},
             },
@@ -7680,7 +7728,7 @@ TOOLS = [
     },
     {
         "name": "consult_claude",
-        "description": "Ask Claude Code for consultation. Defaults to the frontier Fable model at max in plan mode. Use model_policy='cheap_read' for Haiku reading/labour or model_policy='balanced' for Sonnet/medium bounded implementation. Expensive max requests can queue to avoid the MCP timeout; use force_sync to require the direct CLI.",
+        "description": "Ask Claude from another vendor for a Fable/MAX consultation. A Claude caller must use native subagents; same-vendor broker fallback requires native_unavailable_reason. Max work can queue to avoid the MCP timeout.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -7694,6 +7742,7 @@ TOOLS = [
                 "include_task_contract": {"type": "boolean"},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
                 "model_policy": {"type": "string", "description": "Explicit cost policy: 'cheap_read' -> Haiku with no effort flag; 'balanced'/'efficient'/'lower_effort' -> Sonnet/medium. Omit for Fable/max frontier consultation."},
+                "native_unavailable_reason": {"type": "string", "description": "Required only when a Claude caller falls back to a Claude MCP session after the named native role failed to start or was unavailable."},
                 "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'opus', 'sonnet', 'fable'."},
                 "effort": {"type": "string", "description": "Reasoning effort: low|medium|high|xhigh|max ('extra high' => xhigh, 'ultra' => max). Omit for highest available (default)."},
                 "async": {"type": "boolean", "description": "Queue through the Claude inbox and return a request id immediately instead of waiting synchronously."},
@@ -7833,6 +7882,7 @@ TOOLS = [
                 "mode": {"type": "string"},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
                 "model_policy": {"type": "string", "description": "Explicit cost policy for Codex or Claude. 'cheap_read' selects Luna/low or Haiku (no effort); 'balanced'/'efficient'/'lower_effort' selects Terra/medium or Sonnet/medium. Omit for frontier/max consultation, audit, review, or debate."},
+                "native_unavailable_reason": {"type": "string", "description": "Required for same-vendor Codex/Claude MCP fallback after native subagent startup/access failure."},
                 "prompt": {"type": "string"},
             },
             "required": ["prompt"],
@@ -8107,7 +8157,7 @@ TOOLS = [
     },
     {
         "name": "queue_codex_request",
-        "description": "Queue a request or handoff for Codex. By default the broker also starts a bounded headless Codex CLI worker so request_result eventually returns an answer or error instead of staying delivered forever. Pass target_model/effort/task_kind to preserve model policy; set autorun=false only for manual app handoff.",
+        "description": "Queue a request or handoff for Codex. Same-vendor Codex callers must use native subagents first and provide native_unavailable_reason only when that path is unavailable. By default the broker also starts a bounded headless Codex CLI worker so request_result eventually returns an answer or error instead of staying delivered forever. Pass target_model/effort/task_kind to preserve model policy; set autorun=false only for manual app handoff.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -8121,6 +8171,7 @@ TOOLS = [
                 "effort": {"type": "string"},
                 "autorun": {"type": "boolean"},
                 "mode": {"type": "string"},
+                "native_unavailable_reason": {"type": "string", "minLength": 12},
             },
             "required": ["prompt"],
         },
@@ -8138,7 +8189,7 @@ TOOLS = [
     },
     {
         "name": "queue_claude_request",
-        "description": "Queue a request for the Claude Code extension inbox. Use this for long frontier/max reviews, audits, and debates that should not block inside the MCP timeout.",
+        "description": "Queue a request for the Claude Code extension inbox. Same-vendor Claude callers must use native subagents first and provide native_unavailable_reason only when that path is unavailable. Use this for long frontier/max reviews, audits, and debates that should not block inside the MCP timeout.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -8157,6 +8208,7 @@ TOOLS = [
                     "type": "string",
                     "enum": ["plan", "default", "acceptEdits", "bypassPermissions"],
                 },
+                "native_unavailable_reason": {"type": "string", "minLength": 12},
             },
             "required": ["prompt"],
         },
@@ -8374,22 +8426,22 @@ TOOL_DESCRIPTION_OVERRIDES = {
     "route_agent_task": (
         "Route a task to Antigravity, Codex, Claude, or Gemini. CLI-FIRST: bare Antigravity "
         "uses agy with Gemini 3.6 Flash High; bare Codex uses gpt-5.6-sol/max; bare Claude "
-        "uses fable/max. Use surface='extension'/'inbox' to force in-app delivery. Explicit "
-        "model_policy='cheap_read' selects Luna/low or Haiku for read/extract/summarize labor; "
-        "model_policy='balanced' selects Terra/medium or Sonnet/medium for bounded implementation. "
+        "uses fable/max. Same-vendor Codex/Claude labour must use native subagents first; MCP "
+        "fallback requires native_unavailable_reason. Use surface='extension'/'inbox' to force "
+        "in-app delivery. Cross-vendor fallback policies can select reader/workhorse tiers. "
         "Call get_model_routing_guide/list_agent_models if unsure."
     ),
 }
 
 COMPACT_TOOL_DESCRIPTIONS = {
-    "consult_codex": "Ask Codex for a bounded consultation. Long answers return an excerpt plus response_ref.",
-    "consult_claude": "Ask Claude Code; frontier Fable/max requests may queue and explicit cost policies select Sonnet or Haiku.",
+    "consult_codex": "Cross-vendor Codex consultation; same-vendor fallback requires native_unavailable_reason.",
+    "consult_claude": "Cross-vendor Claude consultation; same-vendor fallback requires native_unavailable_reason.",
     "consult_antigravity": "Ask Antigravity through agy CLI; defaults to Gemini 3.6 Flash High in plan mode.",
     "consult_gemini": "Ask Gemini through the configured CLI/API. Long answers return an excerpt plus response_ref.",
-    "route_agent_task": "Route a short task CLI-first; surface='extension'/'inbox' explicitly uses the in-app bridge.",
-    "queue_codex_request": "Queue a request for Codex extension pickup.",
+    "route_agent_task": "Route cross-vendor work CLI-first; same-vendor Codex/Claude labour uses native subagents first.",
+    "queue_codex_request": "Queue Codex work; same-vendor callers require native_unavailable_reason after native subagents fail.",
     "get_codex_requests": "List recent queued/completed Codex extension requests.",
-    "queue_claude_request": "Queue a request for Claude extension pickup.",
+    "queue_claude_request": "Queue Claude work; same-vendor callers require native_unavailable_reason after native subagents fail.",
     "get_claude_requests": "List recent queued/completed Claude extension requests.",
     "list_agent_models": "List detected models and remembered defaults.",
     "get_model_routing_guide": "Show frontier-brain and cost-aware worker routing for Codex and Claude.",
@@ -9880,6 +9932,7 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             )
         )
     if name == "queue_codex_request":
+        enforce_native_first_broker_fallback(args, "codex")
         return text_content(queue_codex_request(
             args.get("project"),
             str(args.get("prompt") or ""),
@@ -9895,6 +9948,7 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "get_codex_requests":
         return text_content(get_codex_requests(args.get("project"), int(args.get("limit") or 20)))
     if name == "queue_claude_request":
+        enforce_native_first_broker_fallback(args, "claude")
         return text_content(queue_claude_request(
             args.get("project"),
             str(args.get("prompt") or ""),

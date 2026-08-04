@@ -112,27 +112,28 @@ def select_codex_roles(models_json: dict) -> CodexRoles:
     by_priority = sorted(entries, key=lambda e: (e["priority"], e["id"]))
     frontier = by_priority[0]
 
+    non_frontier = [entry for entry in by_priority if entry["id"] != frontier["id"]]
+
     workhorse = None
-    for entry in by_priority:
+    for entry in non_frontier:
         text = _capability_text(entry["raw"])
         if any(kw in text for kw in WORKHORSE_KEYWORDS):
             workhorse = entry
             break
     if workhorse is None:
-        remaining = [e for e in by_priority if e["id"] != frontier["id"]]
-        workhorse = remaining[0] if remaining else frontier
+        workhorse = non_frontier[0] if non_frontier else None
 
     reader = None
-    for entry in by_priority:
+    for entry in non_frontier:
         text = _capability_text(entry["raw"])
         if any(kw in text for kw in READER_KEYWORDS):
             reader = entry
             break
     if reader is None:
-        excluded_ids = {frontier["id"], workhorse["id"] if workhorse else None}
-        candidates = [e for e in entries if e["id"] not in excluded_ids] or entries
-        # "last-priority" = largest numeric priority value (cheapest/last per spec).
-        reader = sorted(candidates, key=lambda e: (e["priority"], e["id"]))[-1]
+        # A two-model catalog may legitimately use the one non-frontier model
+        # for both cheap roles. It is still cheaper than silently inheriting the
+        # selected frontier brain.
+        reader = non_frontier[-1] if non_frontier else None
 
     # The live catalog may embed full base-instruction templates in each raw
     # entry. They are useful only while matching descriptions and would add
