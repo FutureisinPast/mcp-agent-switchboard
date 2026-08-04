@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import model_roles
+
 
 BROKER_DIR = Path(os.environ.get("AGENT_BROKER_HOME", Path.home() / ".agent-broker"))
 DB_PATH = BROKER_DIR / "state.sqlite"
@@ -36,7 +38,7 @@ CONFIG_PATH = BROKER_DIR / "config.json"
 
 # Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
 # package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.23"
+BROKER_VERSION = "1.0.26"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -147,6 +149,9 @@ SECRET_WORDS = {
 CODEX_FLAGSHIP_MODEL = "gpt-5.6-sol"
 CODEX_BALANCED_MODEL = "gpt-5.6-terra"
 CODEX_CHEAP_MODEL = "gpt-5.6-luna"
+CLAUDE_FLAGSHIP_MODEL = "fable"
+CLAUDE_BALANCED_MODEL = "sonnet"
+CLAUDE_CHEAP_MODEL = "haiku"
 ANTIGRAVITY_DEFAULT_MODEL = "gemini-3.6-flash-high"
 CODEX_DEFAULT_EFFORT = "max"
 # Consults/plans default to the flagship (gpt-5.6-sol) at max — quality is the priority.
@@ -157,6 +162,7 @@ CODEX_DEFAULT_EFFORT = "max"
 # low — e.g. cheap Luna reads) still return inline. See codex_effort_fits_sync_window.
 CODEX_CONSULT_DEFAULT_EFFORT = "max"
 CODEX_CHEAP_EFFORT = "low"
+CLAUDE_BALANCED_EFFORT = "medium"
 # Reasoning efforts that reliably finish inside the ~240s sync window for a real consult.
 # max/xhigh are excluded: they route straight to the pending/worker path so the caller is
 # never blocked for the whole window only to then be told "pending".
@@ -228,7 +234,7 @@ GENERIC_MODEL_REQUESTS = {
 # honors any explicitly named model from the live CLI catalog.
 FAMILY_FLAGSHIP = {
     "codex": CODEX_FLAGSHIP_MODEL,
-    "claude": "opus",
+    "claude": CLAUDE_FLAGSHIP_MODEL,
     "gemini": None,
     "antigravity": ANTIGRAVITY_DEFAULT_MODEL,
 }
@@ -247,8 +253,10 @@ PEER_CONSULT_DEFAULTS = {
     "claude": "codex",
 }
 
-# Free-text effort phrases -> canonical intent. "top" means "this family's highest"
-# (codex => xhigh, claude => max), resolved per family in effort_for_family().
+# Free-text effort phrases -> canonical intent. "top" means the family's
+# highest single-agent reasoning tier (Codex/Claude => max). Codex Ultra is a
+# separate orchestration mode with automatic delegation, not a deeper
+# single-agent tier, so cross-vendor brain consults intentionally use max.
 _EFFORT_SYNONYMS = {
     "none": "none", "no reasoning": "none",
     "minimal": "minimal", "min": "minimal",
@@ -325,6 +333,11 @@ STATIC_ANTIGRAVITY_MODELS = [
 
 STATIC_CLAUDE_MODELS = [
     {
+        "id": "best",
+        "display": "Claude alias: best (most capable model available to this account/provider)",
+        "aliases": ["best", "claude best", "most capable claude", "frontier claude"],
+    },
+    {
         "id": "fable",
         "display": "Claude alias: fable (latest Fable, e.g. claude-fable-5)",
         "aliases": [
@@ -333,9 +346,10 @@ STATIC_CLAUDE_MODELS = [
     },
     {
         "id": "opus",
-        "display": "Claude alias: opus (runs whatever Opus the installed Claude CLI maps 'opus' to, e.g. 4.8)",
+        "display": "Claude alias: opus (latest Opus available to the installed Claude CLI)",
         "aliases": [
             "claude opus", "opus",
+            "opus 5", "opus5", "claude opus 5",
             "opus 4.8", "opus4.8", "claude opus 4.8",
             "opus 4.6", "opus 4.5", "opus 4.1",
         ],
@@ -345,13 +359,14 @@ STATIC_CLAUDE_MODELS = [
         "display": "Claude alias: sonnet (latest available Sonnet)",
         "aliases": [
             "claude sonnet", "sonnet",
+            "sonnet 5", "sonnet5", "claude sonnet 5",
             "sonnet 4.6", "sonnet 4.5", "claude sonnet 4.6", "claude sonnet 4.8",
         ],
     },
     {
         "id": "haiku",
-        "display": "Claude alias: haiku (latest available Haiku)",
-        "aliases": ["claude haiku", "haiku", "haiku 4.5"],
+        "display": "Claude alias: haiku (latest fast/efficient Haiku)",
+        "aliases": ["claude haiku", "haiku", "cheap claude", "fast claude", "claude-haiku-4-5-20251001"],
     },
 ]
 
@@ -450,6 +465,8 @@ TASK_CONTRACTS = {
         "Favor the smallest sufficient design: prefer the standard library, native platform features, or an already-installed dependency over new code or new dependencies -- without dropping required validation, error handling, security, or tests.",
         "If handing to a weaker/cheaper model, make the plan deterministic: include acceptance criteria and forbidden changes.",
         "Do not continue if critical context is missing; ask one concise blocking question.",
+        "Break the plan into work packages; each one states Route | exact model/effort | deliverable | verification | escalation.",
+        "Reclassify risk/difficulty at each work-package boundary instead of routing the whole plan once up front.",
     ],
     "implementation": [
         "Implement only the requested change.",
@@ -458,7 +475,9 @@ TASK_CONTRACTS = {
         "Do not refactor unrelated code or change behavior outside scope.",
         "Prefer the smallest sufficient implementation: write no new code when configuration, removal, or an existing call suffices; otherwise prefer the standard library, then native platform features, then an already-installed dependency, before adding bespoke code or a new dependency.",
         "This minimalism never overrides required validation, error handling, security checks, or tests; if the plan looks unsafe or materially over-built, stop and report it instead of silently trimming.",
-        "If any plan step is impossible or ambiguous, stop and report the blocker instead of improvising.",
+        "Follow the work package's assigned Route (model/effort); if you deviate, record the ASCII line `override: brain - <reason>` in your report.",
+        "If any plan step is impossible or ambiguous, or a fix attempt fails, stop at the first such point, return that item to the brain, and let the brain delegate the remaining deterministic work rather than improvising past it.",
+        "Default to parallel execution for read-only work packages and serial execution for write/edit work packages unless the plan states otherwise.",
         "Report files changed, checks run, and remaining risks.",
     ],
     "co_audit": [
@@ -525,6 +544,20 @@ GENERIC_GROUND_RULES = [
     "Describe failures as observed behavior, impact, known cause, next action; no dramatization or reassurance.",
     "Do not invent duration or effort estimates; report observed elapsed time only, and forecast only if explicitly asked.",
     "Prefer plain language over corporate jargon; keep technical and domain terminology intact.",
+]
+
+COST_AWARE_ROUTING_RULES = [
+    "The model selected for the main session is the brain; never rewrite that user choice. It owns requirements, architecture, planning, hard diagnosis, risk decisions, and final signoff.",
+    "For non-trivial planning or a hard issue, obtain one opposite-vendor maximum-effort consultation: Codex brain -> moving Claude Fable alias (Opus only when Fable is explicitly unavailable); Claude brain -> the live Codex frontier at its highest single-agent effort.",
+    "Classify risk and difficulty at every work-package boundary. Resolve current role ids from the broker: reader/low for bounded reading, search, extraction, and formatting; workhorse/medium for routine writing, light implementation, tests, scripts, and reversible deployment steps from an approved plan.",
+    "Every work package handed to a worker states Route | exact model/effort | deliverable | verification | escalation -- no vague model families and no unstated effort level.",
+    "A worker must follow the assigned Route as given; if it deviates it must record the ASCII line `override: brain - <reason>` in its report so the deviation is auditable.",
+    "A worker must stop and escalate on security, authentication, payments, destructive operations, schema or data migrations, plan deviation, ambiguous requirements, or failed verification.",
+    "On the first ambiguity or failed fix, the item returns to the brain immediately; the brain resolves it and re-delegates only the remaining deterministic work, instead of letting the worker improvise past the blocker.",
+    "Default execution order: read-only work packages run in parallel, write/edit work packages run serially, unless the plan explicitly overrides this.",
+    "Do not accept a worker summary as proof. Validate file-and-line evidence, the actual diff, and check output before signoff.",
+    "The final routing audit cross-checks the broker's actual-model ledger (real model/effort used per call), never a worker's self-reported model or effort.",
+    "Skip delegation when specifying and verifying the handoff would cost more than doing the small task directly.",
 ]
 
 
@@ -694,6 +727,7 @@ def init_db() -> None:
             ("worker_pid", "ALTER TABLE codex_requests ADD COLUMN worker_pid INTEGER"),
             ("worker_started_at", "ALTER TABLE codex_requests ADD COLUMN worker_started_at TEXT"),
             ("worker_completed_at", "ALTER TABLE codex_requests ADD COLUMN worker_completed_at TEXT"),
+            ("mode", "ALTER TABLE codex_requests ADD COLUMN mode TEXT"),
         ):
             if column_name not in codex_columns:
                 try:
@@ -723,7 +757,8 @@ def init_db() -> None:
                 target_model TEXT,
                 strict_model INTEGER DEFAULT 0,
                 task_kind TEXT,
-                token_budget INTEGER
+                token_budget INTEGER,
+                mode TEXT
             )
             """
         )
@@ -736,6 +771,7 @@ def init_db() -> None:
             ("worker_pid", "ALTER TABLE claude_requests ADD COLUMN worker_pid INTEGER"),
             ("worker_started_at", "ALTER TABLE claude_requests ADD COLUMN worker_started_at TEXT"),
             ("worker_completed_at", "ALTER TABLE claude_requests ADD COLUMN worker_completed_at TEXT"),
+            ("mode", "ALTER TABLE claude_requests ADD COLUMN mode TEXT"),
         ):
             if column_name not in claude_columns:
                 try:
@@ -1463,9 +1499,9 @@ def write_app_handoff_file(
 
 
 def discover_codex(config: dict[str, Any]) -> str | None:
-    found = find_executable(config, "codex_path", ["codex", "codex.exe"])
-    if found:
-        return found
+    configured = config.get("codex_path") or os.environ.get("CODEX_PATH")
+    if configured and Path(str(configured)).exists():
+        return str(configured)
     codex_home = Path.home() / ".codex" / "config.toml"
     if codex_home.exists():
         text = codex_home.read_text(encoding="utf-8", errors="ignore")
@@ -1480,6 +1516,10 @@ def discover_codex(config: dict[str, Any]) -> str | None:
                     candidate = tail[start + 1 : end]
                     if Path(candidate).exists():
                         return candidate
+    for name in ("codex", "codex.exe"):
+        found = shutil.which(name)
+        if found:
+            return found
     return None
 
 
@@ -2051,7 +2091,7 @@ def model_family_for(target_agent: Any = None, target_model: Any = None) -> str:
     raw = normalize_lookup(f"{target_agent or ''} {target_model or ''}")
     words = set(raw.split())
     has_codex = bool(words & {"gpt", "openai", "codex"})
-    has_claude = bool(words & {"claude", "opus", "sonnet", "haiku"})
+    has_claude = bool(words & {"claude", "fable", "opus", "sonnet", "haiku"})
     has_gemini = "gemini" in raw
     # "antigravity"/"vscode" can name the IDE that HOSTS an extension rather than the
     # target itself. When an explicit Claude/Codex family is named together with an
@@ -2093,13 +2133,30 @@ def peer_consult_family_for_caller() -> str | None:
     return PEER_CONSULT_DEFAULTS.get(caller_family or "")
 
 
-def model_entry(model_id: str, display: str | None = None, aliases: list[str] | None = None, source: str = "static") -> dict[str, Any]:
-    return {
+def model_entry(
+    model_id: str,
+    display: str | None = None,
+    aliases: list[str] | None = None,
+    source: str = "static",
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    entry = {
         "id": model_id,
         "display": display or model_id,
         "aliases": aliases or [],
         "source": source,
     }
+    for key in (
+        "description",
+        "priority",
+        "visibility",
+        "capabilities",
+        "default_reasoning_level",
+        "supported_reasoning_levels",
+    ):
+        if metadata and key in metadata:
+            entry[key] = metadata[key]
+    return entry
 
 
 def run_json_command(command: list[str], cwd: str | None = None, timeout: int = 20) -> dict[str, Any] | None:
@@ -2144,6 +2201,7 @@ def discover_codex_models() -> list[dict[str, Any]]:
                     str(item.get("display") or item.get("display_name") or item.get("id") or ""),
                     [str(alias) for alias in item.get("aliases") or []],
                     "config",
+                    item,
                 )
             )
         elif str(item).strip():
@@ -2160,16 +2218,75 @@ def discover_codex_models() -> list[dict[str, Any]]:
                         str(item.get("display_name") or slug),
                         [alias for alias in aliases if alias],
                         "codex-debug",
+                        item,
                     )
                 )
-    seen: set[str] = set()
-    deduped: list[dict[str, Any]] = []
+    # Keep the original catalog order, but let a live `codex debug models` entry
+    # replace the static/config placeholder for the same id so role metadata is
+    # not discarded during de-duplication.
+    order: list[str] = []
+    by_id: dict[str, dict[str, Any]] = {}
     for item in models:
         key = item["id"].lower()
-        if item["id"] and key not in seen:
-            seen.add(key)
-            deduped.append(item)
-    return deduped
+        if not item["id"]:
+            continue
+        if key not in by_id:
+            order.append(key)
+            by_id[key] = item
+        elif item.get("source") == "codex-debug":
+            by_id[key] = item
+    return [by_id[key] for key in order]
+
+
+_CODEX_ROLE_CACHE: dict[str, Any] = {"expires_at": 0.0, "roles": None}
+
+
+def codex_roles_from_models(models: list[dict[str, Any]]) -> dict[str, Any]:
+    live = [
+        item
+        for item in models
+        if item.get("source") == "codex-debug" or isinstance(item.get("priority"), (int, float))
+    ]
+    raw_models = []
+    for item in live:
+        raw = dict(item)
+        raw["slug"] = item.get("id")
+        raw["display_name"] = item.get("display")
+        raw_models.append(raw)
+    selected = model_roles.select_codex_roles({"models": raw_models})
+    by_id = {str(item.get("id") or "").lower(): item for item in models}
+
+    def role(value: dict[str, Any] | None, fallback_id: str) -> dict[str, Any]:
+        if value:
+            return value
+        return by_id.get(fallback_id.lower()) or model_entry(fallback_id, source="fallback")
+
+    return {
+        "frontier": role(selected.frontier, CODEX_FLAGSHIP_MODEL),
+        "workhorse": role(selected.workhorse, CODEX_BALANCED_MODEL),
+        "reader": role(selected.reader, CODEX_CHEAP_MODEL),
+        "source": "codex-debug" if selected.frontier else "static-fallback",
+    }
+
+
+def current_codex_roles(refresh: bool = False) -> dict[str, Any]:
+    now = time.monotonic()
+    cached = _CODEX_ROLE_CACHE.get("roles")
+    if not refresh and cached and now < float(_CODEX_ROLE_CACHE.get("expires_at") or 0):
+        return cached
+    roles = codex_roles_from_models(discover_codex_models())
+    _CODEX_ROLE_CACHE.update({"roles": roles, "expires_at": now + 60.0})
+    return roles
+
+
+def current_codex_role_model(role: str) -> str:
+    selected = current_codex_roles().get(role) or {}
+    fallback = {
+        "frontier": CODEX_FLAGSHIP_MODEL,
+        "workhorse": CODEX_BALANCED_MODEL,
+        "reader": CODEX_CHEAP_MODEL,
+    }
+    return str(selected.get("id") or fallback[role])
 
 
 def discover_claude_models() -> list[dict[str, Any]]:
@@ -2381,38 +2498,64 @@ def list_agent_models(agent: str | None = None, project: str | None = None, topi
             models = discover_antigravity_models()
         else:
             models = []
-        catalogs[family] = {
+        family_catalog = {
             "target_agent": default_target_agent_for_family(family),
             "models": models,
         }
+        if family == "codex":
+            family_catalog["roles"] = codex_roles_from_models(models)
+        elif family == "claude":
+            family_catalog["roles"] = model_roles.select_claude_roles()
+        catalogs[family] = family_catalog
     defaults = get_model_defaults(project, topic) if project or topic else {"items": []}
     return {"agent": agent or "all", "catalogs": catalogs, "defaults": defaults.get("items", [])}
 
 
 def get_model_routing_guide(agent: str | None = None, project: str | None = None, topic: str | None = None) -> dict[str, Any]:
     """Small, agent-readable guide so callers do not have to rediscover model policy."""
-    requested = normalize_lookup(agent or "all")
     catalog = list_agent_models(agent, project, topic)
+    codex_catalog = catalog.get("catalogs", {}).get("codex", {})
+    codex_roles = codex_catalog.get("roles") or current_codex_roles()
+    codex_frontier = str((codex_roles.get("frontier") or {}).get("id") or CODEX_FLAGSHIP_MODEL)
+    codex_workhorse = str((codex_roles.get("workhorse") or {}).get("id") or CODEX_BALANCED_MODEL)
+    codex_reader = str((codex_roles.get("reader") or {}).get("id") or CODEX_CHEAP_MODEL)
     guide: dict[str, Any] = {
         "purpose": "Use this before routing if you are unsure which model/effort to request.",
         "defaults": {
             "consult_audit_review_debate": {
                 "target_agent": "codex",
-                "target_model": CODEX_FLAGSHIP_MODEL,
+                "target_model": codex_frontier,
                 "effort": CODEX_DEFAULT_EFFORT,
                 "rule": "Bare 'consult Codex', 'co-op with Codex', 'audit', 'review', 'debate', or 'talk to Codex' should use the flagship/highest route. Accidental lower efforts are upgraded to max unless the caller makes the downshift explicit.",
             },
             "cheap_read_sample_prep": {
                 "target_agent": "codex",
-                "target_model": CODEX_CHEAP_MODEL,
+                "target_model": codex_reader,
                 "effort": CODEX_CHEAP_EFFORT,
                 "rule": "Only use this when the user explicitly asks for cheap/fast/efficient reading, extraction, summarizing, sample preparation, drafting, or boilerplate.",
             },
             "balanced_optional": {
                 "target_agent": "codex",
-                "target_model": CODEX_BALANCED_MODEL,
+                "target_model": codex_workhorse,
                 "effort": "medium",
-                "rule": "Use Terra or model_policy='balanced' when the user asks for a middle ground, or when the caller deliberately judges medium/lower effort sufficient.",
+                "rule": "Use model_policy='balanced' for bounded writing, light implementation, tests, scripts, and reversible deployment steps from an approved plan; it resolves to the live Codex workhorse/medium unless a model is named explicitly.",
+            },
+            "claude_consult_audit_review_debate": {
+                "target_agent": "claude",
+                "target_model": CLAUDE_FLAGSHIP_MODEL,
+                "effort": "max",
+                "rule": "Bare serious Claude consultation uses the moving `fable` alias at max, falls back to `opus` only on explicit model unavailability, and reports the runtime-attested actual model.",
+            },
+            "claude_cheap_read_sample_prep": {
+                "target_agent": "claude",
+                "target_model": "haiku",
+                "rule": "Use model_policy='cheap_read' for explicit reading, extraction, summaries, sample preparation, drafting, or boilerplate. Haiku receives no effort override.",
+            },
+            "claude_balanced_implementation": {
+                "target_agent": "claude",
+                "target_model": CLAUDE_BALANCED_MODEL,
+                "effort": CLAUDE_BALANCED_EFFORT,
+                "rule": "Use model_policy='balanced' for bounded writing, light implementation, tests, scripts, and reversible deployment steps from an approved plan; it resolves to the moving Sonnet alias at medium unless a model is named explicitly.",
             },
             "antigravity_cli": {
                 "target_agent": "antigravity",
@@ -2430,7 +2573,7 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                     "task_kind": "co_audit",
                     "prompt": "Audit this change and report concrete issues.",
                 },
-                "broker_resolves_to": {"target_model": CODEX_FLAGSHIP_MODEL, "effort": CODEX_DEFAULT_EFFORT},
+                "broker_resolves_to": {"target_model": codex_frontier, "effort": CODEX_DEFAULT_EFFORT},
             },
             "cheap_reader": {
                 "tool": "route_agent_task",
@@ -2440,7 +2583,27 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                     "task_kind": "quick_check",
                     "prompt": "Use a cheaper model to read these files and prepare a short sample.",
                 },
-                "broker_resolves_to": {"target_model": CODEX_CHEAP_MODEL, "effort": CODEX_CHEAP_EFFORT},
+                "broker_resolves_to": {"target_model": codex_reader, "effort": CODEX_CHEAP_EFFORT},
+            },
+            "claude_cheap_reader": {
+                "tool": "route_agent_task",
+                "args": {
+                    "target_agent": "claude",
+                    "model_policy": "cheap_read",
+                    "task_kind": "quick_check",
+                    "prompt": "Read these files and return exact file:line evidence.",
+                },
+                "broker_resolves_to": {"target_model": "haiku", "effort": None},
+            },
+            "claude_bounded_implementation": {
+                "tool": "route_agent_task",
+                "args": {
+                    "target_agent": "claude",
+                    "model_policy": "balanced",
+                    "task_kind": "implementation",
+                    "prompt": "Implement the approved plan and run focused checks.",
+                },
+                "broker_resolves_to": {"target_model": CLAUDE_BALANCED_MODEL, "effort": CLAUDE_BALANCED_EFFORT},
             },
             "antigravity_implementation": {
                 "tool": "route_agent_task",
@@ -2462,14 +2625,14 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
             "Use target_model for the model slug only; put reasoning in effort.",
             "Antigravity CLI models are discovered live with `agy models`; newly released models become routable without changing the static catalog.",
             "An automatic Antigravity route falls back to the in-app bridge if agy is missing. An explicit surface='cli' reports a missing CLI instead of silently changing surfaces.",
-            "For serious Sol consult/audit/review/debate, medium/high is allowed only when the caller explicitly marks the downshift with model_policy such as 'balanced', 'efficient', or 'lower_effort', or the prompt says medium/lower effort is enough.",
-            "The broker maps bare Codex/GPT requests to gpt-5.6-sol instead of the bare gpt-5.6 alias because ChatGPT-auth Codex can reject that alias.",
+            "For a serious live-frontier Codex consult/audit/review/debate, a lower effort is allowed only when the caller explicitly marks the downshift with a cost policy or says lower effort is enough.",
+            "Claude family aliases move with Claude Code: Fable/max is the peer brain, Opus/max is the availability fallback, Haiku is the reader, and Sonnet/medium is the workhorse.",
+            "Cost policies are explicit. The broker never guesses a cheap tier from prompt keywords.",
+            "Bare Codex/GPT requests resolve from live `codex debug models` role metadata; built-in ids are used only when live discovery is unavailable.",
             "Use list_agent_models for the raw catalog; this guide adds the default-routing policy.",
         ],
         "catalog": catalog,
     }
-    if requested not in {"", "all", "*", "codex", "gpt", "openai"}:
-        guide["note"] = "The special cheap-read policy currently applies to Codex routes; other agent catalogs are still shown below."
     return guide
 
 
@@ -2747,6 +2910,13 @@ def effort_for_family(family: str, canonical: Any) -> str | None:
     return canonical if canonical in ladder else ladder[-1]
 
 
+def effort_for_resolved_model(family: str, model: Any, effort: str | None) -> str | None:
+    """Remove effort flags a resolved model does not support."""
+    if family == "claude" and re.search(r"\bhaiku\b", normalize_lookup(model)):
+        return None
+    return effort
+
+
 def split_model_and_effort(raw: Any) -> tuple[str, str | None]:
     """Separate an effort phrase from a model request: "5.5 extra high" -> ("5.5",
     "xhigh"), "opus ultra" -> ("opus", "top"), "sonnet 4.6" -> ("sonnet 4.6", None).
@@ -2765,18 +2935,24 @@ def split_model_and_effort(raw: Any) -> tuple[str, str | None]:
     return re.sub(r"\s+", " ", padded).strip(), found
 
 
+def family_frontier_model(family: str) -> str | None:
+    if family == "codex":
+        return current_codex_role_model("frontier")
+    return FAMILY_FLAGSHIP.get(family)
+
+
 def pick_cli_model(family: str, model_text: Any) -> str | None:
     """Resolve an (effort-stripped) model request for a CLI family. Generic/empty ->
     the family flagship (most capable). A named model resolves to its catalog id; an
     unmatched name passes through unchanged so brand-new CLI models still work."""
     text = str(model_text or "").strip()
     if not text or normalize_lookup(text) in GENERIC_MODEL_REQUESTS:
-        return FAMILY_FLAGSHIP.get(family)
+        return family_frontier_model(family)
     match = match_model_request(family, text)
     if match.get("status") == "matched":
         return match["model"]
     if match.get("status") == "generic":
-        return FAMILY_FLAGSHIP.get(family)
+        return family_frontier_model(family)
     return text
 
 
@@ -2798,7 +2974,7 @@ def resolve_cli_model_and_effort(
         effort = effort_for_family(family, fallback)
     else:
         effort = family_max_effort(family)
-    return model, effort
+    return model, effort_for_resolved_model(family, model, effort)
 
 
 def requested_codex_cheap_read_policy(args: dict[str, Any], prompt: str, task_kind: str) -> bool:
@@ -2844,12 +3020,33 @@ def apply_codex_model_policy(
     # flagship at max; the caller keeps full control by passing model_policy/target_model/effort.
     policy = normalize_lookup(str(args.get("model_policy") or ""))
     if policy in {"cheap read", "cheap_read", "cheap reader", "cheap"} and not str(raw_model or "").strip():
-        return CODEX_CHEAP_MODEL, raw_effort or CODEX_CHEAP_EFFORT, "cheap_read"
+        return current_codex_role_model("reader"), raw_effort or CODEX_CHEAP_EFFORT, "cheap_read"
+    if policy in {"balanced", "efficient", "lower effort", "lower_effort", "workhorse"} and not str(raw_model or "").strip():
+        return current_codex_role_model("workhorse"), raw_effort or "medium", "balanced"
+    return raw_model, raw_effort, None
+
+
+def apply_claude_model_policy(
+    args: dict[str, Any],
+    raw_model: Any,
+    raw_effort: Any,
+) -> tuple[Any, Any, str | None]:
+    """Apply only an explicit Claude cost policy. Serious consultations stay on
+    the moving ``fable`` frontier alias at max; prompt keywords never guess a
+    cheaper tier."""
+    policy = normalize_lookup(str(args.get("model_policy") or ""))
+    if policy in {"cheap read", "cheap_read", "cheap reader", "cheap"} and not str(raw_model or "").strip():
+        # Haiku does not support Claude's adaptive effort parameter. Drop an inherited
+        # effort so the CLI does not reject an otherwise valid cheap-reader request.
+        return CLAUDE_CHEAP_MODEL, None, "cheap_read"
+    if policy in {"balanced", "efficient", "lower effort", "lower_effort", "workhorse"} and not str(raw_model or "").strip():
+        return CLAUDE_BALANCED_MODEL, raw_effort or CLAUDE_BALANCED_EFFORT, "balanced"
     return raw_model, raw_effort, None
 
 
 def is_codex_flagship_model(model: Any) -> bool:
     return normalize_lookup(model) in {
+        normalize_lookup(current_codex_role_model("frontier")),
         normalize_lookup(CODEX_FLAGSHIP_MODEL),
         "gpt 5.6",
         "gpt-5.6",
@@ -2938,14 +3135,18 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
     # to match (which used to stall on needs_model_selection).
     raw_effort = args.get("effort") or args.get("reasoning_effort")
     model_policy = None
-    if model_family_for(raw_agent, raw_model) == "codex":
+    initial_family = model_family_for(raw_agent, raw_model)
+    if initial_family == "codex":
         raw_model, raw_effort, model_policy = apply_codex_model_policy(
             args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")), raw_model, raw_effort
         )
+    elif initial_family == "claude":
+        raw_model, raw_effort, model_policy = apply_claude_model_policy(args, raw_model, raw_effort)
     target_model, parsed_effort = split_model_and_effort(raw_model)
     family = model_family_for(raw_agent, target_model)
     canonical_effort = normalize_effort_token(raw_effort) or parsed_effort
     resolved_effort = effort_for_family(family, canonical_effort) if canonical_effort else family_max_effort(family)
+    resolved_effort = effort_for_resolved_model(family, target_model, resolved_effort)
     match = match_model_request(family, target_model)
 
     if match["status"] == "generic":
@@ -2956,6 +3157,7 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
                 if family == "antigravity"
                 else default["target_model"]
             )
+            resolved_effort = effort_for_resolved_model(family, default_model, resolved_effort)
             final_effort, effort_policy = enforce_codex_effort_policy(
                 args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")),
                 default_model, resolved_effort, model_policy,
@@ -3021,6 +3223,7 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
             if family == "antigravity"
             else match["model"]
         )
+        resolved_effort = effort_for_resolved_model(family, matched_model, resolved_effort)
         final_effort, effort_policy = enforce_codex_effort_policy(
             args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")),
             matched_model, resolved_effort, model_policy,
@@ -3090,6 +3293,8 @@ def ensure_ground_rules_file() -> Path:
         "## Always (token discipline)",
     ]
     lines += [f"- {item}" for item in GENERIC_GROUND_RULES]
+    lines += ["", "## Cost-aware brain/worker routing"]
+    lines += [f"- {item}" for item in COST_AWARE_ROUTING_RULES]
     lines += ["", "## Per task kind"]
     for kind, items in TASK_CONTRACTS.items():
         budget = TASK_BUDGETS.get(kind, TASK_BUDGETS["consult"])
@@ -3130,6 +3335,8 @@ def task_contract_text(task_kind: str, token_budget: int | None = None, compact:
     ]
     lines.extend(f"- {item}" for item in TASK_CONTRACTS[kind])
     lines.extend(f"- {item}" for item in GENERIC_GROUND_RULES)
+    lines.append("Cost-aware brain/worker routing:")
+    lines.extend(f"- {item}" for item in COST_AWARE_ROUTING_RULES)
     return "\n".join(lines)
 
 
@@ -3244,8 +3451,12 @@ def should_queue_heavy_claude_consult(
         return False, "caller_not_codex"
     if str(effort or "").strip().lower() != "max":
         return False, "not_claude_max_effort"
-    if normalize_lookup(model_name) != "opus":
-        return False, f"model_not_opus:{model_name or 'default'}"
+    if normalize_lookup(model_name) not in {
+        "fable",
+        "opus",
+        normalize_lookup(CLAUDE_FLAGSHIP_MODEL),
+    }:
+        return False, f"model_not_frontier:{model_name or 'default'}"
     if task_kind in {"quick_check", "sanity_check"}:
         return False, "quick_task"
     if task_kind in HEAVY_CLAUDE_ASYNC_TASKS:
@@ -3351,10 +3562,25 @@ def run_process(
         return 124, stdout, f"{message}\n{stderr}".strip()
 
 
-def parse_claude_stream_output(stdout: str) -> str:
+@dataclass
+class ClaudeStreamParseResult:
+    """Parsed Claude CLI stream: response text plus the model the assistant actually
+    reported (from the main-thread assistant event's message.model). Multiple assistant
+    events with the same model are normal -- we keep the first one seen and never look at
+    result.modelUsage or answer prose to decide attestation. Subagent assistant events
+    (payload.parent_tool_use_id set) are ignored for model attestation -- a subagent can run
+    on a different model than the main thread, and attributing its model to the top-level
+    responder would misreport who actually answered."""
+
+    response: str
+    actual_model: str | None = None
+
+
+def parse_claude_stream_output(stdout: str) -> ClaudeStreamParseResult:
     result: str | None = None
     assistant_text: list[str] = []
     delta_text: list[str] = []
+    actual_model: str | None = None
     for line in str(stdout or "").splitlines():
         try:
             payload = json.loads(line)
@@ -3366,12 +3592,18 @@ def parse_claude_stream_output(stdout: str) -> str:
             result = str(payload.get("result"))
             continue
         if payload.get("type") == "assistant":
+            is_subagent_event = bool(payload.get("parent_tool_use_id"))
             message = payload.get("message") or {}
-            content = message.get("content") if isinstance(message, dict) else None
-            if isinstance(content, list):
-                text = "".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
-                if text.strip():
-                    assistant_text.append(text)
+            if isinstance(message, dict):
+                if not actual_model and not is_subagent_event:
+                    model = message.get("model")
+                    if model:
+                        actual_model = str(model)
+                content = message.get("content")
+                if isinstance(content, list):
+                    text = "".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
+                    if text.strip():
+                        assistant_text.append(text)
             continue
         if payload.get("type") == "stream_event":
             event = payload.get("event") or {}
@@ -3379,10 +3611,96 @@ def parse_claude_stream_output(stdout: str) -> str:
             if isinstance(delta, dict) and delta.get("type") == "text_delta":
                 delta_text.append(str(delta.get("text") or ""))
     if result and result.strip():
-        return result.strip()
-    if assistant_text:
-        return "\n".join(item.strip() for item in assistant_text if item.strip()).strip()
-    return "".join(delta_text).strip()
+        response = result.strip()
+    elif assistant_text:
+        response = "\n".join(item.strip() for item in assistant_text if item.strip()).strip()
+    else:
+        response = "".join(delta_text).strip()
+    return ClaudeStreamParseResult(response=response, actual_model=actual_model)
+
+
+# Bare Claude CLI aliases: these family-match any concrete Claude id that names the same
+# family (e.g. "haiku" matches "claude-haiku-4-5-20251001"). Anything else -- especially a
+# dated/full model id -- is treated as an explicit request and must match exactly.
+CLAUDE_MODEL_BARE_ALIASES = {"fable", "opus", "sonnet", "haiku"}
+
+
+def claude_model_attested(requested_model: Any, actual_model: Any) -> bool:
+    requested = str(requested_model or "").strip()
+    actual = str(actual_model or "").strip()
+    if not requested or not actual:
+        return False
+    requested_lower = requested.lower()
+    actual_lower = actual.lower()
+    # `best` is Claude Code's moving alias for the most capable model available
+    # to the current account/provider. Its concrete family can change, so the
+    # structured runtime model is the attestation; a fixed family-name match
+    # would make the future-proof alias unusable.
+    if requested_lower == "best":
+        return actual_lower.startswith("claude-")
+    if requested_lower in CLAUDE_MODEL_BARE_ALIASES:
+        return re.search(rf"\b{re.escape(requested_lower)}\b", actual_lower) is not None
+    return requested_lower == actual_lower
+
+
+def claude_frontier_candidates(requested_model: Any) -> list[str | None]:
+    """Return a bounded, ordered frontier fallback chain.
+
+    Exact/pinned ids never fall back. The moving aliases do: ``best`` first,
+    then the user's preferred Fable family, then Opus when Fable is unavailable.
+    """
+    requested = str(requested_model or "").strip()
+    lowered = requested.lower()
+    if lowered == "best":
+        return ["best", "fable", "opus"]
+    if lowered == "fable":
+        return ["fable", "opus"]
+    return [requested or None]
+
+
+def claude_model_unavailable_error(stdout: Any, stderr: Any) -> bool:
+    """Recognize only explicit model availability/access failures.
+
+    Network, auth transport, timeout, tool, and general execution errors must
+    not cause a second expensive call under a different model.
+    """
+    text = " ".join(str(value or "") for value in (stdout, stderr)).lower()
+    unavailable = r"(?:invalid|unknown|unavailable|not available|not found|unsupported|not supported|no access|access denied|not entitled|entitlement)"
+    return bool(
+        re.search(rf"(?:--model|model(?: name| id)?)[^\n]{{0,160}}{unavailable}", text)
+        or re.search(rf"{unavailable}[^\n]{{0,160}}(?:--model|model(?: name| id)?)", text)
+    )
+
+
+def normalize_claude_permission_mode(value: Any, default: str = "plan") -> str:
+    raw = str(value or "").strip()
+    aliases = {
+        "plan": "plan",
+        "default": "default",
+        "acceptedits": "acceptEdits",
+        "accept_edits": "acceptEdits",
+        "accept-edits": "acceptEdits",
+        "bypasspermissions": "bypassPermissions",
+        "bypass_permissions": "bypassPermissions",
+        "bypass-permissions": "bypassPermissions",
+    }
+    return aliases.get(raw.lower(), default)
+
+
+@dataclass
+class ClaudeConsultResult:
+    """Structured result of a Claude CLI consult: the response text plus the requested
+    vs. actual model and whether the actual model attests the request. Never derived from
+    answer prose, signature contents, or result.modelUsage -- only the assistant event's
+    message.model."""
+
+    response: str
+    requested_model: str | None
+    actual_model: str | None
+    model_attested: bool
+    initial_model: str | None = None
+    attempted_models: tuple[str, ...] = ()
+    fallback_reason: str | None = None
 
 
 def consult_timeout_message(agent: str, timeout: int, partial: str | None = None) -> str:
@@ -3407,6 +3725,124 @@ def claude_empty_mcp_config_path() -> Path:
     return path
 
 
+@dataclass
+class CodexStreamParseResult:
+    """Parsed `codex exec --json` stdout: the final agent_message text plus the thread_id
+    from thread.started. Never derived from answer prose -- only the structured stream
+    events (thread.started, item.completed{item.type=agent_message})."""
+
+    response: str
+    thread_id: str | None = None
+
+
+def parse_codex_stream_output(stdout: str) -> CodexStreamParseResult:
+    thread_id: str | None = None
+    agent_messages: list[str] = []
+    for line in str(stdout or "").splitlines():
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        ptype = payload.get("type")
+        if ptype == "thread.started" and payload.get("thread_id"):
+            if not thread_id:
+                thread_id = str(payload["thread_id"])
+            continue
+        if ptype == "item.completed":
+            item = payload.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = str(item.get("text") or "")
+                if text.strip():
+                    agent_messages.append(text)
+            continue
+    response = agent_messages[-1].strip() if agent_messages else ""
+    return CodexStreamParseResult(response=response, thread_id=thread_id)
+
+
+_CODEX_THREAD_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,80}$")
+
+
+def _codex_rollout_path_by_thread_id(thread_id: str | None) -> Path | None:
+    """Resolve the exact ~/.codex/sessions rollout file for a validated thread_id
+    (rollout-*-<thread_id>.jsonl). Rejects anything that doesn't look like a real
+    thread/session id so a malformed value can't turn into a broad glob match."""
+    tid = str(thread_id or "").strip()
+    if not tid or not _CODEX_THREAD_ID_RE.match(tid):
+        return None
+    base = Path.home() / ".codex" / "sessions"
+    if not base.exists():
+        return None
+    suffix = f"-{tid}.jsonl".lower()
+    try:
+        for path in base.rglob(f"rollout-*{tid}.jsonl"):
+            if path.is_file() and path.name.lower().endswith(suffix):
+                return path
+    except OSError:
+        return None
+    return None
+
+
+def _codex_turn_context_model_effort(path: Path) -> tuple[str | None, str | None]:
+    """Read only the turn_context line of a Codex rollout for the runtime-reported model
+    and effort. Never scans the conversation body -- that's the whole point of attesting
+    from turn_context rather than the answer text."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and obj.get("type") == "turn_context":
+                    payload = obj.get("payload") or {}
+                    model = payload.get("model") if isinstance(payload, dict) else None
+                    effort = payload.get("effort") if isinstance(payload, dict) else None
+                    return (str(model) if model else None, str(effort) if effort else None)
+    except Exception:  # noqa: BLE001
+        return (None, None)
+    return (None, None)
+
+
+# Bare Codex CLI aliases: these family-match any concrete Codex model id that names the
+# same family (e.g. "sol" matches "gpt-5.6-sol"). Anything else -- especially a full model
+# id -- is treated as an explicit request and must match exactly.
+CODEX_MODEL_BARE_ALIASES = {"sol", "terra", "luna"}
+
+
+def codex_model_attested(requested_model: Any, actual_model: Any) -> bool:
+    requested = str(requested_model or "").strip()
+    actual = str(actual_model or "").strip()
+    if not requested or not actual:
+        return False
+    requested_lower = requested.lower()
+    actual_lower = actual.lower()
+    if requested_lower == actual_lower:
+        return True
+    if requested_lower in CODEX_MODEL_BARE_ALIASES:
+        return re.search(rf"\b{re.escape(requested_lower)}\b", actual_lower) is not None
+    return False
+
+
+@dataclass
+class CodexConsultResult:
+    """Structured result of a Codex CLI consult: the response text plus requested vs.
+    actual model/effort and whether the actual model attests the request. actual_model/
+    actual_effort come only from the rollout's turn_context payload, never from answer
+    prose."""
+
+    response: str
+    requested_model: str | None
+    actual_model: str | None
+    requested_effort: str | None
+    actual_effort: str | None
+    model_attested: bool
+
+
 def consult_codex(
     project: str | None,
     prompt: str,
@@ -3414,13 +3850,20 @@ def consult_codex(
     model_name: str | None = None,
     effort: str | None = None,
     timeout: int = SYNC_CONSULT_TIMEOUT_SECONDS,
-) -> str:
+) -> CodexConsultResult:
     config = load_config()
     codex = discover_codex(config)
     if not codex:
-        return (
-            "Codex CLI was not found. Install Codex CLI or set codex_path in "
-            f"{CONFIG_PATH}."
+        return CodexConsultResult(
+            response=(
+                "Codex CLI was not found. Install Codex CLI or set codex_path in "
+                f"{CONFIG_PATH}."
+            ),
+            requested_model=model_name,
+            actual_model=None,
+            requested_effort=effort,
+            actual_effort=None,
+            model_attested=False,
         )
     project_info = resolve_project(project)
     sandbox = "read-only" if mode not in {"workspace-write", "danger-full-access"} else mode
@@ -3432,7 +3875,7 @@ def consult_codex(
         "--sandbox",
         sandbox,
         "--skip-git-repo-check",
-        "--ephemeral",
+        "--json",
         "-",
     ]
     # Reasoning effort is a config key, NOT part of the model name — keeping it separate
@@ -3442,11 +3885,51 @@ def consult_codex(
     if model_name:
         command[2:2] = ["--model", str(model_name)]
     code, stdout, stderr = run_process(command, project_info.root_path, sanitize_prompt(prompt), timeout=timeout)
+    parsed = parse_codex_stream_output(stdout)
+    actual_model: str | None = None
+    actual_effort: str | None = None
+    rollout_path = _codex_rollout_path_by_thread_id(parsed.thread_id)
+    if rollout_path:
+        actual_model, actual_effort = _codex_turn_context_model_effort(rollout_path)
+        # Keep the rollout: Codex's state database points at this exact file. Removing it
+        # would leave a dangling session row and would also discard the runtime evidence
+        # used to audit the broker's attestation later.
     if code == 124:
-        return consult_timeout_message("Codex", timeout, stdout)
+        return CodexConsultResult(
+            response=consult_timeout_message("Codex", timeout, parsed.response or stdout),
+            requested_model=model_name,
+            actual_model=actual_model,
+            requested_effort=effort,
+            actual_effort=actual_effort,
+            model_attested=False,
+        )
     if code != 0:
-        return f"Codex exited with code {code}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}".strip()
-    return stdout or stderr or "Codex returned no output."
+        return CodexConsultResult(
+            response=f"Codex exited with code {code}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}".strip(),
+            requested_model=model_name,
+            actual_model=actual_model,
+            requested_effort=effort,
+            actual_effort=actual_effort,
+            model_attested=False,
+        )
+    response_text = parsed.response or stdout or stderr or "Codex returned no output."
+    if model_name:
+        attested = codex_model_attested(model_name, actual_model)
+        if not attested:
+            response_text = (
+                f"Model attestation failed: requested Codex model '{model_name}' but the runtime "
+                f"reported '{actual_model or 'unknown'}'.\n\n{response_text}"
+            )
+    else:
+        attested = True
+    return CodexConsultResult(
+        response=response_text,
+        requested_model=model_name,
+        actual_model=actual_model,
+        requested_effort=effort,
+        actual_effort=actual_effort,
+        model_attested=attested,
+    )
 
 
 def consult_claude(
@@ -3457,17 +3940,26 @@ def consult_claude(
     workspace: str | None = None,
     effort: str | None = None,
     timeout: int = SYNC_CONSULT_TIMEOUT_SECONDS,
-) -> str:
+) -> ClaudeConsultResult:
     config = load_config()
+    initial_model = str(
+        model_name or config.get("claude_model") or os.environ.get("CLAUDE_MODEL") or ""
+    ).strip() or None
     claude = find_executable(config, "claude_path", ["claude", "claude.cmd", "claude.ps1"])
     if not claude:
-        return (
-            "Claude Code CLI was not found. Install Claude Code or set claude_path in "
-            f"{CONFIG_PATH}."
+        return ClaudeConsultResult(
+            response=(
+                "Claude Code CLI was not found. Install Claude Code or set claude_path in "
+                f"{CONFIG_PATH}."
+            ),
+            requested_model=initial_model,
+            actual_model=None,
+            model_attested=False,
+            initial_model=initial_model,
         )
     project_info = resolve_project(project)
-    permission_mode = "plan" if mode not in {"default", "acceptEdits", "bypassPermissions"} else mode
-    command = [
+    permission_mode = normalize_claude_permission_mode(mode)
+    base_command = [
         claude,
         "-p",
         "--safe-mode",
@@ -3483,27 +3975,77 @@ def consult_claude(
         "--permission-mode",
         permission_mode,
     ]
-    claude_model = model_name or config.get("claude_model") or os.environ.get("CLAUDE_MODEL")
-    if claude_model:
-        command.extend(["--model", str(claude_model)])
     # Reasoning effort is a separate CLI flag (low|medium|high|xhigh|max), never baked
     # into --model.
     if effort:
-        command.extend(["--effort", str(effort)])
+        base_command.extend(["--effort", str(effort)])
     # Run in the per-topic workspace when given so the session buckets into its own
     # ~/.claude/projects folder; otherwise use the project root. When bucketing in a
     # workspace, still grant read access to the project via --add-dir so codebase
     # consults work. Prompt goes on stdin (claude -p) to dodge the Windows cmd limit.
     run_cwd = workspace or project_info.root_path
     if workspace and os.path.abspath(workspace) != os.path.abspath(project_info.root_path):
-        command.extend(["--add-dir", project_info.root_path])
-    code, stdout, stderr = run_process(command, run_cwd, sanitize_prompt(prompt), timeout=timeout)
-    parsed = parse_claude_stream_output(stdout)
-    if code == 124:
-        return consult_timeout_message("Claude Code", timeout, parsed or stdout)
-    if code != 0:
-        return f"Claude exited with code {code}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}".strip()
-    return parsed or stdout or stderr or "Claude returned no output."
+        base_command.extend(["--add-dir", project_info.root_path])
+
+    attempts: list[str] = []
+    fallback_reason = None
+    candidates = claude_frontier_candidates(initial_model)
+    for index, candidate in enumerate(candidates):
+        command = list(base_command)
+        if candidate:
+            command.extend(["--model", candidate])
+            attempts.append(candidate)
+        code, stdout, stderr = run_process(
+            command, run_cwd, sanitize_prompt(prompt), timeout=timeout
+        )
+        parsed = parse_claude_stream_output(stdout)
+        if code == 124:
+            return ClaudeConsultResult(
+                response=consult_timeout_message("Claude Code", timeout, parsed.response or stdout),
+                requested_model=candidate,
+                actual_model=parsed.actual_model,
+                model_attested=False,
+                initial_model=initial_model,
+                attempted_models=tuple(attempts),
+                fallback_reason=fallback_reason,
+            )
+        if code != 0:
+            if index + 1 < len(candidates) and claude_model_unavailable_error(stdout, stderr):
+                fallback_reason = (
+                    f"Claude model alias '{candidate}' was unavailable; tried the next frontier alias."
+                )
+                continue
+            return ClaudeConsultResult(
+                response=f"Claude exited with code {code}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}".strip(),
+                requested_model=candidate,
+                actual_model=parsed.actual_model,
+                model_attested=False,
+                initial_model=initial_model,
+                attempted_models=tuple(attempts),
+                fallback_reason=fallback_reason,
+            )
+        response_text = parsed.response or stdout or stderr or "Claude returned no output."
+        if candidate:
+            attested = claude_model_attested(candidate, parsed.actual_model)
+            if not attested:
+                response_text = (
+                    f"Model attestation failed: requested Claude model '{candidate}' but the runtime "
+                    f"reported '{parsed.actual_model or 'unknown'}'.\n\n{response_text}"
+                )
+        else:
+            attested = True
+        if fallback_reason:
+            response_text = f"{fallback_reason}\n\n{response_text}"
+        return ClaudeConsultResult(
+            response=response_text,
+            requested_model=candidate,
+            actual_model=parsed.actual_model,
+            model_attested=attested,
+            initial_model=initial_model,
+            attempted_models=tuple(attempts),
+            fallback_reason=fallback_reason,
+        )
+    raise AssertionError("Claude frontier candidate list must not be empty")
 
 
 def consult_antigravity_cli(
@@ -3692,6 +4234,22 @@ def codex_effort_fits_sync_window(effort: Any) -> bool:
     return str(effort or "").strip().lower() in CODEX_SYNC_ELIGIBLE_EFFORTS
 
 
+def _parse_codex_responder_model(responder_model: str | None) -> tuple[str | None, str | None]:
+    """Recover (actual_model, actual_effort) from a stored 'codex:<model> [<effort>]'
+    ledger label without any new columns. 'codex:unverified' (an unattested/unresolved
+    responder) always yields (None, None) -- never guess an actual model from a label
+    that explicitly says it couldn't be verified."""
+    label = str(responder_model or "").strip()
+    if not label or not label.startswith("codex:") or label.startswith("codex:unverified"):
+        return (None, None)
+    body = label[len("codex:"):].strip()
+    effort = None
+    match = re.match(r"^(.*?)\s*\[([^\]]+)\]\s*$", body)
+    if match:
+        body, effort = match.group(1).strip(), match.group(2).strip()
+    return (body or None, effort)
+
+
 def _run_codex_consult(
     project_info: ProjectInfo,
     prompt: str,
@@ -3718,6 +4276,7 @@ def _run_codex_consult(
         token_budget,
         effort,
         True,
+        mode=mode,
     )
     rid = queued.get("id")
     worker = queued.get("async_worker") or {}
@@ -3734,11 +4293,18 @@ def _run_codex_consult(
         row = _refresh_stale_codex_request("codex_requests", found[1]) if found else None
     response = (row or {}).get("response")
     if response:
+        actual_model, actual_effort = _parse_codex_responder_model((row or {}).get("responder_model"))
+        model_attested = codex_model_attested(resolved_model, actual_model) if resolved_model else True
         return {
             "pending": False,
             "response": response,
             "responder_model": (row or {}).get("responder_model"),
             "request_id": rid,
+            "requested_model": resolved_model,
+            "actual_model": actual_model,
+            "requested_effort": effort,
+            "actual_effort": actual_effort,
+            "model_attested": model_attested,
         }
     state = canonical_request_state((row or {}).get("status")) if row else "queued"
     model_label = (f"codex:{resolved_model}" if resolved_model else "codex") + (f" [{effort}]" if effort else "")
@@ -3771,6 +4337,11 @@ def _run_codex_consult(
         "poll": {"tool": "request_result", "request_id": rid, "wait_seconds": 180 if not sync_eligible else 120},
         "async_worker": worker or None,
         "note": note,
+        "requested_model": resolved_model,
+        "actual_model": None,
+        "requested_effort": effort,
+        "actual_effort": None,
+        "model_attested": None,
     }
     return {"pending": True, "payload": payload, "request_id": rid}
 
@@ -3792,6 +4363,10 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     if model == "codex":
         requested_model, requested_effort, model_policy = apply_codex_model_policy(
             args, prompt, task_kind, requested_model, requested_effort
+        )
+    elif model == "claude":
+        requested_model, requested_effort, model_policy = apply_claude_model_policy(
+            args, requested_model, requested_effort
         )
     # Resolve the model (generic -> family flagship) and the reasoning effort
     # (explicit arg > parsed from the model text > default). This keeps effort OUT of the
@@ -3839,6 +4414,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
                 strict_model=True,
                 effort=effort,
                 cli_model=resolved_model,
+                mode=mode,
             )
             consulted_name = f"claude:{resolved_model}" if resolved_model else "claude"
             if effort:
@@ -3875,6 +4451,17 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         # second one for codex (already_stored).
         already_stored = False
         responder_model = None
+        claude_requested_model = None
+        claude_actual_model = None
+        claude_model_attested_ok = None
+        claude_initial_model = None
+        claude_attempted_models: tuple[str, ...] = ()
+        claude_fallback_reason = None
+        codex_requested_model = None
+        codex_actual_model = None
+        codex_requested_effort = None
+        codex_actual_effort = None
+        codex_model_attested_ok = None
         if model == "codex":
             codex_outcome = _run_codex_consult(
                 project_info, prompt, mode, resolved_model, effort,
@@ -3884,12 +4471,27 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
                 return codex_outcome["payload"]
             response = codex_outcome["response"]
             responder_model = codex_outcome.get("responder_model")
+            codex_requested_model = codex_outcome.get("requested_model")
+            codex_actual_model = codex_outcome.get("actual_model")
+            codex_requested_effort = codex_outcome.get("requested_effort")
+            codex_actual_effort = codex_outcome.get("actual_effort")
+            codex_model_attested_ok = codex_outcome.get("model_attested")
             already_stored = True
         elif model == "claude":
             claude_workspace = None
             if topic_arg and load_config().get("topic_workspaces", True):
                 claude_workspace = str(topic_workspace_dir(project_info, topic_arg))
-            response = consult_claude(project_info.root_path, prompt, mode, resolved_model, claude_workspace, effort, timeout_seconds)
+            claude_result = consult_claude(project_info.root_path, prompt, mode, resolved_model, claude_workspace, effort, timeout_seconds)
+            response = claude_result.response
+            claude_requested_model = claude_result.requested_model
+            claude_actual_model = claude_result.actual_model
+            claude_model_attested_ok = claude_result.model_attested
+            claude_initial_model = claude_result.initial_model
+            claude_attempted_models = claude_result.attempted_models
+            claude_fallback_reason = claude_result.fallback_reason
+            # Never fall back to the requested alias/model when the actual model can't be
+            # confirmed -- that would silently misreport an unverified responder as attested.
+            responder_model = f"claude:{claude_actual_model}" if claude_actual_model else "claude:unverified"
         elif model == "antigravity":
             response = consult_antigravity_cli(
                 project_info.root_path, prompt, mode, resolved_model, effort, timeout_seconds
@@ -3901,7 +4503,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         status = "error" if response.startswith(CONSULT_FAILURE_PREFIXES) else "ok"
         error = response if status == "error" else None
         consulted_name = responder_model or (f"{model}:{resolved_model}" if resolved_model else model)
-        if not responder_model and effort:
+        if effort and model != "codex":
             consulted_name += f" [{effort}]"
         if not already_stored:
             store_consultation(project_info, consulted_name, mode, prompt, response, status, error, started_at)
@@ -3934,6 +4536,20 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             "status": status,
             "response": response_payload,
         }
+        if model == "claude":
+            result["requested_model"] = claude_requested_model
+            result["actual_model"] = claude_actual_model
+            result["model_attested"] = claude_model_attested_ok
+            result["initial_model"] = claude_initial_model
+            result["attempted_models"] = list(claude_attempted_models)
+            if claude_fallback_reason:
+                result["fallback_reason"] = claude_fallback_reason
+        if model == "codex":
+            result["requested_model"] = codex_requested_model
+            result["actual_model"] = codex_actual_model
+            result["requested_effort"] = codex_requested_effort
+            result["actual_effort"] = codex_actual_effort
+            result["model_attested"] = codex_model_attested_ok
         if model_policy:
             result["model_policy"] = model_policy
         if effort_policy:
@@ -4861,6 +5477,7 @@ def queue_codex_request(
     token_budget: int | None = None,
     effort: str | None = None,
     autorun: Any = None,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     init_db()
     if not prompt or not prompt.strip():
@@ -4876,9 +5493,12 @@ def queue_codex_request(
     stored_token_budget = int(token_budget or 0) or None
     stored_effort = normalize_effort_token(effort) or (str(effort).strip().lower() if effort else None)
     autorun_enabled = CODEX_QUEUE_AUTORUN if autorun is None else truthy(autorun)
+    stored_mode = str(mode).strip().lower() if mode else ""
+    if stored_mode not in {"read-only", "workspace-write", "danger-full-access"}:
+        stored_mode = "read-only"
     # Direct callers that name a model get the self-check guard too; route_agent_task
     # already prepends it, so skip if it's present to avoid double-injection.
-    if model_label and "[REQUIRED MODEL:" not in clean_prompt and "[Preferred model:" not in clean_prompt:
+    if not autorun_enabled and model_label and "[REQUIRED MODEL:" not in clean_prompt and "[Preferred model:" not in clean_prompt:
         clean_prompt = model_guard_text(model_label, strict=bool(strict_flag)) + clean_prompt
     with db_connect() as conn:
         conn.row_factory = sqlite3.Row
@@ -4886,15 +5506,16 @@ def queue_codex_request(
             """
             SELECT id, project, root_path, topic, status, created_by, created_at, notified_at,
                    completed_at, target_model, strict_model, task_kind, token_budget, effort,
-                   worker_pid, worker_started_at, worker_completed_at
+                   worker_pid, worker_started_at, worker_completed_at, mode
             FROM codex_requests
             WHERE (lower(project) = lower(?) OR root_path = ?)
               AND ((topic IS NULL AND ? IS NULL) OR topic = ?)
               AND prompt = ?
+              AND COALESCE(mode, 'read-only') = ?
             ORDER BY created_at DESC
             LIMIT 1
             """,
-            (project_info.name, project_info.root_path, topic, topic, clean_prompt),
+            (project_info.name, project_info.root_path, topic, topic, clean_prompt, stored_mode),
         ).fetchone()
         if existing:
             result = dict(existing)
@@ -4908,8 +5529,8 @@ def queue_codex_request(
             """
             INSERT INTO codex_requests (
                 id, project, root_path, topic, prompt, status, created_by, created_at,
-                target_model, strict_model, task_kind, token_budget, effort
-            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+                target_model, strict_model, task_kind, token_budget, effort, mode
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request_id,
@@ -4924,6 +5545,7 @@ def queue_codex_request(
                 normalized_task_kind,
                 stored_token_budget,
                 stored_effort,
+                stored_mode,
             ),
         )
         conn.execute(
@@ -4960,6 +5582,7 @@ def queue_codex_request(
         "task_kind": normalized_task_kind,
         "token_budget": stored_token_budget,
         "effort": stored_effort,
+        "mode": stored_mode,
         "status": "running" if (async_worker or {}).get("started") else "queued",
         "async_worker": async_worker,
     }
@@ -5002,6 +5625,7 @@ CONSULT_FAILURE_PREFIXES = (
     "Claude Code CLI was not found.",
     "Claude Code timed out after",
     "Claude exited with code",
+    "Model attestation failed:",
     "Antigravity CLI was not found.",
     "Antigravity CLI timed out after",
     "Antigravity CLI exited with code",
@@ -5162,21 +5786,27 @@ def run_codex_request_worker(request_id: str) -> dict[str, Any]:
         None,
     )
     started_at = utc_now()
-    response = consult_codex(
+    stored_mode = str(data.get("mode") or "").strip().lower()
+    if stored_mode not in {"read-only", "workspace-write", "danger-full-access"}:
+        stored_mode = "read-only"
+    codex_result = consult_codex(
         data.get("root_path") or data.get("project"),
         data.get("prompt") or "",
-        "read-only",
+        stored_mode,
         target_model,
         resolved_effort,
         CODEX_ASYNC_WORKER_TIMEOUT_SECONDS,
     )
+    response = codex_result.response
     status, error = _consult_status(response)
     response = scrub_surrogates(response)
     error = scrub_surrogates(error)
     completed_at = utc_now()
-    responder_model = f"codex:{target_model}" if target_model else "codex"
-    if resolved_effort:
-        responder_model += f" [{resolved_effort}]"
+    # Never fall back to the requested model/effort as "actual" — an unverified responder
+    # must not be silently reported as attested.
+    responder_model = f"codex:{codex_result.actual_model}" if codex_result.actual_model else "codex:unverified"
+    if codex_result.actual_effort:
+        responder_model += f" [{codex_result.actual_effort}]"
     with db_connect() as conn:
         cur = conn.execute(
             """
@@ -5197,7 +5827,7 @@ def run_codex_request_worker(request_id: str) -> dict[str, Any]:
         store_consultation(
             ProjectInfo(data.get("project") or "", data.get("root_path") or str(Path.cwd())),
             responder_model,
-            "read-only",
+            stored_mode,
             data.get("prompt") or "",
             response,
             "error" if error else "ok",
@@ -5224,6 +5854,11 @@ def run_codex_request_worker(request_id: str) -> dict[str, Any]:
         "responder_model": responder_model,
         "response_chars": len(response or ""),
         "completed_at": completed_at,
+        "requested_model": codex_result.requested_model,
+        "actual_model": codex_result.actual_model,
+        "requested_effort": codex_result.requested_effort,
+        "actual_effort": codex_result.actual_effort,
+        "model_attested": codex_result.model_attested,
     }
     if effort_policy:
         result["effort_policy"] = effort_policy
@@ -5394,21 +6029,25 @@ def run_claude_request_worker(request_id: str) -> dict[str, Any]:
             )
         return {"id": rid, "status": "error", "error": err}
     resolved_effort = claude_effort_for_request(data)
+    requested_mode = normalize_claude_permission_mode(data.get("mode"))
     started_at = utc_now()
-    response = consult_claude(
+    claude_result = consult_claude(
         data.get("root_path") or data.get("project"),
         data.get("prompt") or "",
-        "plan",
+        requested_mode,
         cli_model,
         None,
         resolved_effort,
         CODEX_ASYNC_WORKER_TIMEOUT_SECONDS,
     )
+    response = claude_result.response
     status, error = _consult_status(response)
     response = scrub_surrogates(response)
     error = scrub_surrogates(error)
     completed_at = utc_now()
-    responder_model = f"claude:{cli_model}"
+    # Never fall back to the requested/resolved CLI model when the actual model can't be
+    # confirmed -- that would silently misreport an unverified responder as attested.
+    responder_model = f"claude:{claude_result.actual_model}" if claude_result.actual_model else "claude:unverified"
     if resolved_effort:
         responder_model += f" [{resolved_effort}]"
     with db_connect() as conn:
@@ -5438,7 +6077,7 @@ def run_claude_request_worker(request_id: str) -> dict[str, Any]:
         store_consultation(
             ProjectInfo(data.get("project") or "", data.get("root_path") or str(Path.cwd())),
             responder_model,
-            "plan",
+            requested_mode,
             data.get("prompt") or "",
             response,
             "error" if error else "ok",
@@ -5465,7 +6104,15 @@ def run_claude_request_worker(request_id: str) -> dict[str, Any]:
         "responder_model": responder_model,
         "response_chars": len(response or ""),
         "completed_at": completed_at,
+        "requested_model": cli_model,
+        "actual_model": claude_result.actual_model,
+        "model_attested": claude_result.model_attested,
+        "mode": requested_mode,
+        "initial_model": claude_result.initial_model,
+        "attempted_models": list(claude_result.attempted_models),
     }
+    if claude_result.fallback_reason:
+        result["fallback_reason"] = claude_result.fallback_reason
     if error:
         result["error"] = error[:1000]
     return result
@@ -6287,6 +6934,7 @@ def queue_claude_request(
     effort: str | None = None,
     cli_model: str | None = None,
     autorun: Any = None,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     """Queue a Claude request: write the inbox markdown (UI delivery path) AND, when the
     target resolves to a Claude-CLI model, start a detached CLI worker (v1.0.19) so the
@@ -6336,13 +6984,14 @@ def queue_claude_request(
     )
     stored_effort = normalize_effort_token(effort) or (str(effort).strip().lower() if effort else None)
     stored_cli_model = (str(cli_model).strip() or None) if cli_model else None
+    stored_mode = normalize_claude_permission_mode(mode)
     with db_connect() as conn:
         conn.execute(
             """
             INSERT INTO claude_requests (
                 id, project, root_path, topic, prompt, status, created_by, created_at,
-                target_model, strict_model, task_kind, token_budget, effort, cli_model
-            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+                target_model, strict_model, task_kind, token_budget, effort, cli_model, mode
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request_id,
@@ -6358,6 +7007,7 @@ def queue_claude_request(
                 int(token_budget or 0) or None,
                 stored_effort,
                 stored_cli_model,
+                stored_mode,
             ),
         )
         conn.execute(
@@ -6411,6 +7061,7 @@ def queue_claude_request(
         "token_budget": int(token_budget or 0) or None,
         "effort": stored_effort,
         "cli_model": stored_cli_model,
+        "mode": stored_mode,
         "inbox_files": written,
         "status": "running" if worker_started else "queued",
         "async_worker": async_worker,
@@ -6614,9 +7265,14 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         target_agent = default_target_agent_for_family(intent_family)
     effort_hint = args.get("effort") or args.get("reasoning_effort")
     model_policy = None
-    if model_family_for(target_agent, target_model) == "codex":
+    requested_family = model_family_for(target_agent, target_model)
+    if requested_family == "codex":
         target_model, effort_hint, model_policy = apply_codex_model_policy(
             args, prompt, normalize_task_kind(args.get("task_kind") or args.get("request_type")), target_model, effort_hint
+        )
+    elif requested_family == "claude":
+        target_model, effort_hint, model_policy = apply_claude_model_policy(
+            args, target_model, effort_hint
         )
     model_resolution = resolve_model_request(
         {
@@ -6848,6 +7504,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
             token_budget,
             new_chat,
             strict_model=strict_model,
+            mode=args.get("mode") or "plan",
         )
         queued["route"] = "claude_inbox"
         queued["surface"] = surface
@@ -7001,7 +7658,7 @@ TOOLS = [
     },
     {
         "name": "consult_codex",
-        "description": "Ask Codex for a consultation/plan. ALWAYS runs gpt-5.6-sol at MAX effort (a serious consult is forced to max even if a lower effort is passed) — never silently downgraded. Because max overruns the sync window, the call returns a pending request_id up front (not a timeout) while a detached worker finishes it; collect with request_result(request_id, wait_seconds=180). The ONLY way to use the cheap tier is to explicitly set model_policy='cheap_read' (or name gpt-5.6-luna) for reading/labour/sample-prep — the broker never guesses 'cheap' from the prompt.",
+        "description": "Ask the live Codex frontier for a consultation/plan at MAX single-agent effort. Serious consults are never silently downgraded and can return a pending request_id while a detached worker finishes; collect it with request_result. Explicit model_policy='cheap_read' or 'balanced' resolves the current live reader/workhorse instead.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -7014,16 +7671,16 @@ TOOLS = [
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
-                "model_policy": {"type": "string", "description": "Optional policy hint. Use 'cheap_read' for explicit cheap/fast reading, extraction, summarizing, sample prep, drafting, or boilerplate. Use 'balanced'/'efficient'/'lower_effort' when a deliberate medium/lower serious consult is acceptable. Omit for flagship consult/audit/review/debate."},
+                "model_policy": {"type": "string", "description": "Explicit cost policy: 'cheap_read' -> current live Codex reader/low; 'balanced'/'efficient'/'lower_effort' -> current live Codex workhorse/medium. Omit for frontier/max consultation."},
                 "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'gpt-5.5', 'gpt-5.4-mini'."},
-                "effort": {"type": "string", "description": "Reasoning effort: minimal|low|medium|high|xhigh ('extra high'/'max'/'ultra' => xhigh). Omit for highest available (default)."},
+                "effort": {"type": "string", "description": "Single-agent reasoning effort: minimal|low|medium|high|xhigh|max. Omit for max (default); Ultra is an orchestration/delegation mode rather than a deeper single-agent consult tier."},
             },
             "required": ["prompt"],
         },
     },
     {
         "name": "consult_claude",
-        "description": "Ask Claude Code for consultation. Defaults to opus/max in plan mode. Small requests use the direct CLI; heavy Codex-origin Opus/max reviews, audits, and debates queue through the Claude inbox and return a request id to avoid the MCP timeout. Use force_sync to require the direct CLI.",
+        "description": "Ask Claude Code for consultation. Defaults to the frontier Fable model at max in plan mode. Use model_policy='cheap_read' for Haiku reading/labour or model_policy='balanced' for Sonnet/medium bounded implementation. Expensive max requests can queue to avoid the MCP timeout; use force_sync to require the direct CLI.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -7036,6 +7693,7 @@ TOOLS = [
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
+                "model_policy": {"type": "string", "description": "Explicit cost policy: 'cheap_read' -> Haiku with no effort flag; 'balanced'/'efficient'/'lower_effort' -> Sonnet/medium. Omit for Fable/max frontier consultation."},
                 "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'opus', 'sonnet', 'fable'."},
                 "effort": {"type": "string", "description": "Reasoning effort: low|medium|high|xhigh|max ('extra high' => xhigh, 'ultra' => max). Omit for highest available (default)."},
                 "async": {"type": "boolean", "description": "Queue through the Claude inbox and return a request id immediately instead of waiting synchronously."},
@@ -7147,7 +7805,7 @@ TOOLS = [
                 },
                 "force_sync": {
                     "type": "boolean",
-                    "description": "For Claude targets, force the direct CLI path even for heavy Opus/max work.",
+                    "description": "For Claude targets, force the direct CLI path even for heavy frontier/max work.",
                 },
                 "surface": {
                     "type": "string",
@@ -7174,7 +7832,7 @@ TOOLS = [
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "mode": {"type": "string"},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
-                "model_policy": {"type": "string", "description": "Optional policy hint. Use 'cheap_read' for explicit cheap/fast reading, extraction, summarizing, sample prep, drafting, or boilerplate. Use 'balanced'/'efficient'/'lower_effort' when a deliberate medium/lower serious consult is acceptable; omit for flagship consult/audit/review/debate."},
+                "model_policy": {"type": "string", "description": "Explicit cost policy for Codex or Claude. 'cheap_read' selects Luna/low or Haiku (no effort); 'balanced'/'efficient'/'lower_effort' selects Terra/medium or Sonnet/medium. Omit for frontier/max consultation, audit, review, or debate."},
                 "prompt": {"type": "string"},
             },
             "required": ["prompt"],
@@ -7194,7 +7852,7 @@ TOOLS = [
     },
     {
         "name": "get_model_routing_guide",
-        "description": "Explain the broker's default model policy and return the available model catalog. Use before calling Codex/Claude if unsure: serious consult/audit/debate -> Codex gpt-5.6-sol/max; explicit cheap reading/sample prep -> Codex gpt-5.6-luna/low.",
+        "description": "Explain the broker's brain/worker model policy and return the model catalog. Serious consults use Sol/max or Fable/max; explicit cheap_read uses Luna/low or Haiku; balanced uses Terra/medium or Sonnet/medium.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -7462,6 +8120,7 @@ TOOLS = [
                 "token_budget": {"type": "integer"},
                 "effort": {"type": "string"},
                 "autorun": {"type": "boolean"},
+                "mode": {"type": "string"},
             },
             "required": ["prompt"],
         },
@@ -7479,7 +8138,7 @@ TOOLS = [
     },
     {
         "name": "queue_claude_request",
-        "description": "Queue a request for the Claude Code extension inbox. Use this for long Opus/max reviews, audits, and debates that should not block inside the MCP timeout.",
+        "description": "Queue a request for the Claude Code extension inbox. Use this for long frontier/max reviews, audits, and debates that should not block inside the MCP timeout.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -7491,6 +8150,13 @@ TOOLS = [
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "new_chat": {"type": "boolean"},
                 "strict_model": {"type": "boolean"},
+                "effort": {"type": "string"},
+                "cli_model": {"type": "string"},
+                "autorun": {"type": "boolean"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["plan", "default", "acceptEdits", "bypassPermissions"],
+                },
             },
             "required": ["prompt"],
         },
@@ -7708,16 +8374,16 @@ TOOL_DESCRIPTION_OVERRIDES = {
     "route_agent_task": (
         "Route a task to Antigravity, Codex, Claude, or Gemini. CLI-FIRST: bare Antigravity "
         "uses agy with Gemini 3.6 Flash High; bare Codex uses gpt-5.6-sol/max; bare Claude "
-        "uses opus/max. Use surface='extension'/'inbox' to force in-app delivery. CHEAP CODEX READER: only "
-        "when the user explicitly asks for cheap/fast/efficient reading, extraction, summarizing, "
-        "sample prep, drafting, or boilerplate, use model_policy='cheap_read' and the broker "
-        "selects gpt-5.6-luna/low. Call get_model_routing_guide/list_agent_models if unsure."
+        "uses fable/max. Use surface='extension'/'inbox' to force in-app delivery. Explicit "
+        "model_policy='cheap_read' selects Luna/low or Haiku for read/extract/summarize labor; "
+        "model_policy='balanced' selects Terra/medium or Sonnet/medium for bounded implementation. "
+        "Call get_model_routing_guide/list_agent_models if unsure."
     ),
 }
 
 COMPACT_TOOL_DESCRIPTIONS = {
     "consult_codex": "Ask Codex for a bounded consultation. Long answers return an excerpt plus response_ref.",
-    "consult_claude": "Ask Claude Code; heavy Opus/max Codex requests queue to Claude inbox with a request id.",
+    "consult_claude": "Ask Claude Code; frontier Fable/max requests may queue and explicit cost policies select Sonnet or Haiku.",
     "consult_antigravity": "Ask Antigravity through agy CLI; defaults to Gemini 3.6 Flash High in plan mode.",
     "consult_gemini": "Ask Gemini through the configured CLI/API. Long answers return an excerpt plus response_ref.",
     "route_agent_task": "Route a short task CLI-first; surface='extension'/'inbox' explicitly uses the in-app bridge.",
@@ -7726,7 +8392,7 @@ COMPACT_TOOL_DESCRIPTIONS = {
     "queue_claude_request": "Queue a request for Claude extension pickup.",
     "get_claude_requests": "List recent queued/completed Claude extension requests.",
     "list_agent_models": "List detected models and remembered defaults.",
-    "get_model_routing_guide": "Show routing policy: serious Codex -> gpt-5.6-sol/max; cheap reader -> gpt-5.6-luna/low.",
+    "get_model_routing_guide": "Show frontier-brain and cost-aware worker routing for Codex and Claude.",
     "get_consultation_history": "Return recent consultation summaries. Pass include_raw=true only when excerpts are needed.",
     "get_work_memory": "Return the compact per-topic continuation log.",
     "record_work_memory": "Write a compact continuation update for the next model.",
@@ -9224,6 +9890,7 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             int(args.get("token_budget") or 0) or None,
             args.get("effort"),
             args.get("autorun"),
+            args.get("mode"),
         ))
     if name == "get_codex_requests":
         return text_content(get_codex_requests(args.get("project"), int(args.get("limit") or 20)))
@@ -9237,6 +9904,10 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             int(args.get("token_budget") or 0) or None,
             args.get("new_chat"),
             args.get("strict_model"),
+            args.get("effort"),
+            args.get("cli_model"),
+            args.get("autorun"),
+            args.get("mode"),
         ))
     if name == "get_claude_requests":
         return text_content(get_claude_requests(args.get("project"), int(args.get("limit") or 20)))

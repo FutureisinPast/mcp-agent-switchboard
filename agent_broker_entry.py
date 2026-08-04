@@ -23,7 +23,18 @@ SERVE_ALIASES = {"serve", "server", "mcp", "--serve", "stdio"}
 
 def run() -> int:
     first = sys.argv[1].lower() if len(sys.argv) > 1 else ""
+    if first == "routing-hook":
+        import routing_gate
+        return routing_gate.main(sys.argv[2:])
     if first in SERVE_ALIASES:
+        import setup
+        try:
+            hierarchy = setup.refresh_hierarchy(silent=True)
+            errors = [f"{name}: {result}" for name, result in hierarchy.items() if result.startswith("ERROR")]
+            if errors:
+                print("Agent Switchboard hierarchy refresh: " + "; ".join(errors), file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Agent Switchboard hierarchy refresh failed open: {exc}", file=sys.stderr)
         import agent_broker_mcp as broker
         # Enter the MCP stdio loop: the server keys off argv, so present it with none.
         sys.argv = [sys.argv[0]]

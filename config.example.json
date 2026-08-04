@@ -5,7 +5,7 @@
   "antigravity_cli_path": "",
   "vscode_path": "",
   "claude_path": "",
-  "claude_model": "sonnet",
+  "claude_model": "fable",
   "gemini_model": "gemini-2.5-pro",
 
   "app_autopaste": false,

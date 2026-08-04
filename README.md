@@ -17,6 +17,7 @@ Modern AI coding workflows are fragmented. You might use **Codex** for implement
 - **Ask one assistant to use another** - from Codex, ask Claude Opus to audit; from Claude, ask Codex to implement; send Gemini/Antigravity-hosted models the planning work.
 - **See across chats** - pull a *compact snapshot* of what another agent's session knows; **Codex and Claude Code are read on demand from disk**, no copy-paste.
 - **Run cross-model debate** - Codex vs Claude for N rounds, then synthesize a verdict.
+- **Keep the selected model as the brain, route labour cheaply** - global Codex/Claude rules, reader/workhorse roles, and a completion audit are installed and refreshed by the same exe.
 - **Token compaction is built in** - compressed handoffs, compact context packs, work memory, and retrievable originals instead of dumping entire transcripts.
 - **Keep it local** - SQLite state under `~/.agent-broker`; no private chat scraping, no cloud broker.
 - **Use subscriptions you already pay for** - no required API keys or metered orchestration service.
@@ -93,7 +94,7 @@ The broker is a dependency-free Python MCP server. Each assistant talks to it ov
 **Routing priority:**
 
 1. **Surface** — Codex, Claude, and Antigravity default to the **headless CLI** (reliable, model-switchable, answer returned inline). For Antigravity, that means the standalone `agy` executable, not the IDE's `antigravity chat` launcher. Say **"in app"** / **"inbox"**, pass `surface: extension` / `surface: inbox`, or set `use_inbox: true` to force the bridge panel. If `agy` is absent, an automatic Antigravity route falls back to that bridge/inbox.
-2. **Model** — vague Codex/Claude requests resolve to their flagship; bare Antigravity defaults to `gemini-3.6-flash-high`. Natural requests such as **"Flash High 3.6"** resolve to the stable CLI slug. `list_agent_models` merges the static aliases with live `agy models` output, so a future model such as Gemini 4 Pro becomes routable as soon as the installed CLI advertises it; before release, an unavailable model fails honestly instead of silently downgrading.
+2. **Model** — vague Codex requests resolve from live `codex debug models` metadata; Claude frontier consults use the moving `fable` alias and fall back to the moving `opus` alias only on an explicit availability/entitlement error. Bare Antigravity defaults to `gemini-3.6-flash-high`. Natural requests such as **"Flash High 3.6"** resolve to the stable CLI slug. `list_agent_models` merges static aliases with live catalogs, so newer models become routable without rewriting the user's selected main-session model.
 3. **Token budget** — every routed task carries a task contract (`implementation_plan`, `co_audit`, `debate`, `review`, …) with a word budget, and a compressed context pack instead of raw history. If a caller inlines a bloated `prompt` (over a soft token limit), the broker stashes the full text as a retrievable `context_ref` and returns a `prompt_notice` nudging it to send a short instruction + ref next time — so token discipline is enforced by the system, not left to each agent.
 
 ---
@@ -129,9 +130,9 @@ There is a real difference between **delivered** (a file/prompt reached the surf
 
 > **Answer return-path:** any surface without a native completion API closes the loop by calling **`respond_to_request(request_id, response)`** — the broker records the answer + timing on the request and refreshes a per-topic **`ledger.md`** (`get_request_ledger`). Codex inbox requests now also start a bounded CLI worker by default, so `request_result` returns an answer or a terminal error instead of staying `delivered` forever.
 
-> **Model enforcement, honestly:** the broker can only *switch the answering model programmatically* on **Antigravity** (CDP UI automation, best-effort) and the **CLIs** (`--model`/`-m` flag). It **cannot** drive the Codex- or Claude-*extension* model picker. So when a specific model is requested on those surfaces, the broker prepends a **strict guard** to the prompt — *"you must be `<model>`; state your model; if you're not, STOP and ask the user to switch"* — and the bridge pops a **notification** to select that model. This way a lesser/default model never silently answers in the requested model's place. A model named only in the prompt ("get Opus's opinion") is detected conservatively and treated as the requested model **for that one request** (it does not overwrite the topic default).
+> **Model enforcement, honestly:** the broker can only *switch the answering model programmatically* on **Antigravity** (CDP UI automation, best-effort) and the **CLIs** (`--model`/`-m` flag). CLI responses are attested from runtime metadata and fail closed when that metadata is missing or mismatched; answer prose and usage summaries are not accepted as proof. The broker **cannot** drive the Codex- or Claude-*extension* model picker, so those surfaces still receive a strict guard plus a notification to select the requested model. A model named only in the prompt ("get Opus's opinion") is detected conservatively and treated as the requested model **for that one request** (it does not overwrite the topic default).
 
-> **Model + effort on the CLIs:** model and reasoning effort are **separate inputs**, never folded together. Pass **`effort`** and the broker sets the CLI's own effort flag. A bare family request defaults to Codex `gpt-5.6-sol`/`max`, Claude `opus`/`max`, or Antigravity `gemini-3.6-flash-high`/`high`. For Antigravity, effort selects the matching low/medium/high live model variant when available. Implementation routes use `accept-edits`; permission bypass is never implicit and requires the explicit `danger-full-access` mode.
+> **Model + effort on the CLIs:** model and reasoning effort are **separate inputs**, never folded together. Pass **`effort`** and the broker sets the CLI's own effort flag. A bare family request defaults to the live Codex frontier at `max`, Claude's moving `fable` alias at `max` (then `opus` only when unavailable), or Antigravity `gemini-3.6-flash-high`/`high`. Explicit `cheap_read` and `balanced` policies select dynamically discovered Codex reader/workhorse models or Claude `haiku`/`sonnet`; prompt keywords never guess. The selected main-session model is never rewritten. Queued implementation routes preserve `acceptEdits`; permission bypass is never implicit.
 
 > The broker is **target-driven** when a target is named. If a Codex/Claude caller leaves the target completely empty, Switchboard uses the caller only as a fallback: Codex defaults to Claude, and Claude defaults to Codex. A named target or prompt phrase like "consult with Claude" still wins.
 
@@ -174,6 +175,29 @@ broker/bridge version drift and prints actionable next steps.
 ---
 
 ## Changelog
+
+### v1.0.26 (future-proof brain/labour hierarchy)
+- The install/repair flow now owns checksum-marked global Codex and Claude hierarchy blocks, cheap reader/workhorse role files, and merge-safe prompt/tool/stop hooks. It preserves existing hooks and main model/effort settings; the same refresh runs whenever the installed MCP server starts.
+- Codex brain/worker/reader roles are selected from live `codex debug models` priority/visibility/description metadata. Claude uses moving family aliases: Fable/max for the peer brain, Opus/max only on an explicit Fable availability failure, Sonnet/medium for workhorse implementation, and Haiku for read-only labour.
+- Queued Claude jobs now preserve their requested permission mode instead of hardcoding `plan`, so approved routine implementation can execute on the workhorse. Direct and async results report requested, attempted, and runtime-attested actual models.
+- A bounded completion gate observes mutating tool use and requests a broker-verified routing audit (or an explicit brain override) before an implementation can claim completion. It fails open when the broker ledger is unavailable and blocks at most once per turn.
+
+### v1.0.25 (exact Haiku pin + tighter delegation contracts + codex discovery order)
+- `CLAUDE_CHEAP_MODEL` now pins the exact `claude-haiku-4-5-20251001` model id instead of the floating `haiku` alias; the static Claude catalog entry was updated to match while keeping all existing Haiku aliases (`haiku`, `claude haiku`, `haiku 4.5`) resolvable.
+- Implementation-plan and implementation task contracts, and the cost-aware routing rules, now require each work package to state `Route | exact model/effort | deliverable | verification | escalation`, require workers to record an `override: brain - <reason>` line when deviating from the assigned route, reclassify risk/difficulty at each work-package boundary, return the first ambiguity or failed fix to the brain before delegating the deterministic remainder, default to parallel reads / serial writes, and require the final routing audit to cross-check the broker's actual-model ledger rather than a worker's self-report.
+- `discover_codex` (broker) and `setup.py`'s config writer/repair now resolve Codex CLI path in the same order: a valid configured `codex_path`, then a valid `CODEX_CLI_PATH` marker from `~/.codex/config.toml`, then `PATH`.
+- Direct and asynchronous Codex/Claude CLI calls now record the runtime-reported model (and Codex effort), label missing evidence `unverified`, and fail closed on a requested-model mismatch. Claude trusts only the main assistant event; Codex trusts the persisted `turn_context` tied to the emitted thread id.
+- Codex request rows now preserve `read-only`, `workspace-write`, or `danger-full-access` through the detached worker instead of silently forcing every worker to read-only. Native Windows sandbox failures still escalate to the brain; the broker never weakens the requested sandbox automatically.
+
+### v1.0.24 (cost-aware frontier brain + worker routing)
+- Bare serious consultations now use the current frontier brain at maximum effort: Codex Sol/max and Claude Fable/max.
+- Explicit `model_policy="cheap_read"` routes read/extract/summarize labor to Luna/low or Haiku (without an unsupported Haiku effort flag).
+- Explicit `model_policy="balanced"` routes bounded implementation/testing from an approved plan to Terra/medium or Sonnet/medium. Prompt keywords never silently downshift a serious request.
+- The routing guide now documents both families and the evidence/escalation contract remains in the shared ground rules.
+
+### v1.0.23 (cross-agent output discipline)
+- Shared task contracts now lead with the result, describe failures concretely, avoid invented estimates, and prefer plain language.
+- Review/audit/bug-hunt contracts report every substantiated in-scope finding, keep unrelated observations separate, and identify residual verification gaps when no finding is confirmed.
 
 ### v1.0.22 (Antigravity CLI-first routing)
 - **Antigravity now defaults to the standalone `agy` CLI**, matching Codex and Claude's CLI-first behavior. Calls return stdout directly; if `agy` is missing, automatic routing falls back to the existing in-app bridge/inbox.

@@ -8,6 +8,7 @@ the subcommands for automation/testing:
 
     python setup.py status                 # show what was detected + current state
     python setup.py install   [--dry-run] [--debug-port]
+    python setup.py hierarchy [--dry-run]
     python setup.py uninstall [--dry-run] [--remove-data]
 
 Two supported install paths, both with a built-in uninstall/rollback:
@@ -23,14 +24,19 @@ registration in all four hosts and removes the bridge extension.
 
 from __future__ import annotations
 
+import filecmp
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+import hierarchy_install
+import model_roles
 
 # --- locations -------------------------------------------------------------
 HOME = Path.home()
@@ -93,7 +99,7 @@ def backup_dir() -> Path:
     return _backup_root
 
 
-def backup_file(path: Path) -> None:
+def backup_file(path: Path, quiet: bool = False) -> None:
     if path.exists():
         dest = backup_dir() / path.name
         i = 1
@@ -101,7 +107,8 @@ def backup_file(path: Path) -> None:
             dest = backup_dir() / f"{path.stem}.{i}{path.suffix}"
             i += 1
         shutil.copy2(path, dest)
-        info(f"backed up {path} -> {dest}")
+        if not quiet:
+            info(f"backed up {path} -> {dest}")
 
 
 def python_command() -> str:
@@ -136,6 +143,12 @@ def install_self_if_frozen(dry: bool) -> str | None:
         src = Path(sys.executable).resolve()
         if src == dest.resolve():
             return f"already installed at {dest}"
+        if (
+            dest.exists()
+            and src.stat().st_size == dest.stat().st_size
+            and filecmp.cmp(src, dest, shallow=False)
+        ):
+            return f"already current at {dest}"
         # Stage then atomically replace. os.replace can overwrite a target held open by
         # readers where copy-over-open can fail, and is atomic. If it's locked by a
         # running `agent-switchboard.exe serve`, report a hard error so do_install aborts
@@ -171,6 +184,31 @@ def broker_command() -> tuple[str, list[str]]:
 
 def which(name: str) -> str | None:
     return shutil.which(name) or shutil.which(name + ".cmd") or shutil.which(name + ".exe")
+
+
+def codex_cli_path_marker() -> str | None:
+    """Read a valid CODEX_CLI_PATH marker out of ~/.codex/config.toml, if present."""
+    if not CODEX_TOML.exists():
+        return None
+    text = CODEX_TOML.read_text(encoding="utf-8", errors="ignore")
+    marker = "CODEX_CLI_PATH"
+    index = text.find(marker)
+    if index < 0:
+        return None
+    tail = text[index : index + 300]
+    for quote in ("'", '"'):
+        start = tail.find(quote)
+        end = tail.find(quote, start + 1) if start >= 0 else -1
+        if start >= 0 and end > start:
+            candidate = tail[start + 1 : end]
+            if Path(candidate).exists():
+                return candidate
+    return None
+
+
+def resolve_codex_path() -> str:
+    """Valid CODEX_CLI_PATH marker first, then PATH."""
+    return codex_cli_path_marker() or which("codex") or ""
 
 
 def running_ide_windows() -> list[dict[str, str]]:
@@ -567,12 +605,12 @@ def unregister_antigravity(dry: bool) -> str:
 def write_config(dry: bool) -> str:
     cfg_path = BROKER_HOME / "config.json"
     desired = {
-        "codex_path": which("codex") or "",
+        "codex_path": resolve_codex_path(),
         "antigravity_path": antigravity_cli() or "",
         "antigravity_cli_path": antigravity_agent_cli() or "",
         "vscode_path": vscode_cli() or "",
         "claude_path": which("claude") or "",
-        "claude_model": "sonnet",
+        "claude_model": "fable",
         "gemini_model": "gemini-2.5-pro",
         "app_autopaste": False,
         "app_autosubmit": False,
@@ -594,8 +632,11 @@ def write_config(dry: bool) -> str:
     for k, v in desired.items():
         existing.setdefault(k, v)
     # Fill the executable paths only if currently empty/missing (don't clobber a working path).
-    if not existing.get("codex_path"):
-        existing["codex_path"] = which("codex") or ""
+    current_codex = str(existing.get("codex_path") or "")
+    if not current_codex or not Path(current_codex).exists():
+        resolved_codex = resolve_codex_path()
+        if resolved_codex:
+            existing["codex_path"] = resolved_codex
     resolved_antigravity_agent_cli = antigravity_agent_cli() or ""
     current_antigravity_agent_cli = str(existing.get("antigravity_cli_path") or "")
     if resolved_antigravity_agent_cli and (
@@ -720,6 +761,61 @@ def uninstall_bridge(host_cli: str, dry: bool) -> str:
         return f"ERROR: {exc}"
 
 
+# --- installer-managed hierarchy ------------------------------------------
+def _discover_hierarchy_roles() -> tuple[dict, dict]:
+    codex_roles = {"frontier": None, "workhorse": None, "reader": None}
+    codex = resolve_codex_path()
+    if codex:
+        try:
+            proc = subprocess.run(
+                [codex, "debug", "models"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=25,
+                check=False,
+            )
+            data = json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout else {}
+            selected = model_roles.select_codex_roles(data)
+            codex_roles = {
+                "frontier": selected.frontier,
+                "workhorse": selected.workhorse,
+                "reader": selected.reader,
+            }
+        except Exception:  # noqa: BLE001
+            pass
+    return codex_roles, model_roles.select_claude_roles()
+
+
+def _routing_hook_command_prefix() -> str:
+    if FROZEN:
+        argv = [str(frozen_broker_exe()), "routing-hook"]
+    else:
+        entry = find_asset("agent_broker_entry.py") or (SETUP_DIR / "agent_broker_entry.py")
+        argv = [python_command(), str(entry), "routing-hook"]
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+
+
+def refresh_hierarchy(dry: bool = False, silent: bool = False) -> dict[str, str]:
+    codex_roles, claude_roles = _discover_hierarchy_roles()
+    backup = lambda path: backup_file(path, quiet=silent)
+    return hierarchy_install.refresh(
+        hierarchy_install.HierarchyPaths(HOME, BROKER_HOME),
+        codex_roles,
+        claude_roles,
+        _routing_hook_command_prefix(),
+        backup,
+        dry,
+    )
+
+
+def uninstall_hierarchy(dry: bool = False) -> dict[str, str]:
+    return hierarchy_install.uninstall(
+        hierarchy_install.HierarchyPaths(HOME, BROKER_HOME), backup_file, dry
+    )
+
+
 # --- high-level actions ----------------------------------------------------
 def show_detected() -> None:
     """Print the per-host detected/installed state. Shared by Status and the top of Install
@@ -741,6 +837,27 @@ def do_status() -> None:
     info(f"home:    {BROKER_HOME}")
     vsix = latest_vsix()
     info(f"bridge:  {vsix.name if vsix else 'no .vsix found (build it: see build-release.ps1)'}")
+
+
+def do_refresh_hierarchy(dry: bool) -> bool:
+    """Refresh only the durable exe and global hierarchy assets.
+
+    This intentionally avoids MCP/extension registration, so it is safe while
+    IDE windows are open. A later full install can update host registrations.
+    """
+    head("Hierarchy refresh" + (" (dry-run)" if dry else ""))
+    results = {}
+    self_install = install_self_if_frozen(dry)
+    if self_install:
+        results["Broker exe"] = self_install
+        if self_install.startswith("ERROR") and not dry:
+            for key, value in results.items():
+                print(f"  {key:<24} : {value}")
+            return False
+    results.update(refresh_hierarchy(dry=dry))
+    for key, value in results.items():
+        print(f"  {key:<24} : {value}")
+    return not any(str(value).startswith("ERROR") for value in results.values())
 
 
 def do_install(dry: bool, debug_port: bool) -> bool:
@@ -777,6 +894,7 @@ def do_install(dry: bool, debug_port: bool) -> bool:
         "VS Code bridge": install_bridge("code", dry),
         "config.json": write_config(dry),
     })
+    results.update(refresh_hierarchy(dry=dry))
     # Antigravity automated in-app model selection (opt-in). The broker can auto-pick
     # the model you ask for directly in Antigravity's panel, but that needs a LOCAL CDP
     # debug port, which only exists if Antigravity is launched with --remote-debugging-port.
@@ -826,6 +944,7 @@ def do_uninstall(dry: bool, remove_data: bool) -> bool:
         "Antigravity bridge": uninstall_bridge("antigravity", dry),
         "VS Code bridge": uninstall_bridge("code", dry),
     }
+    results.update(uninstall_hierarchy(dry=dry))
     # Roll back the durable self-contained exe copy (best effort; can't delete the
     # currently-running exe on Windows, so note that case).
     exe = frozen_broker_exe()
@@ -943,6 +1062,8 @@ def main(argv: list[str]) -> int:
         do_status()
     elif cmd == "install":
         return 0 if do_install(dry=dry, debug_port="--debug-port" in flags) else 1
+    elif cmd in {"hierarchy", "refresh-hierarchy"}:
+        return 0 if do_refresh_hierarchy(dry=dry) else 1
     elif cmd == "uninstall":
         return 0 if do_uninstall(dry=dry, remove_data="--remove-data" in flags) else 1
     else:
