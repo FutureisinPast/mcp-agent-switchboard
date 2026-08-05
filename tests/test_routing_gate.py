@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -43,6 +44,18 @@ class RoutingGateTests(unittest.TestCase):
     @staticmethod
     def payload(message=""):
         return {"session_id": "session-1", "last_assistant_message": message}
+
+    @staticmethod
+    def pre_payload(tool_use_id: str, tool_name: str = "Read", host: str = "codex", **extra):
+        payload = {
+            "session_id": "session-1",
+            "tool_use_id": tool_use_id,
+            "tool_name": tool_name,
+            "tool_input": {"path": "source.py"},
+            "_switchboard_host": host,
+        }
+        payload.update(extra)
+        return payload
 
     def test_no_mutation_allows(self):
         self.assertEqual(routing_gate.stop(self.payload()), {})
@@ -322,37 +335,210 @@ class RoutingGateTests(unittest.TestCase):
                 routing_gate._lookup_routing_audit_valid(with_reason, "session-1", "codex")
             )
 
-    def test_no_native_checkpoint_appears_once_at_mutation_threshold(self):
-        payload = {
-            "session_id": "session-1",
-            "tool_name": "Edit",
-            "tool_input": {"path": "source.py"},
-        }
-        for _ in range(routing_gate.NATIVE_CHECKPOINT_MUTATIONS - 1):
-            self.assertEqual(routing_gate.post_tool_use(payload), {})
+    def test_pretool_allows_exact_limit_then_denies_next_call(self):
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 3):
+            for index in range(3):
+                self.assertEqual(
+                    routing_gate.pre_tool_use(self.pre_payload(f"call-{index}")), {}
+                )
+            denied = routing_gate.pre_tool_use(self.pre_payload("call-3"))
 
-        checkpoint = routing_gate.post_tool_use(payload)
-        context = checkpoint["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Native-first checkpoint", context)
-        self.assertEqual(routing_gate.post_tool_use(payload), {})
+        output = denied["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("already performed 3 direct labour calls", output["permissionDecisionReason"])
+        state = routing_gate._read_state("session-1")
+        self.assertEqual(state["direct_labour_counts"]["reads"], 3)
 
-    def test_completed_cheap_native_agent_suppresses_checkpoint(self):
-        native_payload = {
+    def test_parallel_pretool_reservations_cannot_exceed_limit(self):
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 3):
+            with ThreadPoolExecutor(max_workers=12) as pool:
+                results = list(
+                    pool.map(
+                        routing_gate.pre_tool_use,
+                        [self.pre_payload(f"parallel-{index}") for index in range(12)],
+                    )
+                )
+
+        allowed = sum(result == {} for result in results)
+        denied = sum(
+            result.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+            for result in results
+        )
+        self.assertEqual((allowed, denied), (3, 9))
+        state = routing_gate._read_state("session-1")
+        self.assertEqual(state["direct_labour_count"], 3)
+        self.assertEqual(len(state["direct_labour_reservations"]), 3)
+
+    def test_same_tool_use_id_is_idempotent(self):
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 1):
+            payload = self.pre_payload("same-call")
+            self.assertEqual(routing_gate.pre_tool_use(payload), {})
+            self.assertEqual(routing_gate.pre_tool_use(payload), {})
+            denied = routing_gate.pre_tool_use(self.pre_payload("different-call"))
+
+        self.assertEqual(
+            denied["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
+        state = routing_gate._read_state("session-1")
+        self.assertEqual(state["direct_labour_count"], 1)
+        self.assertEqual(state["direct_labour_counts"]["reads"], 1)
+
+    def test_active_codex_cheap_role_exempts_parent_session_calls(self):
+        native = {
             "session_id": "session-1",
             "turn_id": "turn-1",
-            "agent_id": "agent-reader-done",
-            "agent_type": "explorer",
-            "model": "gpt-5.6-luna",
+            "agent_id": "codex-worker-active",
+            "agent_type": "worker",
         }
-        routing_gate.subagent_start(native_payload)
-        routing_gate.subagent_stop(native_payload)
-        tool_payload = {
+        routing_gate.subagent_start(native)
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 1):
+            for index in range(3):
+                self.assertEqual(
+                    routing_gate.pre_tool_use(self.pre_payload(f"worker-{index}")), {}
+                )
+
+        self.assertNotIn("direct_labour_count", routing_gate._read_state("session-1"))
+
+    def test_claude_requires_cheap_agent_identity_for_exemption(self):
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 1):
+            cheap = self.pre_payload(
+                "cheap-call", host="claude", agent_id="claude-reader", agent_type="Explore"
+            )
+            self.assertEqual(routing_gate.pre_tool_use(cheap), {})
+            brain = self.pre_payload(
+                "brain-call", host="claude", agent_id="claude-brain", agent_type="general-purpose"
+            )
+            self.assertEqual(routing_gate.pre_tool_use(brain), {})
+            denied = routing_gate.pre_tool_use(
+                self.pre_payload(
+                    "brain-call-2",
+                    host="claude",
+                    agent_id="claude-brain",
+                    agent_type="general-purpose",
+                )
+            )
+
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(
+            routing_gate._read_state("session-1")["direct_labour_count"], 1
+        )
+
+    def test_native_start_opens_only_one_new_bounded_block(self):
+        native = {
             "session_id": "session-1",
-            "tool_name": "Edit",
-            "tool_input": {"path": "source.py"},
+            "turn_id": "turn-1",
+            "agent_id": "reader-once",
+            "agent_type": "explorer",
         }
-        for _ in range(routing_gate.NATIVE_CHECKPOINT_MUTATIONS + 1):
-            self.assertEqual(routing_gate.post_tool_use(tool_payload), {})
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 2):
+            for index in range(2):
+                self.assertEqual(routing_gate.pre_tool_use(self.pre_payload(f"before-{index}")), {})
+            self.assertNotEqual(routing_gate.pre_tool_use(self.pre_payload("before-denied")), {})
+            routing_gate.subagent_start(native)
+            routing_gate.subagent_stop(native)
+            for index in range(2):
+                self.assertEqual(routing_gate.pre_tool_use(self.pre_payload(f"after-{index}")), {})
+            denied = routing_gate.pre_tool_use(self.pre_payload("after-denied"))
+
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        state = routing_gate._read_state("session-1")
+        self.assertEqual(state["direct_labour_count"], 4)
+        self.assertEqual(state["direct_labour_since_relief"], 2)
+        self.assertEqual(state["native_agents"]["reader-once"]["status"], "completed")
+
+    def test_switchboard_controls_are_exempt_but_research_mcp_counts(self):
+        controls = (
+            "consult_codex",
+            "consult_claude",
+            "queue_codex_request",
+            "queue_claude_request",
+            "request_status",
+            "request_result",
+        )
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 1):
+            for index, suffix in enumerate(controls):
+                payload = self.pre_payload(
+                    f"control-{index}", tool_name=f"mcp__agent_switchboard__{suffix}"
+                )
+                self.assertEqual(routing_gate.pre_tool_use(payload), {})
+            research = self.pre_payload("research", tool_name="mcp__market__research")
+            self.assertEqual(routing_gate.pre_tool_use(research), {})
+            denied = routing_gate.pre_tool_use(
+                self.pre_payload("research-2", tool_name="mcp__market__research")
+            )
+
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        state = routing_gate._read_state("session-1")
+        self.assertEqual(state["direct_labour_counts"], {"evidence": 1})
+
+    def test_oversized_mcp_is_counted_once_by_pretool_before_posttool(self):
+        payload = self.pre_payload("large-mcp", tool_name="mcp__market__research")
+        payload["tool_response"] = "raw-evidence-" * 30
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 3), mock.patch.object(
+            routing_gate, "CONTEXT_INGRESS_MAX_CHARS", 100
+        ):
+            self.assertEqual(routing_gate.pre_tool_use(payload), {})
+            replaced = routing_gate.post_tool_use(payload)
+
+        self.assertEqual(replaced.get("decision"), "block")
+        state = routing_gate._read_state("session-1")
+        self.assertEqual(state["direct_labour_counts"], {"evidence": 1})
+        self.assertEqual(state["direct_labour_count"], 1)
+
+    def test_pretool_state_or_lock_failure_fails_open(self):
+        with mock.patch.object(routing_gate, "_update_state", return_value=None):
+            self.assertEqual(
+                routing_gate.pre_tool_use(self.pre_payload("lock-failure")), {}
+            )
+
+    def test_registered_override_resets_one_block_and_requires_matching_audit_reason(self):
+        reason = "architecture boundary requires direct brain inspection"
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 1):
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("before")), {})
+            self.assertNotEqual(routing_gate.pre_tool_use(self.pre_payload("blocked")), {})
+            self.assertTrue(routing_gate.register_brain_override("session-1", "WP2", reason))
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("after")), {})
+            self.assertNotEqual(routing_gate.pre_tool_use(self.pre_payload("blocked-again")), {})
+
+        exact = (
+            "## Routing audit\npackages: 1\n"
+            "direct-brain-labour: reads=2 | searches=0 | evidence=0 | "
+            "tests=0 | docs=0 | other=0\n"
+            f"- WP2 | direct=reads | override: brain - WP2: {reason}\n"
+        )
+        wrong = exact.replace(reason, "different architecture reason is claimed here")
+        self.assertFalse(routing_gate._lookup_routing_audit_valid(wrong, "session-1"))
+        self.assertTrue(routing_gate._lookup_routing_audit_valid(exact, "session-1"))
+
+    def test_routing_override_validation_and_shell_classification(self):
+        self.assertFalse(routing_gate.register_brain_override("", "WP1", "valid long reason"))
+        self.assertFalse(
+            routing_gate.register_brain_override("session-1", "bad package", "valid long reason")
+        )
+        self.assertFalse(routing_gate.register_brain_override("session-1", "WP1", "short"))
+
+        generated = routing_gate._routing_override_command("session-1")
+        self.assertIsNone(
+            routing_gate._direct_labour_category("Bash", {"command": generated})
+        )
+        unrelated = "Write-Output '# routing-override is documented here'"
+        self.assertEqual(
+            routing_gate._direct_labour_category("Bash", {"command": unrelated}), "other"
+        )
+
+    def test_audit_cannot_understate_observed_direct_labour_floor(self):
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 3):
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("read-1")), {})
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("read-2")), {})
+        understated = (
+            "## Routing audit\npackages: 1\n"
+            "direct-brain-labour: reads=1 | searches=0 | evidence=0 | "
+            "tests=0 | docs=0 | other=0\n"
+            "- WP1 | direct=reads | override: brain - WP1: architecture risk retained here\n"
+        )
+        accurate = understated.replace("reads=1", "reads=2")
+        self.assertFalse(routing_gate._lookup_routing_audit_valid(understated, "session-1"))
+        self.assertTrue(routing_gate._lookup_routing_audit_valid(accurate, "session-1"))
 
     def test_unverified_receipt_blocks(self):
         routing_gate.mark_mutated("session-1")

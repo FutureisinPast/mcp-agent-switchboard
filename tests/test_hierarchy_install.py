@@ -79,6 +79,22 @@ class HierarchyInstallTests(unittest.TestCase):
                                 ],
                             }
                         ],
+                        "PreToolUse": [
+                            {
+                                "matcher": "user-pre",
+                                "hooks": [
+                                    {"type": "command", "command": "user-pre-tool.ps1"}
+                                ],
+                            }
+                        ],
+                        "PostToolUse": [
+                            {
+                                "matcher": "user-post",
+                                "hooks": [
+                                    {"type": "command", "command": "user-post-tool.ps1"}
+                                ],
+                            }
+                        ],
                     }
                 },
                 indent=2,
@@ -104,7 +120,23 @@ class HierarchyInstallTests(unittest.TestCase):
                                     {"type": "command", "command": "shutdown-if-armed.ps1"}
                                 ]
                             }
-                        ]
+                        ],
+                        "PreToolUse": [
+                            {
+                                "matcher": "user-pre",
+                                "hooks": [
+                                    {"type": "command", "command": "user-pre-tool.ps1"}
+                                ],
+                            }
+                        ],
+                        "PostToolUse": [
+                            {
+                                "matcher": "user-post",
+                                "hooks": [
+                                    {"type": "command", "command": "user-post-tool.ps1"}
+                                ],
+                            }
+                        ],
                     },
                 },
                 indent=2,
@@ -141,8 +173,29 @@ class HierarchyInstallTests(unittest.TestCase):
         self.assertTrue(any(item.endswith("routing-hook Stop agent-switchboard claude") for item in stop_commands))
         self.assertTrue(
             any(
-                "mcp__.*" in str(group.get("matcher", ""))
+                "Read" in str(group.get("matcher", ""))
+                and "mcp__.*" in str(group.get("matcher", ""))
                 for group in settings["hooks"]["PostToolUse"]
+            )
+        )
+        for event, user_command in (
+            ("PreToolUse", "user-pre-tool.ps1"),
+            ("PostToolUse", "user-post-tool.ps1"),
+        ):
+            commands = [
+                item["command"]
+                for group in settings["hooks"][event]
+                for item in group.get("hooks", [])
+            ]
+            self.assertIn(user_command, commands)
+            self.assertTrue(
+                any(item.endswith(f"routing-hook {event} agent-switchboard claude") for item in commands)
+            )
+        self.assertTrue(
+            any(
+                "Read" in str(group.get("matcher", ""))
+                and "mcp__.*" in str(group.get("matcher", ""))
+                for group in settings["hooks"]["PreToolUse"]
             )
         )
 
@@ -162,8 +215,29 @@ class HierarchyInstallTests(unittest.TestCase):
             )
         self.assertTrue(
             any(
-                "mcp__.*" in str(group.get("matcher", ""))
+                "Read" in str(group.get("matcher", ""))
+                and "mcp__.*" in str(group.get("matcher", ""))
                 for group in codex_hooks["PostToolUse"]
+            )
+        )
+        for event, user_command in (
+            ("PreToolUse", "user-pre-tool.ps1"),
+            ("PostToolUse", "user-post-tool.ps1"),
+        ):
+            commands = [
+                item["command"]
+                for group in codex_hooks[event]
+                for item in group.get("hooks", [])
+            ]
+            self.assertIn(user_command, commands)
+            self.assertTrue(
+                any(item.endswith(f"routing-hook {event} agent-switchboard codex") for item in commands)
+            )
+        self.assertTrue(
+            any(
+                "Read" in str(group.get("matcher", ""))
+                and "mcp__.*" in str(group.get("matcher", ""))
+                for group in codex_hooks["PreToolUse"]
             )
         )
 
@@ -182,6 +256,9 @@ class HierarchyInstallTests(unittest.TestCase):
         self.assertIn("reader locates", hierarchy_lower)
         self.assertIn("every planned and unplanned package", hierarchy_lower)
         self.assertIn("direct-brain-labour", hierarchy_lower)
+        self.assertIn("pretooluse", hierarchy_lower)
+        self.assertIn("first ten direct labour calls", hierarchy_lower)
+        self.assertIn("each native start or registered override opens the next bounded block", hierarchy_lower)
 
         codex_reader = self.paths.codex_explorer.read_text(encoding="utf-8").lower()
         claude_reader = self.paths.claude_explore.read_text(encoding="utf-8").lower()
@@ -189,6 +266,13 @@ class HierarchyInstallTests(unittest.TestCase):
             self.assertIn("observed fact from interpretation", reader_text)
             self.assertIn("decision premise", reader_text)
             self.assertIn("never adjudicate", reader_text)
+            self.assertIn("no more than 8,000 characters", reader_text)
+
+        codex_worker = self.paths.codex_worker.read_text(encoding="utf-8").lower()
+        claude_worker = self.paths.claude_worker.read_text(encoding="utf-8").lower()
+        for worker_text in (codex_worker, claude_worker):
+            self.assertIn("return no more than 8,000 characters", worker_text)
+            self.assertIn("large logs/artifacts outside the brain context", worker_text)
 
         before = {path: path.read_bytes() for path in (
             self.paths.codex_agents_md,

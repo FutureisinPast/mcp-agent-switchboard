@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import agent_broker_mcp as broker  # noqa: E402
 import agent_broker_entry  # noqa: E402
+import routing_gate  # noqa: E402
 import setup as broker_setup  # noqa: E402
 from switchboard_version import BROKER_VERSION  # noqa: E402
 
@@ -319,6 +320,16 @@ class RoutingContractStringsTests(unittest.TestCase):
         self.assertIn("planned and unplanned packages", text)
         self.assertIn("direct-brain-labour:", text)
 
+    def test_contracts_require_bounded_pretooluse_relief_and_return_cap(self):
+        implementation = " ".join(broker.TASK_CONTRACTS["implementation"]).lower()
+        global_rules = " ".join(broker.COST_AWARE_ROUTING_RULES).lower()
+        for text in (implementation, global_rules):
+            self.assertIn("pretooluse", text)
+            self.assertIn("ten direct", text)
+            self.assertIn("next bounded block", text)
+            self.assertIn("routing-override", text)
+        self.assertIn("registered overrides must appear in the final audit", global_rules)
+
 
 class EntryVersionTests(unittest.TestCase):
     def test_all_version_aliases_print_shared_release_version(self):
@@ -331,6 +342,34 @@ class EntryVersionTests(unittest.TestCase):
                     result = agent_broker_entry.run()
                 self.assertEqual(result, 0)
                 self.assertEqual(stdout.getvalue().strip(), f"Agent Switchboard {BROKER_VERSION}")
+
+    def test_routing_override_entry_forwards_arguments(self):
+        argv = [
+            "agent-switchboard.exe",
+            "routing-override",
+            "--session",
+            "session-1",
+            "--package",
+            "WP2",
+            "--reason",
+            "architecture boundary requires brain review",
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            routing_gate, "routing_override_cli", return_value=0
+        ) as override:
+            self.assertEqual(agent_broker_entry.run(), 0)
+        override.assert_called_once_with(argv[2:])
+
+    def test_routing_override_cli_rejects_invalid_package_and_short_reason(self):
+        cases = (
+            ["--session", "session-1", "--package", "bad-package", "--reason", "long enough reason"],
+            ["--session", "session-1", "--package", "WP2", "--reason", "short"],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv), mock.patch.object(
+                routing_gate, "register_brain_override", return_value=False
+            ), mock.patch("sys.stdout", new=io.StringIO()):
+                self.assertEqual(routing_gate.routing_override_cli(argv), 2)
 
 
 class NativeFirstBrokerGuardTests(unittest.TestCase):

@@ -176,6 +176,11 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.29 (strict native pre-labour enforcement)
+- The installed `PreToolUse` gate now atomically allows one bounded block of direct brain labour, then denies the next eligible read, search, evidence, test, documentation, or mechanical call until a same-vendor native reader/workhorse starts or a package-specific brain override is registered.
+- Native-agent relief is bounded rather than permanent: each cheap-role start opens only the next block, while completed planning work cannot disable later implementation enforcement. Switchboard consultation controls remain available, but ordinary research MCP calls count as evidence labour.
+- Direct-labour counts are captured before tool execution, resist parallel-call and retry bypasses, and set a floor that the final routing audit cannot under-report. Managed native roles are also instructed to cap their return at 8,000 characters so cheap-agent transcripts do not flood the brain context.
+
 ### v1.0.28 (bounded context ingress and complete routing audits)
 - Oversized MCP verification payloads are quarantined outside the brain context by the installed `PostToolUse` hook. The brain receives a compact evidence reference and must request an explicit field projection or output cap instead of ingesting the raw response.
 - Decision premises are explicit: readers locate candidate evidence and distinguish fact from interpretation; the brain adjudicates only the minimum primary evidence whose truth could change a decision.

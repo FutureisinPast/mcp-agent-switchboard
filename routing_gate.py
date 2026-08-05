@@ -4,15 +4,19 @@ Dependency-free (stdlib only). Invoked by the host (Codex/Claude Code) as a
 command hook: JSON on stdin, JSON on stdout. Both hosts use the same
 `hooks.<Event>[].hooks[]` structural shape and the same Stop decision shape
 (`{"decision": "block", "reason": "..."}` to block once, `{}` to allow).
-PostToolUse also quarantines oversized MCP responses before they enter brain
-context. Codex replaces the result with block feedback; Claude uses its
-host-specific ``updatedToolOutput`` response.
+PreToolUse atomically records direct labour and denies work beyond a bounded
+threshold until a managed native cheap-role agent starts or the brain registers
+a package override. PostToolUse quarantines oversized MCP responses before they
+enter brain context.
+Codex replaces the result with block feedback; Claude uses its host-specific
+``updatedToolOutput`` response.
 
 Design constraints (hard, repeat-checked):
 - Fail-open: any doubt (unreachable ledger, re-entrant stop, missing session id)
   allows rather than blocks.
-- Loop-bounded: a session is blocked at most once; the second Stop call for the
-  same unresolved session always allows.
+- Stop is loop-bounded: a session is blocked at most once; the second Stop call
+  for the same unresolved session allows. PreToolUse can deny repeatedly, but
+  native Agent/Task creation remains unblocked so it always has an exit path.
 - Never parses arbitrary transcript files -- only scans the `last_assistant_message`
   string the host hook payload already provides, via narrow regexes.
 - Native receipts are host-attested from SubagentStart/SubagentStop events. Broker
@@ -21,11 +25,14 @@ Design constraints (hard, repeat-checked):
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
 import re
+import shlex
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -46,7 +53,9 @@ def _env_int(name: str, default: int) -> int:
 
 
 STATE_TTL_SECONDS = 24 * 60 * 60
-NATIVE_CHECKPOINT_MUTATIONS = 10
+DIRECT_LABOUR_LIMIT = max(
+    1, _env_int("AGENT_BROKER_DIRECT_LABOUR_LIMIT", 10)
+)
 CONTEXT_INGRESS_MAX_CHARS = max(
     2_000, _env_int("AGENT_BROKER_CONTEXT_INGRESS_MAX_CHARS", 8_000)
 )
@@ -59,6 +68,32 @@ MUTATING_TOOL_NAMES = {
     "edit", "write", "multiedit", "notebookedit", "apply_patch", "applypatch", "patch",
 }
 SHELL_TOOL_NAMES = {"bash", "shell", "exec", "run_command", "localshell", "terminal", "powershell"}
+READ_TOOL_NAMES = {"read", "readfile", "read_file"}
+SEARCH_TOOL_NAMES = {"grep", "glob", "find", "search", "search_files"}
+WEB_RESEARCH_TOOL_NAMES = {"webfetch", "websearch"}
+DELEGATION_TOOL_NAMES = {"agent", "task", "spawn_agent"}
+SWITCHBOARD_CONTROL_SUFFIXES = {
+    "consult_codex", "consult_claude", "consult_gemini", "consult_antigravity",
+    "queue_codex_request", "queue_claude_request", "request_status",
+    "request_result", "route_agent_task",
+}
+ROUTING_OVERRIDE_COMMAND_RE = re.compile(
+    r"^\s*(?:&\s*)?(?:"
+    r"(?:\"[^\"\r\n]*agent-switchboard(?:\.exe)?\"|\S*agent-switchboard(?:\.exe)?)"
+    r"|(?:\"?\S*python(?:\.exe)?\"?\s+\"?[^\r\n]*agent_broker_entry\.py\"?)"
+    r")\s+routing-override\s+--session\s+\S+\s+--package\s+WP[A-Za-z0-9_.-]+"
+    r"\s+--reason\s+.+$",
+    re.IGNORECASE,
+)
+TEST_COMMAND_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:python\s+-m\s+(?:unittest|pytest)|pytest|npm\s+test|"
+    r"pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test|dotnet\s+test)\b",
+    re.IGNORECASE,
+)
+DOC_PATH_RE = re.compile(
+    r"(?:^|[\\/])(?:docs?|documentation)(?:[\\/]|$)|\.(?:md|mdx|rst|txt)$",
+    re.IGNORECASE,
+)
 
 # Conservative, explicit, testable in isolation -- deliberately narrow rather than
 # trying to catch every possible mutating command. Each pattern targets a verb
@@ -193,6 +228,48 @@ def mark_mutated(session_id: str) -> dict | None:
     return _update_state(session_id, update)
 
 
+def reserve_direct_labour(
+    session_id: str,
+    category: str,
+    tool_use_id: str,
+    host: str,
+    cheap_subagent_call: bool,
+) -> tuple[bool, dict] | None:
+    """Atomically reserve one direct labour call before the host executes it.
+
+    Reservation in PreToolUse closes the parallel-batch race and counts failed
+    calls too. Claude identifies cheap subagent calls explicitly; Codex does not
+    document that field, so calls are conservatively exempt while a cheap role
+    is active to prevent the worker from deadlocking on its parent's state.
+    """
+    decision = {"allowed": True}
+
+    def update(state: dict) -> None:
+        if cheap_subagent_call:
+            return
+        if host != "claude" and _cheap_native_agent_active(state):
+            return
+        reservations = state.setdefault("direct_labour_reservations", {})
+        if tool_use_id and tool_use_id in reservations:
+            return
+        since_relief = int(state.get("direct_labour_since_relief") or 0)
+        if since_relief >= DIRECT_LABOUR_LIMIT:
+            decision["allowed"] = False
+            state["labour_gate_denials"] = int(state.get("labour_gate_denials") or 0) + 1
+            return
+        counts = state.setdefault("direct_labour_counts", {})
+        counts[category] = int(counts.get(category) or 0) + 1
+        state["direct_labour_count"] = int(state.get("direct_labour_count") or 0) + 1
+        state["direct_labour_since_relief"] = since_relief + 1
+        if tool_use_id:
+            reservations[tool_use_id] = category
+
+    state = _update_state(session_id, update)
+    if state is None:
+        return None
+    return bool(decision["allowed"]), state
+
+
 def has_mutation(session_id: str) -> bool:
     return bool(_read_state(session_id).get("mutated"))
 
@@ -209,13 +286,21 @@ def _normalized_agent_type(value: object) -> str:
     return str(value or "").strip().lower()
 
 
-def _cheap_native_agent_active_or_completed(state: dict) -> bool:
+def _cheap_native_agent_active(state: dict) -> bool:
     agents = state.get("native_agents") or {}
     return any(
         isinstance(item, dict)
         and _normalized_agent_type(item.get("agent_type")) in NATIVE_CHEAP_AGENT_TYPES
-        and item.get("status") in {"started", "completed"}
+        and item.get("status") == "started"
         for item in agents.values()
+    )
+
+
+def _payload_is_cheap_native_call(payload: dict) -> bool:
+    return bool(
+        str(payload.get("agent_id") or "").strip()
+        and _normalized_agent_type(payload.get("agent_type"))
+        in NATIVE_CHEAP_AGENT_TYPES
     )
 
 
@@ -238,6 +323,11 @@ def subagent_start(payload: dict) -> dict:
             "turn_id": str(payload.get("turn_id") or ""),
             "model": str(payload.get("model") or ""),
         }
+        if _normalized_agent_type(agent_type) in NATIVE_CHEAP_AGENT_TYPES:
+            state["direct_labour_since_relief"] = 0
+            state["labour_relief_sequence"] = int(
+                state.get("labour_relief_sequence") or 0
+            ) + 1
 
     _update_state(session_id, update)
     return {}
@@ -312,11 +402,158 @@ def _is_mutating(tool_name: str, tool_input: dict) -> bool:
     return False
 
 
+def _tool_input_text(tool_input: object) -> str:
+    if not isinstance(tool_input, dict):
+        return ""
+    values = []
+    for key in ("command", "cmd", "script", "path", "file_path", "filePath"):
+        value = tool_input.get(key)
+        if value is not None:
+            values.append(str(value))
+    return "\n".join(values)
+
+
+def _direct_labour_category(tool_name: object, tool_input: object) -> str | None:
+    name = str(tool_name or "").strip().lower()
+    if not name or name in DELEGATION_TOOL_NAMES:
+        return None
+    # Opposite-vendor consultation is brain work, not same-vendor labour. The
+    # broker independently rejects same-vendor labour unless native-unavailable
+    # is documented, so consultation controls must remain usable at the gate.
+    if name.startswith("mcp__agent_switchboard__") and any(
+        name.endswith(suffix) for suffix in SWITCHBOARD_CONTROL_SUFFIXES
+    ):
+        return None
+    if name in READ_TOOL_NAMES:
+        return "reads"
+    if name in SEARCH_TOOL_NAMES:
+        return "searches"
+    if name in WEB_RESEARCH_TOOL_NAMES or name.startswith("mcp__"):
+        return "evidence"
+    text = _tool_input_text(tool_input)
+    if name in SHELL_TOOL_NAMES or "shell" in name:
+        if ROUTING_OVERRIDE_COMMAND_RE.search(text):
+            return None
+        return "tests" if TEST_COMMAND_RE.search(text) else "other"
+    if name in MUTATING_TOOL_NAMES:
+        return "docs" if DOC_PATH_RE.search(text) else "other"
+    return None
+
+
 def user_prompt_submit(payload: dict) -> dict:
     sweep_stale()
     session_id = str(payload.get("session_id") or "").strip()
     reset_turn_state(session_id)
     return {}
+
+
+def register_brain_override(session_id: str, package_id: str, reason: str) -> bool:
+    session_id = str(session_id or "").strip()
+    package_id = str(package_id or "").strip()
+    reason = " ".join(str(reason or "").split())
+    if (
+        not session_id
+        or not re.fullmatch(r"WP[A-Za-z0-9_.-]+", package_id, re.IGNORECASE)
+        or len(reason) < 12
+    ):
+        return False
+
+    def update(state: dict) -> None:
+        overrides = state.setdefault("brain_overrides", {})
+        overrides[package_id.lower()] = {
+            "package_id": package_id,
+            "reason": reason,
+            "registered_at": time.time(),
+        }
+        state["direct_labour_since_relief"] = 0
+        state["labour_relief_sequence"] = int(
+            state.get("labour_relief_sequence") or 0
+        ) + 1
+
+    return _update_state(session_id, update) is not None
+
+
+def routing_override_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent-switchboard routing-override")
+    parser.add_argument("--session", required=True)
+    parser.add_argument("--package", required=True)
+    parser.add_argument("--reason", required=True)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code or 2)
+    ok = register_brain_override(args.session, args.package, args.reason)
+    sys.stdout.write(json.dumps({"registered": ok, "package": args.package}))
+    return 0 if ok else 2
+
+
+def _routing_override_command(session_id: str) -> str:
+    if getattr(sys, "frozen", False):
+        argv = [sys.executable, "routing-override"]
+    else:
+        argv = [
+            sys.executable,
+            str(Path(__file__).with_name("agent_broker_entry.py")),
+            "routing-override",
+        ]
+    prefix = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    return (
+        f'{prefix} --session {shlex.quote(session_id)} --package WP-ID '
+        '--reason "specific reason at least 12 characters"'
+    )
+
+
+def pre_tool_use(payload: dict) -> dict:
+    """Deny the next direct labour call after the threshold until delegation.
+
+    Agent/Task creation is never labour-classified, so the model always retains
+    an escape path. Claude identifies cheap subagent calls; Codex is exempt
+    while a cheap role is active because it does not document per-tool agent ids.
+    """
+    sweep_stale()
+    session_id = str(payload.get("session_id") or "").strip()
+    category = _direct_labour_category(
+        payload.get("tool_name"), payload.get("tool_input") or {}
+    )
+    if not session_id or not category:
+        return {}
+    reserved = reserve_direct_labour(
+        session_id,
+        category,
+        str(payload.get("tool_use_id") or ""),
+        str(payload.get("_switchboard_host") or "").strip().lower(),
+        _payload_is_cheap_native_call(payload),
+    )
+    if reserved is None:
+        return {}
+    allowed, state = reserved
+    if allowed:
+        return {}
+    counts = state.get("direct_labour_counts") or {}
+    observed = ", ".join(
+        f"{name}={int(counts.get(name) or 0)}"
+        for name in DIRECT_BRAIN_LABOUR_CATEGORIES
+        if int(counts.get(name) or 0) > 0
+    ) or f"total={DIRECT_LABOUR_LIMIT}"
+    reason = (
+        f"Native-first labour gate: the main brain already performed "
+        f"{int(state.get('direct_labour_since_relief') or 0)} direct labour calls since "
+        "the last native package/brain override "
+        f"({observed}). The next {category} call is blocked. Start the same-vendor "
+        "managed reader/workhorse for a bounded package; Agent/Task/spawn_agent remains "
+        "available. For a genuinely brain-owned package, register the exact override with: "
+        f"{_routing_override_command(session_id)}. High-risk judgment and final approval "
+        "stay with the brain, but the "
+        "deterministic evidence, test, documentation, or mechanical remainder must be "
+        "delegated. Any registered override must appear verbatim in the completion audit."
+    )
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
 
 
 def _serialized_tool_response(response: object) -> str:
@@ -403,26 +640,41 @@ def _context_ingress_feedback(payload: dict) -> dict | None:
 
 def post_tool_use(payload: dict) -> dict:
     sweep_stale()
+    session_id = str(payload.get("session_id") or "").strip()
+    tool_input = payload.get("tool_input") or {}
+    mutated = _is_mutating(payload.get("tool_name"), tool_input)
+    if session_id and mutated and not _payload_is_cheap_native_call(payload):
+        mark_mutated(session_id)
     ingress_feedback = _context_ingress_feedback(payload)
     if ingress_feedback is not None:
         return ingress_feedback
-    session_id = str(payload.get("session_id") or "").strip()
-    if session_id and _is_mutating(payload.get("tool_name"), payload.get("tool_input") or {}):
-        state = mark_mutated(session_id)
-        if (
-            state
-            and not payload.get("agent_id")
-            and int(state.get("mutation_count") or 0) == NATIVE_CHECKPOINT_MUTATIONS
-            and not _cheap_native_agent_active_or_completed(state)
-        ):
+    if session_id:
+        notify = {"value": False}
+
+        def update(state: dict) -> None:
+            sequence = int(state.get("labour_relief_sequence") or 0)
+            checkpoint_sequence = state.get("labour_checkpoint_sequence")
+            checkpoint_sequence = (
+                -1 if checkpoint_sequence is None else int(checkpoint_sequence)
+            )
+            if (
+                int(state.get("direct_labour_since_relief") or 0)
+                == DIRECT_LABOUR_LIMIT
+                and checkpoint_sequence != sequence
+            ):
+                state["labour_checkpoint_sequence"] = sequence
+                notify["value"] = True
+
+        state = _update_state(session_id, update)
+        if state and notify["value"]:
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",
                     "additionalContext": (
-                        "Native-first checkpoint: this turn reached 10 mutating operations "
-                        "without a completed managed native explorer/worker. Before the next "
-                        "work package, delegate bounded same-vendor labour natively or record "
-                        "a package-specific brain override with the exact collision or risk."
+                        f"Native-first checkpoint: this turn reached {DIRECT_LABOUR_LIMIT} "
+                        "direct brain labour calls since the last native package/override. "
+                        "The next eligible labour call will be denied until another bounded "
+                        "same-vendor native package starts or an exact brain override is registered."
                     ),
                 }
             }
@@ -506,6 +758,13 @@ def _lookup_routing_audit_valid(
     direct_labour = DIRECT_BRAIN_LABOUR_RE.search(body)
     if not direct_labour:
         return False
+    session_state = _read_state(session_id)
+    observed_counts = (session_state.get("direct_labour_counts") or {})
+    for category, raw_count in zip(
+        DIRECT_BRAIN_LABOUR_CATEGORIES, direct_labour.groups()
+    ):
+        if int(raw_count) < int(observed_counts.get(category) or 0):
+            return False
     package_count_match = AUDIT_PACKAGE_COUNT_RE.search(body)
     if not package_count_match:
         return False
@@ -530,6 +789,7 @@ def _lookup_routing_audit_valid(
         ):
             return False
     seen_ids: set[str] = set()
+    seen_override_ids: set[str] = set()
     for row_id, row_body in rows:
         normalized_row_id = row_id.lower()
         if normalized_row_id in seen_ids:
@@ -542,6 +802,15 @@ def _lookup_routing_audit_valid(
             return False
         if overrides and overrides[0][0].lower() != normalized_row_id:
             return False
+        if overrides:
+            override_id, override_reason = overrides[0]
+            override_id = override_id.lower()
+            seen_override_ids.add(override_id)
+            registered = (session_state.get("brain_overrides") or {}).get(override_id)
+            if registered and str(registered.get("reason") or "").lower() not in str(
+                override_reason
+            ).lower():
+                return False
         if native_ids and not _native_receipt_valid(session_id, native_ids[0]):
             return False
         if broker_ids:
@@ -554,6 +823,10 @@ def _lookup_routing_audit_valid(
                 return None
             if not broker_valid:
                 return False
+    if not set((session_state.get("brain_overrides") or {}).keys()).issubset(
+        seen_override_ids
+    ):
+        return False
     return True
 
 
@@ -586,7 +859,8 @@ def stop(payload: dict) -> dict:
             "'override: brain - <WP-ID>: <specific reason>' for a package retained by the "
             "brain. Also include `direct-brain-labour: reads=N | searches=N | evidence=N | "
             "tests=N | docs=N | other=N`, counting planned and unplanned direct labour; map "
-            "each nonzero category on a package row as `direct=reads,searches,...`. "
+            "each nonzero category on a package row as `direct=reads,searches,...`. Reported "
+            "counts cannot be lower than the host-observed pre-delegation floor. "
             "Bare/global overrides are invalid; then stop again."
         ),
     }
@@ -626,6 +900,8 @@ def main(argv: list[str]) -> int:
             payload["_switchboard_host"] = str(argv[2]).strip().lower()
         if event == "UserPromptSubmit":
             result = user_prompt_submit(payload)
+        elif event == "PreToolUse":
+            result = pre_tool_use(payload)
         elif event == "SubagentStart":
             result = subagent_start(payload)
         elif event == "SubagentStop":

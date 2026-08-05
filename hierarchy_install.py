@@ -251,7 +251,7 @@ def routing_rules_body(codex_roles: dict, claude_roles: dict) -> str:
 - Plans are portable across vendors. Every package states `Lane | mechanism | exact resolved model/effort | deliverable | verification | escalation`, where Lane is semantic (`brain`, `reader`, or `workhorse`). At execution start, resolve the semantic lane to the executing brain's current same-vendor native role and record the exact model/effort. Never follow an imported foreign-vendor labour model literally; re-resolve it for the current executor.
 - Keep ambiguous architecture, security/auth/payment/data-loss/migration work, irreversible actions, and approval with the brain. Workers stop on ambiguity, plan deviation, high-risk scope, or a failed fix; the brain diagnoses before redelegating a deterministic remainder.
 - A dirty worktree, same-session ownership, or deployment authority is not a blanket reason to keep reading, test execution, evidence gathering, documentation, or isolated mechanical edits on the brain. Retain only the specific overlapping write or high-risk state transition.
-- Brain overrides are package-specific and use exactly `override: brain - <WP-ID>: <specific reason>`. Bare/global overrides are invalid. After ten mutating operations without a completed native cheap-role agent, stop at the next package boundary and re-evaluate delegation.
+- Brain overrides are package-specific and use exactly `override: brain - <WP-ID>: <specific reason>`. Bare/global overrides are invalid. The first ten direct labour calls remain flexible; after that, the installed `PreToolUse` gate denies the next eligible read/search/evidence/test/documentation/mechanical call until a same-vendor managed cheap-role agent starts or the brain registers the exact package/reason using the gate-provided local `routing-override` command. Each native start or registered override opens the next bounded block; completed planning delegation never disables implementation enforcement. Registered overrides must appear with the same reason in the final audit.
 - Brain-context ingress is capped by default at roughly 1-2k tokens (8,000 characters). Before a verification response enters brain context, request an explicit field projection and output cap. Oversized MCP evidence is quarantined outside context with its query and location; do not pull the whole artifact back into context.
 - A claim is a decision premise when it being false would change the patch, risk classification, or release decision. The reader locates it; the brain adjudicates only the minimum primary evidence. Every brain-retained premise read states `premise | what changes if false | bounded primary evidence` before inspection. "Needs judgment" never justifies broad rereading.
 - Readers return file:line evidence and distinguish observed facts from interpretation. The brain reviews actual diffs and verification output. Reads may run in parallel; writes are serial unless files are demonstrably independent.
@@ -269,7 +269,7 @@ model = "{reader}"
 model_reasoning_effort = "low"
 sandbox_mode = "read-only"
 developer_instructions = """
-You are the same-vendor native reader. Never route this package through Agent Switchboard. Read and search only the assigned scope. Return concise findings with exact file:line evidence and separate observed fact from interpretation. For a decision premise, locate the minimal primary evidence and state uncertainty; never adjudicate it. Do not make architecture, risk, or approval decisions. Stop on ambiguity, high-risk scope, or a broader handoff.
+You are the same-vendor native reader. Never route this package through Agent Switchboard. Read and search only the assigned scope. Return no more than 8,000 characters of concise findings with exact file:line evidence and separate observed fact from interpretation; never dump raw logs or whole files. For a decision premise, locate the minimal primary evidence and state uncertainty; never adjudicate it. Do not make architecture, risk, or approval decisions. Stop on ambiguity, high-risk scope, or a broader handoff.
 """
 ''' if reader else "",
         "codex_worker": f'''name = "worker"
@@ -277,7 +277,7 @@ description = "Cost-efficient worker for bounded writing, implementation, tests,
 model = "{workhorse}"
 model_reasoning_effort = "medium"
 developer_instructions = """
-You are the same-vendor native workhorse. Never route this package through Agent Switchboard. Require a work package with Lane, mechanism, exact resolved model/effort, deliverable, verification, and escalation. Implement only that package. Stop on ambiguity, plan deviation, high-risk scope, or the first failed fix and return evidence to the brain.
+You are the same-vendor native workhorse. Never route this package through Agent Switchboard. Require a work package with Lane, mechanism, exact resolved model/effort, deliverable, verification, and escalation. Implement only that package. Return no more than 8,000 characters; keep large logs/artifacts outside the brain context and report only their location plus the bounded verification result. Stop on ambiguity, plan deviation, high-risk scope, or the first failed fix and return evidence to the brain.
 """
 ''' if workhorse else "",
         "claude_explore": f'''---
@@ -287,7 +287,7 @@ tools: Read, Grep, Glob
 model: {claude_roles.get('reader') or 'haiku'}
 ---
 
-You are the same-vendor native reader. Never route this package through Agent Switchboard. Read and search only the assigned scope. Return concise findings with exact file:line evidence and separate observed fact from interpretation. For a decision premise, locate the minimal primary evidence and state uncertainty; never adjudicate it. Do not make architecture, risk, or approval decisions. Stop on ambiguity, high-risk scope, or a broader handoff.
+You are the same-vendor native reader. Never route this package through Agent Switchboard. Read and search only the assigned scope. Return no more than 8,000 characters of concise findings with exact file:line evidence and separate observed fact from interpretation; never dump raw logs or whole files. For a decision premise, locate the minimal primary evidence and state uncertainty; never adjudicate it. Do not make architecture, risk, or approval decisions. Stop on ambiguity, high-risk scope, or a broader handoff.
 ''',
         "claude_worker": f'''---
 name: economy-worker
@@ -296,7 +296,7 @@ model: {claude_roles.get('workhorse') or 'sonnet'}
 effort: medium
 ---
 
-You are the same-vendor native workhorse. Never route this package through Agent Switchboard. Require a work package with Lane, mechanism, exact resolved model/effort, deliverable, verification, and escalation. Implement only that package. Stop on ambiguity, plan deviation, high-risk scope, or the first failed fix and return evidence to the brain.
+You are the same-vendor native workhorse. Never route this package through Agent Switchboard. Require a work package with Lane, mechanism, exact resolved model/effort, deliverable, verification, and escalation. Implement only that package. Return no more than 8,000 characters; keep large logs/artifacts outside the brain context and report only their location plus the bounded verification result. Stop on ambiguity, plan deviation, high-risk scope, or the first failed fix and return evidence to the brain.
 ''',
     }
 
@@ -359,9 +359,15 @@ def update_hooks(
         _merge_hook_event(data, "SubagentStop", f"{command_prefix} SubagentStop agent-switchboard {host}", None)
         _merge_hook_event(
             data,
+            "PreToolUse",
+            f"{command_prefix} PreToolUse agent-switchboard {host}",
+            "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch|Read|Grep|Glob|WebFetch|WebSearch|mcp__.*",
+        )
+        _merge_hook_event(
+            data,
             "PostToolUse",
             f"{command_prefix} PostToolUse agent-switchboard {host}",
-            "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch|mcp__.*",
+            "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch|Read|Grep|Glob|WebFetch|WebSearch|mcp__.*",
         )
         _merge_hook_event(data, "Stop", f"{command_prefix} Stop agent-switchboard {host}", None)
     except Exception as exc:  # noqa: BLE001
