@@ -252,8 +252,10 @@ def routing_rules_body(codex_roles: dict, claude_roles: dict) -> str:
 - Keep ambiguous architecture, security/auth/payment/data-loss/migration work, irreversible actions, and approval with the brain. Workers stop on ambiguity, plan deviation, high-risk scope, or a failed fix; the brain diagnoses before redelegating a deterministic remainder.
 - A dirty worktree, same-session ownership, or deployment authority is not a blanket reason to keep reading, test execution, evidence gathering, documentation, or isolated mechanical edits on the brain. Retain only the specific overlapping write or high-risk state transition.
 - Brain overrides are package-specific and use exactly `override: brain - <WP-ID>: <specific reason>`. Bare/global overrides are invalid. After ten mutating operations without a completed native cheap-role agent, stop at the next package boundary and re-evaluate delegation.
-- Readers return file:line evidence. The brain reviews actual diffs and verification output. Reads may run in parallel; writes are serial unless files are demonstrably independent.
-- Do not claim implementation complete without a `Routing audit` mapping each package to its lane, mechanism, resolved model/effort, verification, and one receipt: `native:<agent-id>` for a host-attested completed managed subagent, `broker:<uuid>` for an Agent Switchboard call, or the structured per-package brain override. Native lifecycle attests agent id/type/completion; its checksum-protected role file attests configured model/effort unless the runtime exposes stronger attestation. Never treat prose self-identification as proof; label unavailable runtime model attestation unverified.
+- Brain-context ingress is capped by default at roughly 1-2k tokens (8,000 characters). Before a verification response enters brain context, request an explicit field projection and output cap. Oversized MCP evidence is quarantined outside context with its query and location; do not pull the whole artifact back into context.
+- A claim is a decision premise when it being false would change the patch, risk classification, or release decision. The reader locates it; the brain adjudicates only the minimum primary evidence. Every brain-retained premise read states `premise | what changes if false | bounded primary evidence` before inspection. "Needs judgment" never justifies broad rereading.
+- Readers return file:line evidence and distinguish observed facts from interpretation. The brain reviews actual diffs and verification output. Reads may run in parallel; writes are serial unless files are demonstrably independent.
+- Do not claim implementation complete without a `Routing audit` mapping every planned and unplanned package to its lane, mechanism, resolved model/effort, verification, and one receipt: `native:<agent-id>` for a host-attested completed managed subagent, `broker:<uuid>` for an Agent Switchboard call, or the structured per-package brain override. The audit must include `direct-brain-labour: reads=N | searches=N | evidence=N | tests=N | docs=N | other=N`; every nonzero category must appear in a package row as `direct=reads,searches,...`. Native lifecycle attests agent id/type/completion; its checksum-protected role file attests configured model/effort unless the runtime exposes stronger attestation. Never treat prose self-identification as proof; label unavailable runtime model attestation unverified.
 """
 
 
@@ -267,7 +269,7 @@ model = "{reader}"
 model_reasoning_effort = "low"
 sandbox_mode = "read-only"
 developer_instructions = """
-You are the same-vendor native reader. Never route this package through Agent Switchboard. Read and search only the assigned scope. Return concise findings with exact file:line evidence. Do not make architecture, risk, or approval decisions. Stop on ambiguity, high-risk scope, or a broader handoff.
+You are the same-vendor native reader. Never route this package through Agent Switchboard. Read and search only the assigned scope. Return concise findings with exact file:line evidence and separate observed fact from interpretation. For a decision premise, locate the minimal primary evidence and state uncertainty; never adjudicate it. Do not make architecture, risk, or approval decisions. Stop on ambiguity, high-risk scope, or a broader handoff.
 """
 ''' if reader else "",
         "codex_worker": f'''name = "worker"
@@ -285,7 +287,7 @@ tools: Read, Grep, Glob
 model: {claude_roles.get('reader') or 'haiku'}
 ---
 
-You are the same-vendor native reader. Never route this package through Agent Switchboard. Read and search only the assigned scope. Return concise findings with exact file:line evidence. Do not make architecture, risk, or approval decisions. Stop on ambiguity, high-risk scope, or a broader handoff.
+You are the same-vendor native reader. Never route this package through Agent Switchboard. Read and search only the assigned scope. Return concise findings with exact file:line evidence and separate observed fact from interpretation. For a decision premise, locate the minimal primary evidence and state uncertainty; never adjudicate it. Do not make architecture, risk, or approval decisions. Stop on ambiguity, high-risk scope, or a broader handoff.
 ''',
         "claude_worker": f'''---
 name: economy-worker
@@ -359,7 +361,7 @@ def update_hooks(
             data,
             "PostToolUse",
             f"{command_prefix} PostToolUse agent-switchboard {host}",
-            "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch",
+            "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch|mcp__.*",
         )
         _merge_hook_event(data, "Stop", f"{command_prefix} Stop agent-switchboard {host}", None)
     except Exception as exc:  # noqa: BLE001

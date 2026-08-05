@@ -29,16 +29,13 @@ from pathlib import Path
 from typing import Any
 
 import model_roles
+from switchboard_version import BROKER_VERSION
 
 
 BROKER_DIR = Path(os.environ.get("AGENT_BROKER_HOME", Path.home() / ".agent-broker"))
 DB_PATH = BROKER_DIR / "state.sqlite"
 LOG_PATH = BROKER_DIR / "agent-broker.log"
 CONFIG_PATH = BROKER_DIR / "config.json"
-
-# Tracks broker releases (surfaced via MCP serverInfo); may differ from the bridge
-# package.json version when a change is broker-only (e.g. the request ledger / return path).
-BROKER_VERSION = "1.0.27"
 
 # The MCP server key every host registers the broker under (matches setup.py MCP_KEY).
 MCP_SERVER_KEY = "agent-switchboard"
@@ -467,6 +464,7 @@ TASK_CONTRACTS = {
         "Do not continue if critical context is missing; ask one concise blocking question.",
         "Break the plan into portable work packages; each one states Lane | mechanism | exact model/effort resolved by the executor | deliverable | verification | escalation.",
         "Use semantic brain/reader/workhorse lanes in imported plans. At execution start, translate a foreign-vendor labour route to the current executor's same-vendor native role instead of following the foreign model literally.",
+        "For every decision premise -- a claim whose falsity changes the patch, risk classification, or release decision -- assign the reader to locate minimal primary evidence and reserve adjudication for the brain. State premise | what changes if false | bounded primary evidence.",
         "Reclassify risk/difficulty at each work-package boundary instead of routing the whole plan once up front.",
     ],
     "implementation": [
@@ -478,6 +476,7 @@ TASK_CONTRACTS = {
         "This minimalism never overrides required validation, error handling, security checks, or tests; if the plan looks unsafe or materially over-built, stop and report it instead of silently trimming.",
         "Follow the package's semantic Lane, but resolve it to the current executor's same-vendor native role and record the exact model/effort. Never call Agent Switchboard for same-vendor labour unless the native role is unavailable.",
         "If the brain retains a package, record `override: brain - <WP-ID>: <specific reason>` under the final Routing audit; bare/global overrides are invalid.",
+        "Before verification enters brain context, request an explicit field projection and output cap (default no more than 8,000 characters, roughly 1-2k tokens). Keep raw evidence external with its query/location; expand only after naming the decision premise, what changes if false, and the bounded primary evidence.",
         "If any plan step is impossible or ambiguous, or a fix attempt fails, stop at the first such point, return that item to the brain, and let the brain delegate the remaining deterministic work rather than improvising past it.",
         "Default to parallel execution for read-only work packages and serial execution for write/edit work packages unless the plan states otherwise.",
         "Report files changed, checks run, and remaining risks.",
@@ -559,8 +558,10 @@ COST_AWARE_ROUTING_RULES = [
     "On the first ambiguity or failed fix, the item returns to the brain immediately; the brain resolves it and re-delegates only the remaining deterministic work, instead of letting the worker improvise past the blocker.",
     "Default execution order: read-only work packages run in parallel, write/edit work packages run serially, unless the plan explicitly overrides this.",
     "A dirty worktree or same-session ownership never excuses keeping read-only inventory, tests, evidence, docs, or isolated mechanical work on the brain; only the exact overlapping write or high-risk state transition may be retained.",
+    "Brain-context ingress defaults to at most 8,000 characters (roughly 1-2k tokens). Verification calls declare a field projection and output cap; oversized raw evidence stays outside context with its query and location.",
+    "A decision premise is a claim whose falsity changes the patch, risk classification, or release decision. The reader locates minimal primary evidence; the brain states premise | what changes if false | bounded primary evidence and adjudicates only that range. Never launder a reader interpretation into fact.",
     "Do not accept a worker summary as proof. Validate file-and-line evidence, the actual diff, and check output before signoff.",
-    "The final routing audit uses host-attested native:<agent-id> receipts for native labour, broker:<uuid> ledger receipts for Switchboard calls, or a structured per-package brain override. Native model/effort is configured by the checksum-protected role and labeled unverified if the host exposes no runtime model attestation.",
+    "The final routing audit covers planned and unplanned packages and uses host-attested native:<agent-id> receipts for native labour, broker:<uuid> ledger receipts for Switchboard calls, or a structured per-package brain override. It includes direct-brain-labour: reads=N | searches=N | evidence=N | tests=N | docs=N | other=N, and maps every nonzero category to a package row as direct=reads,searches,... . Native model/effort is configured by the checksum-protected role and labeled unverified if the host exposes no runtime model attestation.",
     "Skip delegation when specifying and verifying the handoff would cost more than doing the small task directly.",
 ]
 

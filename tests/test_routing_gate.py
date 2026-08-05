@@ -15,18 +15,29 @@ if str(REPO_ROOT) not in sys.path:
 
 import routing_gate  # noqa: E402
 
+DIRECT_BRAIN_LABOUR = (
+    "direct-brain-labour: reads=0 | searches=0 | evidence=0 | "
+    "tests=0 | docs=0 | other=0\n"
+)
+
 
 class RoutingGateTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.state_dir = Path(self.tmp.name) / "routing-gate"
+        self.evidence_dir = Path(self.tmp.name) / "context-evidence"
         self.db_path = Path(self.tmp.name) / "state.sqlite"
         self.state_patch = mock.patch.object(routing_gate, "STATE_DIR", self.state_dir)
+        self.evidence_patch = mock.patch.object(
+            routing_gate, "EVIDENCE_DIR", self.evidence_dir
+        )
         self.db_patch = mock.patch.object(routing_gate, "DB_PATH", self.db_path)
         self.state_patch.start()
+        self.evidence_patch.start()
         self.db_patch.start()
         self.addCleanup(self.state_patch.stop)
+        self.addCleanup(self.evidence_patch.stop)
         self.addCleanup(self.db_patch.stop)
 
     @staticmethod
@@ -56,7 +67,46 @@ class RoutingGateTests(unittest.TestCase):
         message = (
             "## Routing audit\n"
             "packages: 1\n"
+            f"{DIRECT_BRAIN_LABOUR}"
             "- WP1 | receipt: override: brain - WP1: coordination costs more than this tiny edit\n"
+        )
+        with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
+            self.assertEqual(routing_gate.stop(self.payload(message)), {})
+
+    def test_missing_exact_direct_brain_labour_census_blocks(self):
+        routing_gate.mark_mutated("session-1")
+        message = (
+            "## Routing audit\n"
+            "packages: 1\n"
+            "- WP1 | receipt: override: brain - WP1: retained for architecture risk\n"
+        )
+        with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
+            result = routing_gate.stop(self.payload(message))
+        self.assertEqual(result.get("decision"), "block")
+        self.assertIn("direct-brain-labour", result.get("reason", ""))
+
+    def test_nonzero_direct_labour_without_matching_package_tag_blocks(self):
+        routing_gate.mark_mutated("session-1")
+        message = (
+            "## Routing audit\n"
+            "packages: 1\n"
+            "direct-brain-labour: reads=1 | searches=0 | evidence=0 | "
+            "tests=0 | docs=0 | other=0\n"
+            "- WP1 | receipt: override: brain - WP1: retained for architecture risk\n"
+        )
+        with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
+            result = routing_gate.stop(self.payload(message))
+        self.assertEqual(result.get("decision"), "block")
+
+    def test_nonzero_direct_labour_with_matching_package_tag_allows(self):
+        routing_gate.mark_mutated("session-1")
+        message = (
+            "## Routing audit\n"
+            "packages: 1\n"
+            "direct-brain-labour: reads=1 | searches=0 | evidence=0 | "
+            "tests=0 | docs=0 | other=0\n"
+            "- WP1 | direct=reads | receipt: override: brain - WP1: "
+            "retained for architecture risk\n"
         )
         with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
             self.assertEqual(routing_gate.stop(self.payload(message)), {})
@@ -83,7 +133,10 @@ class RoutingGateTests(unittest.TestCase):
     def test_valid_receipt_allows(self):
         routing_gate.mark_mutated("session-1")
         rid = "e53e5d2b-dcb7-4e2d-8c03-20009a336399"
-        message = f"## Routing audit\npackages: 1\n- WP1 | receipt: broker:{rid} | verified\n"
+        message = (
+            f"## Routing audit\npackages: 1\n{DIRECT_BRAIN_LABOUR}"
+            f"- WP1 | receipt: broker:{rid} | verified\n"
+        )
         fake = types.SimpleNamespace(
             request_status=lambda _rid: {
                 "found": True,
@@ -169,6 +222,7 @@ class RoutingGateTests(unittest.TestCase):
         message = (
             "## Routing audit\n"
             "packages: 2\n"
+            f"{DIRECT_BRAIN_LABOUR}"
             f"- WP1 | receipt: broker:{rid} | consult verified\n"
             "- WP2 | receipt: native:agent-worker-1 | tests passed\n"
         )
@@ -188,7 +242,10 @@ class RoutingGateTests(unittest.TestCase):
 
     def test_unknown_native_receipt_blocks(self):
         routing_gate.mark_mutated("session-1")
-        message = "## Routing audit\npackages: 1\n- WP1 | receipt: native:agent-missing | verified\n"
+        message = (
+            f"## Routing audit\npackages: 1\n{DIRECT_BRAIN_LABOUR}"
+            "- WP1 | receipt: native:agent-missing | verified\n"
+        )
         with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
             self.assertEqual(routing_gate.stop(self.payload(message)).get("decision"), "block")
 
@@ -203,7 +260,10 @@ class RoutingGateTests(unittest.TestCase):
                 "model": "gpt-5.6-terra",
             }
         )
-        message = "## Routing audit\npackages: 1\n- WP1 | receipt: native:agent-worker-pending | pending\n"
+        message = (
+            f"## Routing audit\npackages: 1\n{DIRECT_BRAIN_LABOUR}"
+            "- WP1 | receipt: native:agent-worker-pending | pending\n"
+        )
         with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
             self.assertEqual(routing_gate.stop(self.payload(message)).get("decision"), "block")
 
@@ -212,6 +272,7 @@ class RoutingGateTests(unittest.TestCase):
         message = (
             "## Routing audit\n"
             "packages: 2\n"
+            f"{DIRECT_BRAIN_LABOUR}"
             "- WP1 | receipt: override: brain - WP1: retained for architecture risk\n"
         )
         with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
@@ -222,6 +283,7 @@ class RoutingGateTests(unittest.TestCase):
         message = (
             "## Routing audit\n"
             "packages: 1\n"
+            f"{DIRECT_BRAIN_LABOUR}"
             "- WP1 | receipt: native:agent-worker-1 | "
             "override: brain - WP1: brain also claims the same package\n"
         )
@@ -241,10 +303,12 @@ class RoutingGateTests(unittest.TestCase):
         )
         without_reason = (
             "## Routing audit\npackages: 1\n"
+            f"{DIRECT_BRAIN_LABOUR}"
             f"- WP1 | receipt: broker:{rid} | tests passed\n"
         )
         with_reason = (
             "## Routing audit\npackages: 1\n"
+            f"{DIRECT_BRAIN_LABOUR}"
             f"- WP1 | receipt: broker:{rid} | "
             "native-unavailable: native worker failed to start twice\n"
         )
@@ -293,7 +357,10 @@ class RoutingGateTests(unittest.TestCase):
     def test_unverified_receipt_blocks(self):
         routing_gate.mark_mutated("session-1")
         rid = "e53e5d2b-dcb7-4e2d-8c03-20009a336399"
-        message = f"## Routing audit\npackages: 1\n- WP1 | receipt: broker:{rid} | verified\n"
+        message = (
+            f"## Routing audit\npackages: 1\n{DIRECT_BRAIN_LABOUR}"
+            f"- WP1 | receipt: broker:{rid} | verified\n"
+        )
         fake = types.SimpleNamespace(
             request_status=lambda _rid: {
                 "found": True,
@@ -311,12 +378,84 @@ class RoutingGateTests(unittest.TestCase):
     def test_receipt_validation_error_fails_open(self):
         routing_gate.mark_mutated("session-1")
         rid = "e53e5d2b-dcb7-4e2d-8c03-20009a336399"
-        message = f"## Routing audit\npackages: 1\n- WP1 | receipt: broker:{rid} | verified\n"
+        message = (
+            f"## Routing audit\npackages: 1\n{DIRECT_BRAIN_LABOUR}"
+            f"- WP1 | receipt: broker:{rid} | verified\n"
+        )
         fake = types.SimpleNamespace(request_status=mock.Mock(side_effect=RuntimeError("down")))
         with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True), mock.patch.dict(
             sys.modules, {"agent_broker_mcp": fake}
         ):
             self.assertEqual(routing_gate.stop(self.payload(message)), {})
+
+    def test_oversized_mcp_codex_response_is_quarantined_and_replaced(self):
+        secret = "raw-provider-evidence-" * 20
+        payload = {
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "tool_use_id": "call-1",
+            "tool_name": "mcp__market__report",
+            "tool_input": {"fields": ["price", "timestamp"], "limit": 5},
+            "tool_response": {"rows": secret},
+            "_switchboard_host": "codex",
+        }
+        with mock.patch.object(routing_gate, "CONTEXT_INGRESS_MAX_CHARS", 100):
+            result = routing_gate.post_tool_use(payload)
+
+        self.assertEqual(result.get("decision"), "block")
+        self.assertIn("quarantined", result.get("reason", ""))
+        evidence_files = list(self.evidence_dir.glob("*.json"))
+        self.assertEqual(len(evidence_files), 1)
+        record = json.loads(evidence_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["tool_input"], payload["tool_input"])
+        self.assertEqual(record["tool_name"], "mcp__market__report")
+        self.assertGreater(record["response_chars"], 100)
+        self.assertIn(secret, record["tool_response_serialized"])
+
+    def test_oversized_mcp_claude_response_uses_updated_output_without_raw_leak(self):
+        secret = "never-return-this-raw-payload-" * 20
+        payload = {
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "tool_use_id": "call-2",
+            "tool_name": "mcp__ledger__query",
+            "tool_input": {"projection": ["state"]},
+            "tool_response": secret,
+            "_switchboard_host": "claude",
+        }
+        with mock.patch.object(routing_gate, "CONTEXT_INGRESS_MAX_CHARS", 100):
+            result = routing_gate.post_tool_use(payload)
+
+        output = result["hookSpecificOutput"]
+        self.assertEqual(output["hookEventName"], "PostToolUse")
+        self.assertIn("updatedToolOutput", output)
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertEqual(len(list(self.evidence_dir.glob("*.json"))), 1)
+
+    def test_mcp_response_at_or_below_ingress_cap_is_unchanged(self):
+        payload = {
+            "session_id": "session-1",
+            "tool_name": "mcp__ledger__query",
+            "tool_input": {"projection": ["state"]},
+            "tool_response": "short result",
+            "_switchboard_host": "codex",
+        }
+        with mock.patch.object(routing_gate, "CONTEXT_INGRESS_MAX_CHARS", 100):
+            self.assertEqual(routing_gate.post_tool_use(payload), {})
+        self.assertFalse(self.evidence_dir.exists())
+
+    def test_evidence_storage_failure_preserves_original_tool_result(self):
+        payload = {
+            "session_id": "session-1",
+            "tool_name": "mcp__ledger__query",
+            "tool_input": {"projection": ["state"]},
+            "tool_response": "x" * 200,
+            "_switchboard_host": "codex",
+        }
+        with mock.patch.object(
+            routing_gate, "CONTEXT_INGRESS_MAX_CHARS", 100
+        ), mock.patch.object(routing_gate, "_store_context_evidence", return_value=None):
+            self.assertEqual(routing_gate.post_tool_use(payload), {})
 
     def test_mutation_classification(self):
         positives = [

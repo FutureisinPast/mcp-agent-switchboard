@@ -139,6 +139,12 @@ class HierarchyInstallTests(unittest.TestCase):
         ]
         self.assertIn("shutdown-if-armed.ps1", stop_commands)
         self.assertTrue(any(item.endswith("routing-hook Stop agent-switchboard claude") for item in stop_commands))
+        self.assertTrue(
+            any(
+                "mcp__.*" in str(group.get("matcher", ""))
+                for group in settings["hooks"]["PostToolUse"]
+            )
+        )
 
         codex_hooks = json.loads(self.paths.codex_hooks.read_text(encoding="utf-8"))["hooks"]
         for event, user_command in (
@@ -154,6 +160,12 @@ class HierarchyInstallTests(unittest.TestCase):
             self.assertTrue(
                 any(item.endswith(f"routing-hook {event} agent-switchboard codex") for item in commands)
             )
+        self.assertTrue(
+            any(
+                "mcp__.*" in str(group.get("matcher", ""))
+                for group in codex_hooks["PostToolUse"]
+            )
+        )
 
         hierarchy_lower = codex_text.lower()
         self.assertIn("same-vendor", hierarchy_lower)
@@ -165,6 +177,18 @@ class HierarchyInstallTests(unittest.TestCase):
         self.assertIn("semantic", hierarchy_lower)
         self.assertIn("resolve", hierarchy_lower)
         self.assertIn("execution", hierarchy_lower)
+        self.assertIn("brain-context ingress", hierarchy_lower)
+        self.assertIn("decision premise", hierarchy_lower)
+        self.assertIn("reader locates", hierarchy_lower)
+        self.assertIn("every planned and unplanned package", hierarchy_lower)
+        self.assertIn("direct-brain-labour", hierarchy_lower)
+
+        codex_reader = self.paths.codex_explorer.read_text(encoding="utf-8").lower()
+        claude_reader = self.paths.claude_explore.read_text(encoding="utf-8").lower()
+        for reader_text in (codex_reader, claude_reader):
+            self.assertIn("observed fact from interpretation", reader_text)
+            self.assertIn("decision premise", reader_text)
+            self.assertIn("never adjudicate", reader_text)
 
         before = {path: path.read_bytes() for path in (
             self.paths.codex_agents_md,

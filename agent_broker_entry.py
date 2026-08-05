@@ -9,6 +9,7 @@ The one binary is dual-mode so a GitHub user needs no Python at all:
   agent-switchboard.exe serve           -> run the MCP server over stdio (what agents launch)
   agent-switchboard.exe doctor [--json] -> read-only capability report for this machine
   agent-switchboard.exe bridge <args>   -> broker CLI used by the bridge extension
+  agent-switchboard.exe --version       -> print the packaged release version
 
 `broker_command()` in setup.py registers `<this-exe> serve` with every host, so the
 exact same binary that installs the broker is also the broker server.
@@ -19,10 +20,15 @@ from __future__ import annotations
 import sys
 
 SERVE_ALIASES = {"serve", "server", "mcp", "--serve", "stdio"}
+VERSION_ALIASES = {"version", "--version", "-v"}
 
 
 def run() -> int:
     first = sys.argv[1].lower() if len(sys.argv) > 1 else ""
+    if first in VERSION_ALIASES:
+        from switchboard_version import BROKER_VERSION
+        print(f"Agent Switchboard {BROKER_VERSION}")
+        return 0
     if first == "routing-hook":
         import routing_gate
         return routing_gate.main(sys.argv[2:])

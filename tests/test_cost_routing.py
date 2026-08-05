@@ -10,11 +10,13 @@ home is redirected to a TemporaryDirectory for the duration of each test.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -23,7 +25,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import agent_broker_mcp as broker  # noqa: E402
+import agent_broker_entry  # noqa: E402
 import setup as broker_setup  # noqa: E402
+from switchboard_version import BROKER_VERSION  # noqa: E402
 
 
 class ClaudeStreamParserTests(unittest.TestCase):
@@ -295,6 +299,38 @@ class RoutingContractStringsTests(unittest.TestCase):
             and "structured per-package brain override" in line
         ]
         self.assertTrue(matches, "expected the mixed native/broker routing audit rule")
+
+    def test_plan_contract_defines_reader_located_decision_premise(self):
+        text = " ".join(broker.TASK_CONTRACTS["implementation_plan"]).lower()
+        self.assertIn("decision premise", text)
+        self.assertIn("reader to locate minimal primary evidence", text)
+        self.assertIn("adjudication for the brain", text)
+
+    def test_implementation_contract_caps_brain_context_ingress(self):
+        text = " ".join(broker.TASK_CONTRACTS["implementation"]).lower()
+        self.assertIn("field projection and output cap", text)
+        self.assertIn("8,000 characters", text)
+        self.assertIn("raw evidence external", text)
+
+    def test_global_rules_cover_premises_and_unplanned_direct_labour(self):
+        text = " ".join(broker.COST_AWARE_ROUTING_RULES).lower()
+        self.assertIn("brain-context ingress", text)
+        self.assertIn("decision premise", text)
+        self.assertIn("planned and unplanned packages", text)
+        self.assertIn("direct-brain-labour:", text)
+
+
+class EntryVersionTests(unittest.TestCase):
+    def test_all_version_aliases_print_shared_release_version(self):
+        for alias in ("--version", "version", "-v"):
+            with self.subTest(alias=alias), mock.patch.object(
+                sys, "argv", ["agent-switchboard.exe", alias]
+            ):
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    result = agent_broker_entry.run()
+                self.assertEqual(result, 0)
+                self.assertEqual(stdout.getvalue().strip(), f"Agent Switchboard {BROKER_VERSION}")
 
 
 class NativeFirstBrokerGuardTests(unittest.TestCase):

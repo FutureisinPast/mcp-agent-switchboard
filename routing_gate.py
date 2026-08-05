@@ -4,7 +4,9 @@ Dependency-free (stdlib only). Invoked by the host (Codex/Claude Code) as a
 command hook: JSON on stdin, JSON on stdout. Both hosts use the same
 `hooks.<Event>[].hooks[]` structural shape and the same Stop decision shape
 (`{"decision": "block", "reason": "..."}` to block once, `{}` to allow).
-PostToolUse always emits `{}` (it cannot block, only observe).
+PostToolUse also quarantines oversized MCP responses before they enter brain
+context. Codex replaces the result with block feedback; Claude uses its
+host-specific ``updatedToolOutput`` response.
 
 Design constraints (hard, repeat-checked):
 - Fail-open: any doubt (unreachable ledger, re-entrant stop, missing session id)
@@ -19,6 +21,7 @@ Design constraints (hard, repeat-checked):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -32,9 +35,25 @@ import atomic_io
 BROKER_HOME = Path(os.environ.get("AGENT_BROKER_HOME", Path.home() / ".agent-broker"))
 STATE_DIR = BROKER_HOME / "routing-gate"
 DB_PATH = BROKER_HOME / "state.sqlite"
+EVIDENCE_DIR = BROKER_HOME / "context-evidence"
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
 
 STATE_TTL_SECONDS = 24 * 60 * 60
 NATIVE_CHECKPOINT_MUTATIONS = 10
+CONTEXT_INGRESS_MAX_CHARS = max(
+    2_000, _env_int("AGENT_BROKER_CONTEXT_INGRESS_MAX_CHARS", 8_000)
+)
+CONTEXT_EVIDENCE_MAX_CHARS = max(
+    CONTEXT_INGRESS_MAX_CHARS,
+    _env_int("AGENT_BROKER_CONTEXT_EVIDENCE_MAX_CHARS", 5_000_000),
+)
 
 MUTATING_TOOL_NAMES = {
     "edit", "write", "multiedit", "notebookedit", "apply_patch", "applypatch", "patch",
@@ -99,6 +118,15 @@ AUDIT_ROW_RE = re.compile(
 )
 NATIVE_UNAVAILABLE_RE = re.compile(
     r"\bnative-unavailable\s*:\s*\S.{11,}", re.IGNORECASE
+)
+DIRECT_BRAIN_LABOUR_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?direct-brain-labour\s*:\s*"
+    r"reads=(\d+)\s*\|\s*searches=(\d+)\s*\|\s*evidence=(\d+)\s*\|\s*"
+    r"tests=(\d+)\s*\|\s*docs=(\d+)\s*\|\s*other=(\d+)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+DIRECT_BRAIN_LABOUR_CATEGORIES = (
+    "reads", "searches", "evidence", "tests", "docs", "other"
 )
 VALID_RESPONDER_PREFIXES = ("codex:", "claude:", "antigravity:")
 NATIVE_CHEAP_AGENT_TYPES = {"explore", "explorer", "worker", "economy-worker"}
@@ -253,19 +281,20 @@ def subagent_stop(payload: dict) -> dict:
 
 
 def sweep_stale(max_age_seconds: float = STATE_TTL_SECONDS) -> None:
-    if not STATE_DIR.exists():
-        return
     cutoff = time.time() - max_age_seconds
-    try:
-        entries = list(STATE_DIR.glob("*.json"))
-    except OSError:
-        return
-    for path in entries:
+    for directory in (STATE_DIR, EVIDENCE_DIR):
+        if not directory.exists():
+            continue
         try:
-            if path.stat().st_mtime < cutoff:
-                path.unlink()
+            entries = list(directory.glob("*.json"))
         except OSError:
-            pass
+            continue
+        for path in entries:
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                pass
 
 
 def _is_mutating(tool_name: str, tool_input: dict) -> bool:
@@ -290,8 +319,93 @@ def user_prompt_submit(payload: dict) -> dict:
     return {}
 
 
+def _serialized_tool_response(response: object) -> str:
+    if isinstance(response, str):
+        return response
+    return json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+
+
+def _is_mcp_tool(tool_name: object) -> bool:
+    return str(tool_name or "").strip().lower().startswith("mcp__")
+
+
+def _store_context_evidence(payload: dict, serialized_response: str) -> Path | None:
+    """Persist oversized evidence outside model context with its query/provenance.
+
+    The local file is intentionally short-lived and user-readable only where the
+    platform supports POSIX modes. On any write failure the hook fails open so it
+    never destroys the only copy of a tool result.
+    """
+    now = time.time()
+    identity = "|".join(
+        str(payload.get(key) or "")
+        for key in ("session_id", "turn_id", "tool_use_id", "tool_name")
+    )
+    digest = hashlib.sha256(f"{identity}|{time.time_ns()}".encode("utf-8")).hexdigest()[:20]
+    safe_tool = re.sub(r"[^A-Za-z0-9_.-]", "_", str(payload.get("tool_name") or "mcp"))[:80]
+    path = EVIDENCE_DIR / f"{int(now)}-{safe_tool}-{digest}.json"
+    truncated = len(serialized_response) > CONTEXT_EVIDENCE_MAX_CHARS
+    record = {
+        "schema": "agent-switchboard.context-evidence.v1",
+        "created_at_epoch": now,
+        "host": str(payload.get("_switchboard_host") or "unknown"),
+        "session_id": str(payload.get("session_id") or ""),
+        "turn_id": str(payload.get("turn_id") or ""),
+        "tool_name": str(payload.get("tool_name") or ""),
+        "tool_use_id": str(payload.get("tool_use_id") or ""),
+        "tool_input": payload.get("tool_input"),
+        "response_chars": len(serialized_response),
+        "response_truncated_on_disk": truncated,
+        "tool_response_serialized": serialized_response[:CONTEXT_EVIDENCE_MAX_CHARS],
+    }
+    try:
+        atomic_io.atomic_write_text(path, json.dumps(record, ensure_ascii=False, indent=2))
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return path
+    except Exception:  # noqa: BLE001 - preserve the original tool result on failure
+        return None
+
+
+def _context_ingress_feedback(payload: dict) -> dict | None:
+    if not _is_mcp_tool(payload.get("tool_name")) or "tool_response" not in payload:
+        return None
+    try:
+        serialized = _serialized_tool_response(payload.get("tool_response"))
+    except Exception:  # noqa: BLE001
+        return None
+    if len(serialized) <= CONTEXT_INGRESS_MAX_CHARS:
+        return None
+    evidence_path = _store_context_evidence(payload, serialized)
+    if evidence_path is None:
+        return None
+    feedback = (
+        f"Brain-context ingress gate replaced an oversized MCP response "
+        f"({len(serialized)} characters; limit {CONTEXT_INGRESS_MAX_CHARS}). "
+        f"Raw evidence plus the original query is quarantined at {evidence_path}. "
+        "Do not read the whole file into the brain context. Delegate extraction to the "
+        "native reader or re-run/filter with an explicit field projection and output cap. "
+        "If a claim could change the patch, risk classification, or release decision, first "
+        "state: decision premise | what changes if false | bounded primary evidence; then "
+        "inspect only that minimal evidence range."
+    )
+    if str(payload.get("_switchboard_host") or "").strip().lower() == "claude":
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "updatedToolOutput": feedback,
+            }
+        }
+    return {"decision": "block", "reason": feedback}
+
+
 def post_tool_use(payload: dict) -> dict:
     sweep_stale()
+    ingress_feedback = _context_ingress_feedback(payload)
+    if ingress_feedback is not None:
+        return ingress_feedback
     session_id = str(payload.get("session_id") or "").strip()
     if session_id and _is_mutating(payload.get("tool_name"), payload.get("tool_input") or {}):
         state = mark_mutated(session_id)
@@ -389,6 +503,9 @@ def _lookup_routing_audit_valid(
     if not section:
         return False
     body = section.group(1)
+    direct_labour = DIRECT_BRAIN_LABOUR_RE.search(body)
+    if not direct_labour:
+        return False
     package_count_match = AUDIT_PACKAGE_COUNT_RE.search(body)
     if not package_count_match:
         return False
@@ -400,6 +517,18 @@ def _lookup_routing_audit_valid(
             rows.append((match.group(1), match.group(2)))
     if package_count < 1 or len(rows) != package_count:
         return False
+    for category, raw_count in zip(
+        DIRECT_BRAIN_LABOUR_CATEGORIES, direct_labour.groups()
+    ):
+        if int(raw_count) > 0 and not any(
+            re.search(
+                rf"\bdirect\s*=\s*[^|\n]*\b{re.escape(category)}\b",
+                row_body,
+                re.IGNORECASE,
+            )
+            for _, row_body in rows
+        ):
+            return False
     seen_ids: set[str] = set()
     for row_id, row_body in rows:
         normalized_row_id = row_id.lower()
@@ -455,7 +584,10 @@ def stop(payload: dict) -> dict:
             "Include a 'Routing audit' section using broker:<uuid> for Switchboard work, "
             "native:<agent-id> for a completed managed native worker/explorer, or "
             "'override: brain - <WP-ID>: <specific reason>' for a package retained by the "
-            "brain. Bare/global overrides are invalid; then stop again."
+            "brain. Also include `direct-brain-labour: reads=N | searches=N | evidence=N | "
+            "tests=N | docs=N | other=N`, counting planned and unplanned direct labour; map "
+            "each nonzero category on a package row as `direct=reads,searches,...`. "
+            "Bare/global overrides are invalid; then stop again."
         ),
     }
 

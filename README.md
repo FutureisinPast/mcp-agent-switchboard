@@ -176,6 +176,12 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.28 (bounded context ingress and complete routing audits)
+- Oversized MCP verification payloads are quarantined outside the brain context by the installed `PostToolUse` hook. The brain receives a compact evidence reference and must request an explicit field projection or output cap instead of ingesting the raw response.
+- Decision premises are explicit: readers locate candidate evidence and distinguish fact from interpretation; the brain adjudicates only the minimum primary evidence whose truth could change a decision.
+- Completion audits now cover unplanned as well as planned work and include a direct-brain labour census for reads, searches, evidence queries, tests, documentation, and other routine work.
+- `agent-switchboard.exe --version` (plus `version` and `-v`) reports the packaged release, so an installed binary can be verified directly.
+
 ### v1.0.27 (native-first labour routing)
 - Same-vendor labour now uses native subagents first: Codex `explorer`/Luna-low and `worker`/Terra-medium, or Claude `Explore`/Haiku and `economy-worker`/Sonnet-medium. Agent Switchboard is reserved for opposite-vendor maximum-effort consultation and an explicitly recorded native-unavailable fallback.
 - Plans now carry a portable semantic lane plus execution mechanism and executor-resolved exact model/effort. A Claude-authored Sonnet/Haiku package is re-resolved to Codex's current native worker/reader when Codex executes it, and vice versa.
