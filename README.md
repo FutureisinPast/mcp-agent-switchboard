@@ -176,6 +176,10 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.30 (Windows-safe Claude hook execution)
+- Claude Code routing hooks now use executable-plus-argument-array form, preventing `/usr/bin/bash` from stripping backslashes out of Windows executable paths. Install/repair migrates legacy string-form Switchboard hooks without changing other user hooks; Codex hooks keep their existing command-string format.
+- Completion now requires every Claude-managed background Bash, PowerShell, or Monitor job started by a package to reach a terminal result or be stopped. Launching or detaching background work does not count as verification.
+
 ### v1.0.29 (strict native pre-labour enforcement)
 - The installed `PreToolUse` gate now atomically allows one bounded block of direct brain labour, then denies the next eligible read, search, evidence, test, documentation, or mechanical call until a same-vendor native reader/workhorse starts or a package-specific brain override is registered.
 - Native-agent relief is bounded rather than permanent: each cheap-role start opens only the next block, while completed planning work cannot disable later implementation enforcement. Switchboard consultation controls remain available, but ordinary research MCP calls count as evidence labour.

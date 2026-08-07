@@ -9,6 +9,7 @@ import copy
 import hashlib
 import json
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -255,6 +256,7 @@ def routing_rules_body(codex_roles: dict, claude_roles: dict) -> str:
 - Brain-context ingress is capped by default at roughly 1-2k tokens (8,000 characters). Before a verification response enters brain context, request an explicit field projection and output cap. Oversized MCP evidence is quarantined outside context with its query and location; do not pull the whole artifact back into context.
 - A claim is a decision premise when it being false would change the patch, risk classification, or release decision. The reader locates it; the brain adjudicates only the minimum primary evidence. Every brain-retained premise read states `premise | what changes if false | bounded primary evidence` before inspection. "Needs judgment" never justifies broad rereading.
 - Readers return file:line evidence and distinguish observed facts from interpretation. The brain reviews actual diffs and verification output. Reads may run in parallel; writes are serial unless files are demonstrably independent.
+- Background shell lifecycle is part of package completion: before claiming completion or returning, reconcile every Claude-managed background Bash/PowerShell/Monitor job started in that package by obtaining its terminal result or stopping it. Launching or detaching a job is never verification.
 - Do not claim implementation complete without a `Routing audit` mapping every planned and unplanned package to its lane, mechanism, resolved model/effort, verification, and one receipt: `native:<agent-id>` for a host-attested completed managed subagent, `broker:<uuid>` for an Agent Switchboard call, or the structured per-package brain override. The audit must include `direct-brain-labour: reads=N | searches=N | evidence=N | tests=N | docs=N | other=N`; every nonzero category must appear in a package row as `direct=reads,searches,...`. Native lifecycle attests agent id/type/completion; its checksum-protected role file attests configured model/effort unless the runtime exposes stronger attestation. Never treat prose self-identification as proof; label unavailable runtime model attestation unverified.
 """
 
@@ -296,7 +298,7 @@ model: {claude_roles.get('workhorse') or 'sonnet'}
 effort: medium
 ---
 
-You are the same-vendor native workhorse. Never route this package through Agent Switchboard. Require a work package with Lane, mechanism, exact resolved model/effort, deliverable, verification, and escalation. Implement only that package. Return no more than 8,000 characters; keep large logs/artifacts outside the brain context and report only their location plus the bounded verification result. Stop on ambiguity, plan deviation, high-risk scope, or the first failed fix and return evidence to the brain.
+You are the same-vendor native workhorse. Never route this package through Agent Switchboard. Require a work package with Lane, mechanism, exact resolved model/effort, deliverable, verification, and escalation. Implement only that package. Return no more than 8,000 characters; keep large logs/artifacts outside the brain context and report only their location plus the bounded verification result. Before returning, reconcile every background Bash/PowerShell/Monitor job started in this package by obtaining its terminal result or stopping it; launching or detaching a job is never verification. Stop on ambiguity, plan deviation, high-risk scope, or the first failed fix and return evidence to the brain.
 ''',
     }
 
@@ -316,7 +318,7 @@ def _legacy_claude_role(name: str) -> Callable[[str], bool]:
     )
 
 
-def _merge_hook_event(data: dict, event: str, command: str, matcher: str | None) -> None:
+def _merge_hook_event(data: dict, event: str, handler: dict, matcher: str | None) -> None:
     hooks = data.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         raise ValueError("hooks must be a JSON object")
@@ -335,11 +337,38 @@ def _merge_hook_event(data: dict, event: str, command: str, matcher: str | None)
             new_group = copy.deepcopy(group)
             new_group["hooks"] = filtered
             kept.append(new_group)
-    owned_group = {"hooks": [{"type": "command", "command": command}]}
+    owned_group = {"hooks": [copy.deepcopy(handler)]}
     if matcher:
         owned_group["matcher"] = matcher
     kept.append(owned_group)
     hooks[event] = kept
+
+
+def _hook_prefix_argv(command_prefix: str) -> list[str]:
+    """Split the installer-generated command prefix without consuming backslashes."""
+    parts = shlex.split(command_prefix, posix=False)
+    argv = [
+        part[1:-1]
+        if len(part) >= 2 and part[0] == part[-1] and part[0] in {'"', "'"}
+        else part
+        for part in parts
+    ]
+    if not argv:
+        raise ValueError("routing hook command prefix is empty")
+    return argv
+
+
+def _hook_handler(command_prefix: str, event: str, host: str) -> dict:
+    suffix = [event, "agent-switchboard", host]
+    if host == "claude":
+        # Claude Code executes a string command through its configured shell.
+        # Exec-form hooks keep Windows paths out of bash parsing entirely.
+        argv = _hook_prefix_argv(command_prefix)
+        return {"type": "command", "command": argv[0], "args": argv[1:] + suffix}
+    return {
+        "type": "command",
+        "command": f"{command_prefix} {' '.join(suffix)}",
+    }
 
 
 def update_hooks(
@@ -354,22 +383,22 @@ def update_hooks(
         data = json.loads(existing) if existing else {}
         if not isinstance(data, dict):
             raise ValueError("top-level JSON must be an object")
-        _merge_hook_event(data, "UserPromptSubmit", f"{command_prefix} UserPromptSubmit agent-switchboard {host}", None)
-        _merge_hook_event(data, "SubagentStart", f"{command_prefix} SubagentStart agent-switchboard {host}", None)
-        _merge_hook_event(data, "SubagentStop", f"{command_prefix} SubagentStop agent-switchboard {host}", None)
+        _merge_hook_event(data, "UserPromptSubmit", _hook_handler(command_prefix, "UserPromptSubmit", host), None)
+        _merge_hook_event(data, "SubagentStart", _hook_handler(command_prefix, "SubagentStart", host), None)
+        _merge_hook_event(data, "SubagentStop", _hook_handler(command_prefix, "SubagentStop", host), None)
         _merge_hook_event(
             data,
             "PreToolUse",
-            f"{command_prefix} PreToolUse agent-switchboard {host}",
+            _hook_handler(command_prefix, "PreToolUse", host),
             "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch|Read|Grep|Glob|WebFetch|WebSearch|mcp__.*",
         )
         _merge_hook_event(
             data,
             "PostToolUse",
-            f"{command_prefix} PostToolUse agent-switchboard {host}",
+            _hook_handler(command_prefix, "PostToolUse", host),
             "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch|Read|Grep|Glob|WebFetch|WebSearch|mcp__.*",
         )
-        _merge_hook_event(data, "Stop", f"{command_prefix} Stop agent-switchboard {host}", None)
+        _merge_hook_event(data, "Stop", _hook_handler(command_prefix, "Stop", host), None)
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: {path.name} is not safely mergeable ({exc}); left untouched"
     rendered = json.dumps(data, indent=2) + "\n"

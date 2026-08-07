@@ -671,6 +671,16 @@ class RoutingGateTests(unittest.TestCase):
         self.assertEqual(merged_again, merged)
         self.assertEqual(routing_gate.remove_owned_hook_entries(merged), existing)
 
+        exec_form = {
+            "type": "command",
+            "command": r"C:\Agent Switchboard\agent-switchboard.exe",
+            "args": ["routing-hook", "Stop", "agent-switchboard", "claude"],
+        }
+        self.assertTrue(routing_gate.is_owned_hook_entry(exec_form))
+        self.assertEqual(
+            routing_gate.remove_owned_hook_entries([existing[0], exec_form]), existing
+        )
+
     def test_cli_always_emits_json_on_bad_input(self):
         with mock.patch("sys.stdin.read", return_value="not-json"), mock.patch(
             "sys.stdout.write"

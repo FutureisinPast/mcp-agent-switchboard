@@ -869,7 +869,11 @@ def stop(payload: dict) -> dict:
 # --- hook merge (shared by setup.py install/uninstall) --------------------
 def is_owned_hook_entry(entry: dict) -> bool:
     command = str((entry or {}).get("command") or "")
-    return "agent-switchboard" in command and "routing-hook" in command
+    args = (entry or {}).get("args") or []
+    if not isinstance(args, list):
+        args = []
+    invocation = " ".join([command, *(str(arg) for arg in args)])
+    return "agent-switchboard" in invocation and "routing-hook" in invocation
 
 
 def merge_hook_entry(existing_hooks_for_event: list, our_command: str) -> list:

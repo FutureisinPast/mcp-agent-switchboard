@@ -81,6 +81,15 @@ class HierarchyInstallTests(unittest.TestCase):
                         ],
                         "PreToolUse": [
                             {
+                                "matcher": "legacy-switchboard",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": '"C:\\Agent Switchboard\\agent-switchboard.exe" routing-hook PreToolUse agent-switchboard claude',
+                                    }
+                                ],
+                            },
+                            {
                                 "matcher": "user-pre",
                                 "hooks": [
                                     {"type": "command", "command": "user-pre-tool.ps1"}
@@ -164,13 +173,25 @@ class HierarchyInstallTests(unittest.TestCase):
         settings = json.loads(self.paths.claude_settings.read_text(encoding="utf-8"))
         self.assertEqual(settings["model"], "user-selected-brain")
         self.assertEqual(settings["effortLevel"], "max")
-        stop_commands = [
-            item["command"]
+        stop_handlers = [
+            item
             for group in settings["hooks"]["Stop"]
             for item in group.get("hooks", [])
         ]
-        self.assertIn("shutdown-if-armed.ps1", stop_commands)
-        self.assertTrue(any(item.endswith("routing-hook Stop agent-switchboard claude") for item in stop_commands))
+        self.assertIn("shutdown-if-armed.ps1", [item["command"] for item in stop_handlers])
+        owned_stop = [
+            item for item in stop_handlers if hierarchy_install.routing_gate.is_owned_hook_entry(item)
+        ]
+        self.assertEqual(
+            owned_stop,
+            [
+                {
+                    "type": "command",
+                    "command": "C:\\Agent Switchboard\\agent-switchboard.exe",
+                    "args": ["routing-hook", "Stop", "agent-switchboard", "claude"],
+                }
+            ],
+        )
         self.assertTrue(
             any(
                 "Read" in str(group.get("matcher", ""))
@@ -182,14 +203,24 @@ class HierarchyInstallTests(unittest.TestCase):
             ("PreToolUse", "user-pre-tool.ps1"),
             ("PostToolUse", "user-post-tool.ps1"),
         ):
-            commands = [
-                item["command"]
+            handlers = [
+                item
                 for group in settings["hooks"][event]
                 for item in group.get("hooks", [])
             ]
-            self.assertIn(user_command, commands)
-            self.assertTrue(
-                any(item.endswith(f"routing-hook {event} agent-switchboard claude") for item in commands)
+            self.assertIn(user_command, [item["command"] for item in handlers])
+            owned = [
+                item for item in handlers if hierarchy_install.routing_gate.is_owned_hook_entry(item)
+            ]
+            self.assertEqual(
+                owned,
+                [
+                    {
+                        "type": "command",
+                        "command": "C:\\Agent Switchboard\\agent-switchboard.exe",
+                        "args": ["routing-hook", event, "agent-switchboard", "claude"],
+                    }
+                ],
             )
         self.assertTrue(
             any(
@@ -259,6 +290,8 @@ class HierarchyInstallTests(unittest.TestCase):
         self.assertIn("pretooluse", hierarchy_lower)
         self.assertIn("first ten direct labour calls", hierarchy_lower)
         self.assertIn("each native start or registered override opens the next bounded block", hierarchy_lower)
+        self.assertIn("reconcile every claude-managed background", hierarchy_lower)
+        self.assertIn("launching or detaching a job is never verification", hierarchy_lower)
 
         codex_reader = self.paths.codex_explorer.read_text(encoding="utf-8").lower()
         claude_reader = self.paths.claude_explore.read_text(encoding="utf-8").lower()
@@ -273,6 +306,8 @@ class HierarchyInstallTests(unittest.TestCase):
         for worker_text in (codex_worker, claude_worker):
             self.assertIn("return no more than 8,000 characters", worker_text)
             self.assertIn("large logs/artifacts outside the brain context", worker_text)
+        self.assertIn("reconcile every background bash/powershell/monitor job", claude_worker)
+        self.assertIn("launching or detaching a job is never verification", claude_worker)
 
         before = {path: path.read_bytes() for path in (
             self.paths.codex_agents_md,
@@ -374,6 +409,18 @@ class HierarchyInstallTests(unittest.TestCase):
             for item in group.get("hooks", [])
         ]
         self.assertEqual(stop_commands, ["shutdown-if-armed.ps1"])
+        remaining_handlers = [
+            item
+            for groups in settings.get("hooks", {}).values()
+            for group in groups
+            for item in group.get("hooks", [])
+        ]
+        self.assertFalse(
+            any(
+                hierarchy_install.routing_gate.is_owned_hook_entry(item)
+                for item in remaining_handlers
+            )
+        )
 
 
 if __name__ == "__main__":
