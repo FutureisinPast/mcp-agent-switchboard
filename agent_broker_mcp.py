@@ -556,9 +556,11 @@ COST_AWARE_ROUTING_RULES = [
     "For non-trivial planning or a hard issue, obtain one opposite-vendor maximum-effort consultation: Codex brain -> moving Claude Fable alias (Opus only when Fable is explicitly unavailable); Claude brain -> the live Codex frontier at its highest single-agent effort.",
     "Capability tier outranks model version. Gemini Flash High is a useful, non-authoritative workhorse-level adviser; a higher version does not promote it above Sol/Fable or make its advice automatically authoritative. When Claude's Fable -> Opus chain is unavailable because of quota, reachability, entitlement, or another availability failure, a Codex brain should request a second opinion from the newest live Flash High, label it degraded advisory fallback, and retain final judgment.",
     "Native first: same-vendor labour uses the host's managed native subagents (Codex explorer/worker; Claude Explore/economy-worker). Agent Switchboard is reserved for opposite-vendor consultation, the external Antigravity Flash workhorse lane, or an explicitly documented native-unavailable fallback; Flash is not a native child agent.",
-    "Codex and Claude brains should proactively consider the newest live Antigravity Gemini Flash High through Agent Switchboard/agy as a fast, cheap external workhorse for bounded search, reading, extraction, summaries, drafting, low-risk implementation/tests from an approved plan, and independent parallel packages.",
+    "Cross-vendor routing must enter through Agent Switchboard's MCP tools whenever Switchboard is registered. For Flash labour, the sender brain MUST call MCP route_agent_task; 'through CLI' means surface=cli on that MCP call. The brain MUST NOT shell out to agy or call consult_antigravity directly. Only the Switchboard backend may start agy; sender-side direct agy is prohibited.",
+    "Codex, Claude, and Gemini brains should proactively consider the newest live Antigravity Gemini Flash High through Agent Switchboard as a fast, cheap external workhorse for bounded search, reading, extraction, summaries, drafting, low-risk implementation/tests from an approved plan, and independent parallel packages. Use route_agent_task with target_agent=antigravity, surface=cli, target_model=gemini flash, effort=high, the correct task_kind, and mode=plan or mode=accept-edits plus the required implementation envelope.",
     "Every Flash call is exactly one bounded work package. Never hand Flash an entire autonomous plan or let it select/continue to the next package. Implementation calls must name a package id, at most five allowed files, explicit acceptance criteria, and forbidden actions; Switchboard rejects an incomplete envelope.",
-    "Every agy Flash call must use schema-enforced JSON. Missing/malformed fields, scope violations, contradictory completion, unsupported design-intent claims, ambiguity, or failed checks are failures to escalate -- never prose to accept. The sender brain independently inspects cited lines, the actual diff, and check output before dispatching another package.",
+    "A Switchboard-launched Gemini Flash session is the non-authoritative worker for exactly its assigned envelope, never the brain or router. It must not dispatch agents, reinterpret the whole plan, or continue to another package.",
+    "Switchboard's internal agy backend must use --output-format json with --json-schema. Missing/malformed fields, scope violations, contradictory completion, unsupported design-intent claims, ambiguity, or failed checks are failures to escalate -- never prose to accept. The sender brain independently inspects cited lines, the actual diff, and check output before dispatching another package.",
     "Flash never receives production SSH, live credentials, destructive operations, migrations, or danger-full-access. It may prepare bounded local changes and checks; the brain owns live deployment and approval.",
     "If agy or Flash is missing, quota-limited, times out, mismatches the requested model, or otherwise fails, fall back to the host's native cheap roles (Codex explorer/worker; Claude Explore/economy-worker) and record the fallback.",
     "Classify risk and difficulty at every work-package boundary. Reader/low handles bounded reading, search, extraction, and formatting; workhorse/medium handles routine writing, light implementation, tests, scripts, and reversible deployment from an approved plan.",
@@ -8334,7 +8336,7 @@ TOOLS = [
     },
     {
         "name": "route_agent_task",
-        "description": "Route one task package to Antigravity, Codex, Claude, or Gemini. For Flash CLI work, send exactly one bounded package; implementation requires work_package_id, 1-5 allowed_files, and acceptance_criteria. Switchboard enforces --json-schema, rejects danger-full-access/malformed or contradictory completion, and returns brain_verification=pending. Never send Flash an entire plan, production SSH, credentials, migrations, or live deployment. The sender brain independently checks cited lines, actual diff, and tests before accepting or sending the next package. KEEP prompt SHORT.",
+        "description": "Required MCP entry point for routing one task package to Antigravity, Codex, Claude, or Gemini. For Flash CLI work, set surface=cli here; never invoke agy directly. Send exactly one bounded package; implementation requires work_package_id, 1-5 allowed_files, and acceptance_criteria. Switchboard alone invokes agy and enforces --output-format json with --json-schema, rejects danger-full-access/malformed or contradictory completion, and returns brain_verification=pending. Never send Flash an entire plan, production SSH, credentials, migrations, or live deployment. The sender brain independently checks cited lines, actual diff, and tests before accepting or sending the next package. KEEP prompt SHORT.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -8931,7 +8933,8 @@ PUBLIC_TOOL_NAMES = CLAUDE_LITE_TOOL_NAMES | {
 
 TOOL_DESCRIPTION_OVERRIDES = {
     "route_agent_task": (
-        "Route work CLI-first. Codex/Claude brains should proactively consider external Antigravity "
+        "Required MCP entry for cross-vendor labour; never shell out to agy directly. Codex/Claude "
+        "brains should proactively consider external Antigravity "
         "Flash High for bounded cheap labour via target_agent='antigravity', surface='cli', "
         "target_model='gemini flash', effort='high'; plan is read-only and accept-edits requires an "
         "approved isolated package. Flash is non-authoritative and not a native child. On failure, "
@@ -8943,9 +8946,9 @@ TOOL_DESCRIPTION_OVERRIDES = {
 COMPACT_TOOL_DESCRIPTIONS = {
     "consult_codex": "Cross-vendor Codex consultation; same-vendor fallback requires native_unavailable_reason.",
     "consult_claude": "Cross-vendor Claude consultation; same-vendor fallback requires native_unavailable_reason.",
-    "consult_antigravity": "Use newest live Flash High as a proactive non-authoritative external workhorse through agy; fall back to host native cheap roles on failure.",
+    "consult_antigravity": "Low-level compatibility/diagnostic route. For Flash labour, call route_agent_task with surface=cli; never invoke agy directly.",
     "consult_gemini": "Ask Gemini through the configured CLI/API. Long answers return an excerpt plus response_ref.",
-    "route_agent_task": "Route CLI-first, including proactive external Antigravity Flash workhorse packages; same-vendor labour remains native-first.",
+    "route_agent_task": "Required MCP entry for cross-vendor work, including Antigravity Flash packages; surface=cli selects the backend without direct agy invocation.",
     "queue_codex_request": "Queue Codex work; same-vendor callers require native_unavailable_reason after native subagents fail.",
     "get_codex_requests": "List recent queued/completed Codex extension requests.",
     "queue_claude_request": "Queue Claude work; same-vendor callers require native_unavailable_reason after native subagents fail.",

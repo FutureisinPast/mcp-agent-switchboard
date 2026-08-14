@@ -85,6 +85,33 @@ ROUTING_OVERRIDE_COMMAND_RE = re.compile(
     r"\s+--reason\s+.+$",
     re.IGNORECASE,
 )
+# Match ``agy`` only where a shell would treat it as the command being
+# executed: at the start of a command or after a command separator. This is
+# deliberately not a plain word search, so prose, arguments, and path checks
+# such as ``Write-Output 'agy --help'`` or ``Test-Path C:\\tools\\agy.exe`` do
+# not trip the gate.
+DIRECT_AGY_COMMAND_RE = re.compile(
+    r"(?:^|(?:&&|\|\||[;&|\r\n])\s*)"
+    r"\s*(?:&\s*)?"
+    r"(?:(?:command|exec|sudo)(?:\s+--?[A-Za-z0-9_-]+)*\s+)*"
+    r"(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]+\s+)*)?"
+    r"(?:"
+    r"\"(?:[^\"\r\n]*[\\/])?agy(?:\.exe)?\""
+    r"|'(?:[^'\r\n]*[\\/])?agy(?:\.exe)?'"
+    r"|(?:[^\s\"';&|]+[\\/])*agy(?:\.exe)?"
+    r")(?=$|\s|[;&|])",
+    re.IGNORECASE,
+)
+START_PROCESS_AGY_RE = re.compile(
+    r"(?:^|(?:&&|\|\||[;&|\r\n])\s*)\s*"
+    r"start-process\s+(?:-filepath\s+)?"
+    r"(?:"
+    r"\"(?:[^\"\r\n]*[\\/])?agy(?:\.exe)?\""
+    r"|'(?:[^'\r\n]*[\\/])?agy(?:\.exe)?'"
+    r"|(?:[^\s\"';&|]+[\\/])*agy(?:\.exe)?"
+    r")(?=$|\s|[;&|])",
+    re.IGNORECASE,
+)
 TEST_COMMAND_RE = re.compile(
     r"(?:^|[;&|]\s*)(?:python\s+-m\s+(?:unittest|pytest)|pytest|npm\s+test|"
     r"pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test|dotnet\s+test)\b",
@@ -413,6 +440,27 @@ def _tool_input_text(tool_input: object) -> str:
     return "\n".join(values)
 
 
+def _shell_command_text(tool_input: object) -> str:
+    if not isinstance(tool_input, dict):
+        return ""
+    return "\n".join(
+        str(tool_input[key])
+        for key in ("command", "cmd", "script")
+        if tool_input.get(key) is not None
+    )
+
+
+def _is_direct_agy_shell_invocation(tool_name: object, tool_input: object) -> bool:
+    name = str(tool_name or "").strip().lower()
+    if name not in SHELL_TOOL_NAMES and "shell" not in name:
+        return False
+    command = _shell_command_text(tool_input)
+    return bool(
+        DIRECT_AGY_COMMAND_RE.search(command)
+        or START_PROCESS_AGY_RE.search(command)
+    )
+
+
 def _direct_labour_category(tool_name: object, tool_input: object) -> str | None:
     name = str(tool_name or "").strip().lower()
     if not name or name in DELEGATION_TOOL_NAMES:
@@ -511,6 +559,24 @@ def pre_tool_use(payload: dict) -> dict:
     while a cheap role is active because it does not document per-tool agent ids.
     """
     sweep_stale()
+    host = str(payload.get("_switchboard_host") or "").strip().lower()
+    if host in {"codex", "claude"} and _is_direct_agy_shell_invocation(
+        payload.get("tool_name"), payload.get("tool_input") or {}
+    ):
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    "Direct Antigravity CLI invocation is blocked. Call Agent "
+                    "Switchboard's MCP route_agent_task with "
+                    'target_agent="antigravity" and surface="cli". The Switchboard '
+                    "backend may invoke agy after it validates the work-package and "
+                    "JSON-schema contract; the sending Codex/Claude agent may not run "
+                    "agy directly."
+                ),
+            }
+        }
     session_id = str(payload.get("session_id") or "").strip()
     category = _direct_labour_category(
         payload.get("tool_name"), payload.get("tool_input") or {}
@@ -521,7 +587,7 @@ def pre_tool_use(payload: dict) -> dict:
         session_id,
         category,
         str(payload.get("tool_use_id") or ""),
-        str(payload.get("_switchboard_host") or "").strip().lower(),
+        host,
         _payload_is_cheap_native_call(payload),
     )
     if reserved is None:

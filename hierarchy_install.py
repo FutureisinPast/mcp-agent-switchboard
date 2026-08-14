@@ -41,6 +41,10 @@ class HierarchyPaths:
         return self.home / ".claude" / "CLAUDE.md"
 
     @property
+    def gemini_md(self) -> Path:
+        return self.home / ".gemini" / "GEMINI.md"
+
+    @property
     def codex_explorer(self) -> Path:
         return self.home / ".codex" / "agents" / "explorer.toml"
 
@@ -112,7 +116,14 @@ def _legacy_section_end(text: str, match: re.Match[str]) -> int:
     return next_heading.start() if next_heading else len(text)
 
 
-def update_instruction_block(path: Path, body: str, backup: BackupFn, dry: bool = False) -> str:
+def update_instruction_block(
+    path: Path,
+    body: str,
+    backup: BackupFn,
+    dry: bool = False,
+    replace_legacy: Callable[[str], bool] | None = None,
+    reject_legacy_mismatch: Callable[[str], bool] | None = None,
+) -> str:
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     rendered = _render_block(body)
     try:
@@ -124,6 +135,10 @@ def update_instruction_block(path: Path, body: str, backup: BackupFn, dry: bool 
             return "ERROR: managed routing block was edited; left untouched"
         start, end, _old_body = parts
         updated = existing[: start.start()] + rendered + existing[end + len(BLOCK_END) :]
+    elif replace_legacy and replace_legacy(existing):
+        updated = rendered + "\n"
+    elif reject_legacy_mismatch and reject_legacy_mismatch(existing):
+        return "ERROR: possible legacy instruction file did not match the known migration; left untouched"
     else:
         legacy = LEGACY_HEADING_RE.search(existing)
         if legacy:
@@ -249,9 +264,11 @@ def routing_rules_body(codex_roles: dict, claude_roles: dict) -> str:
 - Native-first routing order is mandatory: for same-vendor labour, use native subagents first. A Codex brain uses the managed `explorer` (`{reader}`/low) and `worker` (`{workhorse}`/medium); a Claude brain uses managed `Explore` (`{claude_roles.get('reader') or 'haiku'}`) and `economy-worker` (`{claude_roles.get('workhorse') or 'sonnet'}`/medium). Do not use Agent Switchboard to launch same-vendor labour unless the named native role is unavailable or fails to start, and record that fallback. The external Antigravity Flash lane below is a distinct allowed Switchboard use, not a native child agent.
 - For non-trivial planning or a hard issue, the brain must obtain one opposite-vendor maximum-effort consultation: a Codex brain uses Claude `{claude_chain}` with runtime attestation; a Claude brain uses the live Codex frontier `{frontier}` at the highest available single-agent effort. On explicit availability/entitlement failure, use the next advertised frontier candidate and report the fallback.
 - Capability tier outranks model version. Gemini Flash High is a useful, non-authoritative workhorse-level adviser; a higher version does not promote it above Sol/Fable or make its advice automatically authoritative. When Claude's `{claude_chain}` frontier chain is unavailable because of quota, reachability, entitlement, or another availability failure, a Codex brain should request a second opinion from the newest live Antigravity Flash High, label it degraded advisory fallback, and retain final judgment.
-- Codex and Claude brains should proactively consider the newest live Antigravity Gemini Flash High through Agent Switchboard/`agy` as a fast, cheap external workhorse for bounded search, reading, extraction, summaries, drafting, low-risk implementation/tests from an approved plan, and independent parallel packages.
+- Cross-vendor routing must enter through Agent Switchboard's MCP tools whenever Switchboard is registered. For Flash labour, the sender brain MUST call MCP `route_agent_task`; a request to use Flash "through CLI" means `surface="cli"` on that MCP call. The brain MUST NOT invoke `agy` in a shell or call `consult_antigravity` directly. Only the Switchboard backend may start `agy`; sender-side direct `agy` is prohibited.
+- Codex, Claude, and Gemini brains should proactively consider the newest live Antigravity Gemini Flash High through Agent Switchboard as a fast, cheap external workhorse for bounded search, reading, extraction, summaries, drafting, low-risk implementation/tests from an approved plan, and independent parallel packages. Use `route_agent_task` with `target_agent="antigravity"`, `surface="cli"`, `target_model="gemini flash"`, `effort="high"`, the correct `task_kind`, and `mode="plan"` or `mode="accept-edits"` plus the required implementation envelope.
 - Every Flash call is exactly one bounded work package. Never hand Flash an entire autonomous plan or let it select/continue to another package. For implementation, the sender must provide `work_package_id`, 1-5 exact `allowed_files`, explicit `acceptance_criteria`, and any package-specific `forbidden_actions`; Switchboard rejects an incomplete envelope.
-- Always route Flash through the `agy` CLI with Switchboard's mandatory `--json-schema` contract. Missing/malformed fields, scope violations, contradictory completion, ambiguity, failed checks, or unsupported intentional/by-design claims are failures to escalate, not answers to accept.
+- A Switchboard-launched Gemini Flash session is the non-authoritative worker for exactly its assigned envelope, never the brain or router. It must not dispatch agents, reinterpret the whole plan, or continue to another package.
+- Switchboard must invoke its internal `agy` backend with the mandatory `--output-format json --json-schema` contract. Missing/malformed fields, scope violations, contradictory completion, ambiguity, failed checks, or unsupported intentional/by-design claims are failures to escalate, not answers to accept.
 - Flash never receives `danger-full-access`, production SSH, live credentials, destructive operations, migrations, or live deployment. It may prepare bounded local changes and checks; the brain owns live deployment and approval.
 - If `agy` or Flash is missing, quota-limited, times out, mismatches the requested model, or otherwise fails, fall back to the host's native cheap roles (Codex `explorer`/`worker`; Claude `Explore`/`economy-worker`) and record the fallback.
 - Flash and native workers may run concurrently only on independent stages/packages. Read-only packages may run in parallel; writes run serially unless their files and state transitions are demonstrably isolated. The brain reviews evidence and actual diffs. A Flash completion is never acceptance: before dispatching another package, the brain independently inspects cited primary lines, the actual diff, and check output. Unsupported claims that a defect is intentional/by design keep the investigation open.
@@ -323,6 +340,27 @@ def _legacy_claude_role(name: str) -> Callable[[str], bool]:
         "Cost-efficient" in text
         or "Require an approved work package stating Route, exact model/effort" in text
     )
+
+
+def _legacy_gemini_pine_persona(text: str) -> bool:
+    """Recognize only the obsolete global persona previously shipped on this host."""
+    fingerprints = (
+        "Role: Production-grade Quant Dev for TradingView Pine Script v6",
+        "SECTION 1: SCOPE & BOUNDARIES",
+        "SECTION 7: OUTPUT REQUIREMENTS",
+    )
+    return all(item in text for item in fingerprints)
+
+
+def _near_legacy_gemini_pine_persona(text: str) -> bool:
+    fingerprints = (
+        "Role: Production-grade Quant Dev for TradingView Pine Script v6",
+        "SECTION 1: SCOPE & BOUNDARIES",
+        "SECTION 7: OUTPUT REQUIREMENTS",
+    )
+    return not _legacy_gemini_pine_persona(text) and sum(
+        item in text for item in fingerprints
+    ) >= 2
 
 
 def _merge_hook_event(data: dict, event: str, handler: dict, matcher: str | None) -> None:
@@ -491,6 +529,14 @@ def refresh(
             return {
                 "Codex global hierarchy": update_instruction_block(paths.codex_agents_md, body, backup, dry),
                 "Claude global hierarchy": update_instruction_block(paths.claude_md, body, backup, dry),
+                "Gemini global hierarchy": update_instruction_block(
+                    paths.gemini_md,
+                    body,
+                    backup,
+                    dry,
+                    replace_legacy=_legacy_gemini_pine_persona,
+                    reject_legacy_mismatch=_near_legacy_gemini_pine_persona,
+                ),
                 "Codex explorer role": write_codex_role(paths.codex_explorer, role_bodies["codex_explorer"], "explorer"),
                 "Codex worker role": write_codex_role(paths.codex_worker, role_bodies["codex_worker"], "worker"),
                 "Claude Explore role": write_managed_file(paths.claude_explore, role_bodies["claude_explore"], True, _legacy_claude_role("Explore"), backup, dry),
@@ -508,6 +554,7 @@ def uninstall(paths: HierarchyPaths, backup: BackupFn, dry: bool = False) -> dic
             return {
                 "Codex global hierarchy": remove_instruction_block(paths.codex_agents_md, backup, dry),
                 "Claude global hierarchy": remove_instruction_block(paths.claude_md, backup, dry),
+                "Gemini global hierarchy": remove_instruction_block(paths.gemini_md, backup, dry),
                 "Codex explorer role": remove_managed_file(paths.codex_explorer, backup, dry),
                 "Codex worker role": remove_managed_file(paths.codex_worker, backup, dry),
                 "Claude Explore role": remove_managed_file(paths.claude_explore, backup, dry),

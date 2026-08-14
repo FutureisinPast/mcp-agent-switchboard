@@ -471,6 +471,63 @@ class RoutingGateTests(unittest.TestCase):
         state = routing_gate._read_state("session-1")
         self.assertEqual(state["direct_labour_counts"], {"evidence": 1})
 
+    def test_direct_agy_shell_invocations_are_hard_denied_for_codex_and_claude(self):
+        commands = (
+            ("Bash", "agy --print 'inspect this'"),
+            ("PowerShell", "agy.exe --version"),
+            ("PowerShell", r"& 'C:\\Program Files\\Antigravity\\agy.exe' --print task"),
+            ("Bash", "git status && /usr/local/bin/agy --print task"),
+            ("Bash", "echo input | sudo agy --output-format json"),
+            ("PowerShell", 'Start-Process -FilePath "C:\\tools\\agy.exe" -ArgumentList "--print"'),
+        )
+        for host in ("codex", "claude"):
+            for index, (tool_name, command) in enumerate(commands):
+                with self.subTest(host=host, tool=tool_name, command=command):
+                    payload = self.pre_payload(
+                        f"direct-agy-{host}-{index}", tool_name=tool_name, host=host
+                    )
+                    payload["tool_input"] = {"command": command}
+                    result = routing_gate.pre_tool_use(payload)
+                    output = result["hookSpecificOutput"]
+                    self.assertEqual(output["permissionDecision"], "deny")
+                    self.assertIn("MCP route_agent_task", output["permissionDecisionReason"])
+                    self.assertIn('surface="cli"', output["permissionDecisionReason"])
+
+    def test_agy_prose_paths_and_switchboard_mcp_are_not_blocked(self):
+        non_invocations = (
+            "Write-Output 'Use agy --print for this example'",
+            r"Test-Path C:\\tools\\agy.exe",
+            r"Get-Item C:\\tools\\agy.exe",
+            "$tool = 'agy'; Write-Output $tool",
+            "python explain.py --example 'agy --print task'",
+            "Write-Output C:\\docs\\agy-notes.md",
+        )
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 20):
+            for index, command in enumerate(non_invocations):
+                with self.subTest(command=command):
+                    payload = self.pre_payload(
+                        f"agy-prose-{index}", tool_name="PowerShell", host="claude"
+                    )
+                    payload["tool_input"] = {"command": command}
+                    self.assertEqual(routing_gate.pre_tool_use(payload), {})
+
+        switchboard = self.pre_payload(
+            "switchboard-agy",
+            tool_name="mcp__agent_switchboard__route_agent_task",
+            host="claude",
+        )
+        switchboard["tool_input"] = {
+            "target_agent": "antigravity",
+            "surface": "cli",
+            "prompt": "bounded package",
+        }
+        self.assertEqual(routing_gate.pre_tool_use(switchboard), {})
+
+    def test_direct_agy_gate_does_not_apply_outside_host_hooks(self):
+        payload = self.pre_payload("backend-agy", tool_name="PowerShell", host="backend")
+        payload["tool_input"] = {"command": "agy --print internal-package"}
+        self.assertEqual(routing_gate.pre_tool_use(payload), {})
+
     def test_oversized_mcp_is_counted_once_by_pretool_before_posttool(self):
         payload = self.pre_payload("large-mcp", tool_name="mcp__market__research")
         payload["tool_response"] = "raw-evidence-" * 30

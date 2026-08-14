@@ -52,6 +52,14 @@ class HierarchyInstallTests(unittest.TestCase):
         self.paths.claude_md.write_text(
             "# Cost-aware model routing\n\nold Claude rules\n", encoding="utf-8"
         )
+        self.paths.gemini_md.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.gemini_md.write_text(
+            "# SECTION 1: SCOPE & BOUNDARIES\n"
+            "Role: Production-grade Quant Dev for TradingView Pine Script v6\n"
+            "legacy Pine-only global instructions\n"
+            "# SECTION 7: OUTPUT REQUIREMENTS\n",
+            encoding="utf-8",
+        )
         self.paths.codex_explorer.parent.mkdir(parents=True, exist_ok=True)
         self.paths.codex_explorer.write_text(
             'name = "explorer"\ndescription = "Cost-efficient old role"\n', encoding="utf-8"
@@ -164,6 +172,12 @@ class HierarchyInstallTests(unittest.TestCase):
         claude_text = self.paths.claude_md.read_text(encoding="utf-8")
         self.assertEqual(claude_text.count("agent-switchboard:cost-routing:begin"), 1)
         self.assertIn("gpt-next-sol", claude_text)
+        gemini_text = self.paths.gemini_md.read_text(encoding="utf-8")
+        self.assertEqual(gemini_text.count("agent-switchboard:cost-routing:begin"), 1)
+        self.assertNotIn("Production-grade Quant Dev", gemini_text)
+        self.assertIn("MUST call MCP `route_agent_task`", gemini_text)
+        self.assertIn("MUST NOT invoke `agy`", gemini_text)
+        self.assertIn("never the brain or router", gemini_text)
 
         self.assertIn('model = "gpt-next-luna"', self.paths.codex_explorer.read_text(encoding="utf-8"))
         self.assertIn('model = "gpt-next-terra"', self.paths.codex_worker.read_text(encoding="utf-8"))
@@ -288,12 +302,17 @@ class HierarchyInstallTests(unittest.TestCase):
         self.assertIn("retain final judgment", hierarchy_lower)
         self.assertIn("external antigravity flash lane", hierarchy_lower)
         self.assertIn("not a native child agent", hierarchy_lower)
-        self.assertIn("codex and claude brains should proactively consider", hierarchy_lower)
+        self.assertIn("codex, claude, and gemini brains should proactively consider", hierarchy_lower)
         self.assertIn("bounded search, reading, extraction, summaries, drafting", hierarchy_lower)
         self.assertIn("low-risk implementation/tests from an approved plan", hierarchy_lower)
+        self.assertIn("must call mcp `route_agent_task`", hierarchy_lower)
+        self.assertIn("must not invoke `agy`", hierarchy_lower)
+        self.assertIn("only the switchboard backend may start `agy`", hierarchy_lower)
+        self.assertIn("target_agent=\"antigravity\"", hierarchy_lower)
+        self.assertIn("surface=\"cli\"", hierarchy_lower)
         self.assertIn("every flash call is exactly one bounded work package", hierarchy_lower)
         self.assertIn("work_package_id", hierarchy_lower)
-        self.assertIn("mandatory `--json-schema` contract", hierarchy_lower)
+        self.assertIn("mandatory `--output-format json --json-schema` contract", hierarchy_lower)
         self.assertIn("never receives `danger-full-access`", hierarchy_lower)
         self.assertIn("production ssh", hierarchy_lower)
         self.assertIn("a flash completion is never acceptance", hierarchy_lower)
@@ -339,6 +358,7 @@ class HierarchyInstallTests(unittest.TestCase):
         before = {path: path.read_bytes() for path in (
             self.paths.codex_agents_md,
             self.paths.claude_md,
+            self.paths.gemini_md,
             self.paths.codex_explorer,
             self.paths.codex_worker,
             self.paths.claude_explore,
@@ -349,6 +369,33 @@ class HierarchyInstallTests(unittest.TestCase):
         second = self.refresh()
         self.assertTrue(all(value == "unchanged" for value in second.values()), second)
         self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_refresh_preserves_unrelated_gemini_content(self):
+        self.paths.gemini_md.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.gemini_md.write_text("# My Gemini rules\nkeep this\n", encoding="utf-8")
+
+        result = self.refresh()["Gemini global hierarchy"]
+
+        self.assertEqual(result, "updated")
+        text = self.paths.gemini_md.read_text(encoding="utf-8")
+        self.assertIn("# My Gemini rules\nkeep this", text)
+        self.assertEqual(text.count("agent-switchboard:cost-routing:begin"), 1)
+        self.assertIn(self.paths.gemini_md, self.backups)
+
+    def test_refresh_refuses_near_match_legacy_gemini_content(self):
+        self.paths.gemini_md.parent.mkdir(parents=True, exist_ok=True)
+        original = (
+            "SECTION 1: SCOPE & BOUNDARIES\n"
+            "- Role: Production-grade Quant Dev for TradingView Pine Script v6\n"
+            "SECTION 7 - OUTPUT REQUIREMENTS\n"
+        )
+        self.paths.gemini_md.write_text(original, encoding="utf-8")
+
+        result = self.refresh()["Gemini global hierarchy"]
+
+        self.assertTrue(result.startswith("ERROR: possible legacy"), result)
+        self.assertEqual(self.paths.gemini_md.read_text(encoding="utf-8"), original)
+        self.assertNotIn(self.paths.gemini_md, self.backups)
 
     def test_edited_managed_block_is_refused(self):
         self.seed_legacy_files()
@@ -429,6 +476,10 @@ class HierarchyInstallTests(unittest.TestCase):
         self.assertFalse(self.paths.codex_worker.exists())
         self.assertFalse(self.paths.claude_explore.exists())
         self.assertFalse(self.paths.claude_worker.exists())
+        self.assertNotIn(
+            "agent-switchboard:cost-routing:begin",
+            self.paths.gemini_md.read_text(encoding="utf-8"),
+        )
         settings = json.loads(self.paths.claude_settings.read_text(encoding="utf-8"))
         stop_commands = [
             item["command"]
