@@ -339,6 +339,12 @@ class RoutingContractStringsTests(unittest.TestCase):
         for task in ("bounded search", "reading", "extraction", "summaries", "drafting"):
             self.assertIn(task, text)
         self.assertIn("low-risk implementation/tests from an approved plan", text)
+        self.assertIn("every flash call is exactly one bounded work package", text)
+        self.assertIn("at most five allowed files", text)
+        self.assertIn("schema-enforced json", text)
+        self.assertIn("entire autonomous plan", text)
+        self.assertIn("flash never receives production ssh", text)
+        self.assertIn("independently inspects cited lines, the actual diff, and check output", text)
         for failure in ("missing", "quota-limited", "times out", "mismatches", "otherwise fails"):
             self.assertIn(failure, text)
         self.assertIn("codex explorer/worker", text)

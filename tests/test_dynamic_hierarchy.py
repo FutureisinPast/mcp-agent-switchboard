@@ -183,6 +183,162 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
         self.assertEqual(read_args["mode"], "plan")
         self.assertEqual(write_args["mode"], "accept-edits")
         self.assertIn("approved isolated package", write_args["prompt"])
+        self.assertEqual(write_args["work_package_id"], "WP-1")
+        self.assertLessEqual(len(write_args["allowed_files"]), broker.FLASH_WORKHORSE_MAX_ALLOWED_FILES)
+        self.assertTrue(write_args["acceptance_criteria"])
+        self.assertIn("one work package per call", " ".join(policy["hard_requirements"]))
+        self.assertIn("schema-enforced JSON", " ".join(policy["hard_requirements"]))
+
+    @staticmethod
+    def _flash_package() -> dict:
+        return broker.prepare_flash_work_package(
+            {
+                "work_package_id": "WP-TEST",
+                "allowed_files": ["src/worker.py", "tests/test_worker.py"],
+                "acceptance_criteria": ["Focused tests pass."],
+            },
+            "implementation",
+            "Implement the approved bounded change.",
+        )
+
+    @staticmethod
+    def _flash_output(package_id: str, **overrides) -> dict:
+        structured = {
+            "package_id": package_id,
+            "status": "completed",
+            "summary": "Implemented the bounded package.",
+            "acceptance_criteria": [
+                {"criterion": "Focused tests pass.", "status": "passed", "evidence": ["pytest: passed"]}
+            ],
+            "files_changed": [{"path": "src/worker.py", "change": "Applied bounded fix."}],
+            "checks": [
+                {"command": "pytest tests/test_worker.py", "status": "passed", "exit_code": 0, "output_excerpt": "1 passed"}
+            ],
+            "evidence": [
+                {"claim": "Change is present", "path": "src/worker.py", "line": "12", "observation": "Guard added."}
+            ],
+            "claims": [
+                {"statement": "Guard is present.", "basis": "observed", "evidence": ["src/worker.py:12"]}
+            ],
+            "ambiguities": [],
+            "risks": [],
+            "next_action": "Brain verifies diff and test output.",
+            "brain_verification_required": "required",
+        }
+        structured.update(overrides)
+        return {
+            "conversation_id": "conv-1",
+            "status": "SUCCESS",
+            "structured_output": structured,
+            "duration_seconds": 2.5,
+            "num_turns": 1,
+            "usage": {"total_tokens": 100},
+        }
+
+    def test_flash_implementation_requires_a_bounded_envelope(self):
+        with self.assertRaisesRegex(ValueError, "work_package_id"):
+            broker.prepare_flash_work_package({}, "implementation", "Implement everything.")
+        with self.assertRaisesRegex(ValueError, "1-5 allowed_files"):
+            broker.prepare_flash_work_package(
+                {"work_package_id": "WP-X", "acceptance_criteria": ["tests pass"]},
+                "implementation",
+                "Implement everything.",
+            )
+        with self.assertRaisesRegex(ValueError, "acceptance_criteria"):
+            broker.prepare_flash_work_package(
+                {"work_package_id": "WP-X", "allowed_files": ["src/x.py"]},
+                "implementation",
+                "Implement everything.",
+            )
+
+    def test_agy_cli_always_uses_schema_and_returns_validated_structure(self):
+        package = self._flash_package()
+        stdout = json.dumps(self._flash_output(package["package_id"]))
+        with mock.patch.object(broker, "load_config", return_value={}), \
+             mock.patch.object(broker, "discover_antigravity_cli", return_value="agy"), \
+             mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
+             mock.patch.object(broker, "run_process", return_value=(0, stdout, "")) as run:
+            response = broker.consult_antigravity_cli(
+                "p", "bounded prompt", "accept-edits", "gemini-3.7-flash-high", "high", 60, package
+            )
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--output-format") + 1], "json")
+        schema = json.loads(command[command.index("--json-schema") + 1])
+        self.assertIn("brain_verification_required", schema["required"])
+        self.assertEqual(schema["properties"]["package_id"]["enum"], ["WP-TEST"])
+        self.assertNotIn("--dangerously-skip-permissions", command)
+        parsed = json.loads(response)
+        self.assertEqual(parsed["worker_status"], "completed")
+        self.assertEqual(parsed["structured_output"]["package_id"], "WP-TEST")
+
+    def test_flash_danger_full_access_is_rejected_before_agy_starts(self):
+        package = self._flash_package()
+        with mock.patch.object(broker, "load_config", return_value={}), \
+             mock.patch.object(broker, "discover_antigravity_cli", return_value="agy"), \
+             mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
+             mock.patch.object(broker, "run_process") as run:
+            response = broker.consult_antigravity_cli(
+                "p", "deploy everything", "danger-full-access", "gemini-3.7-flash-high", "high", 60, package
+            )
+        self.assertTrue(response.startswith("Antigravity CLI Flash safety policy rejected"))
+        run.assert_not_called()
+
+    def test_direct_accept_edits_cannot_bypass_the_package_envelope(self):
+        with mock.patch.object(broker, "load_config", return_value={}), \
+             mock.patch.object(broker, "discover_antigravity_cli", return_value="agy"), \
+             mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
+             mock.patch.object(broker, "run_process") as run:
+            with self.assertRaisesRegex(ValueError, "work_package_id"):
+                broker.consult_antigravity_cli(
+                    "p", "edit the project", "accept-edits", "gemini-3.7-flash-high", "high", 60
+                )
+        run.assert_not_called()
+
+    def test_flash_validation_rejects_contradiction_scope_and_design_rationalization(self):
+        package = self._flash_package()
+        outer = self._flash_output(
+            package["package_id"],
+            ambiguities=["Plan does not specify retry semantics."],
+            files_changed=[{"path": "src/outside.py", "change": "Expanded scope."}],
+            acceptance_criteria=[{"criterion": "A different easier criterion.", "status": "passed", "evidence": []}],
+            claims=[{"statement": "The duplicate query is intentional by design.", "basis": "assumption", "evidence": []}],
+        )
+        _, errors = broker.validate_flash_workhorse_result(outer, package)
+        joined = " | ".join(errors)
+        self.assertIn("completed contradicts non-empty ambiguities", joined)
+        self.assertIn("out-of-scope file reported", joined)
+        self.assertIn("acceptance criteria do not exactly match", joined)
+        self.assertIn("intentional/by-design claim lacks observed primary evidence", joined)
+
+    def test_consult_marks_flash_completion_pending_brain_verification(self):
+        package = self._flash_package()
+        normalized = json.dumps(
+            {
+                "package_id": package["package_id"],
+                "worker_status": "completed",
+                "structured_output": self._flash_output(package["package_id"])["structured_output"],
+                "cli": {},
+            }
+        )
+        args = {
+            "prompt": "Implement the approved bounded change.",
+            "task_kind": "implementation",
+            "mode": "accept-edits",
+            "target_model": "gemini-3.7-flash-high",
+            "effort": "high",
+            "work_package_id": package["package_id"],
+            "allowed_files": package["allowed_files"],
+            "acceptance_criteria": package["acceptance_criteria"],
+        }
+        with mock.patch.object(broker, "load_config", return_value={"compact_task_contract": False}), \
+             mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
+             mock.patch.object(broker, "consult_antigravity_cli", return_value=normalized), \
+             mock.patch.object(broker, "store_consultation"):
+            result = broker.consult("antigravity", args)
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["brain_verification"]["status"], "pending")
+        self.assertTrue(result["structured_output_enforced"])
 
 
 class ClaudeFrontierFallbackTests(unittest.TestCase):
