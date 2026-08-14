@@ -320,6 +320,38 @@ class RoutingContractStringsTests(unittest.TestCase):
         self.assertIn("planned and unplanned packages", text)
         self.assertIn("direct-brain-labour:", text)
 
+    def test_global_rules_never_promote_flash_to_peer_brain(self):
+        text = " ".join(broker.COST_AWARE_ROUTING_RULES).lower()
+        self.assertIn("capability tier outranks model version", text)
+        self.assertIn("gemini flash high is a useful, non-authoritative workhorse-level adviser", text)
+        self.assertIn("does not promote it above sol/fable", text)
+        self.assertIn("quota, reachability, entitlement", text)
+        self.assertIn("codex brain should request a second opinion", text)
+        self.assertIn("newest live flash high", text)
+        self.assertIn("label it degraded advisory fallback", text)
+        self.assertIn("retain final judgment", text)
+
+    def test_global_rules_define_proactive_external_flash_workhorse_lane(self):
+        text = " ".join(broker.COST_AWARE_ROUTING_RULES).lower()
+        self.assertIn("external antigravity flash workhorse lane", text)
+        self.assertIn("flash is not a native child agent", text)
+        self.assertIn("codex and claude brains should proactively consider", text)
+        for task in ("bounded search", "reading", "extraction", "summaries", "drafting"):
+            self.assertIn(task, text)
+        self.assertIn("low-risk implementation/tests from an approved plan", text)
+        for failure in ("missing", "quota-limited", "times out", "mismatches", "otherwise fails"):
+            self.assertIn(failure, text)
+        self.assertIn("codex explorer/worker", text)
+        self.assertIn("claude explore/economy-worker", text)
+        self.assertIn("record the fallback", text)
+        self.assertIn("concurrently only on independent stages/packages", text)
+        self.assertIn("writes run serially unless", text)
+        self.assertIn("brain reviews evidence and actual diffs", text)
+        self.assertNotIn(
+            "agent switchboard is only for opposite-vendor consultation",
+            text,
+        )
+
     def test_contracts_require_bounded_pretooluse_relief_and_return_cap(self):
         implementation = " ".join(broker.TASK_CONTRACTS["implementation"]).lower()
         global_rules = " ".join(broker.COST_AWARE_ROUTING_RULES).lower()

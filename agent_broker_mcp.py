@@ -149,6 +149,8 @@ CODEX_CHEAP_MODEL = "gpt-5.6-luna"
 CLAUDE_FLAGSHIP_MODEL = "fable"
 CLAUDE_BALANCED_MODEL = "sonnet"
 CLAUDE_CHEAP_MODEL = "haiku"
+# Used only when the live ``agy models`` catalog is unavailable or advertises no
+# stable Gemini Flash High slug. Online defaults are selected numerically below.
 ANTIGRAVITY_DEFAULT_MODEL = "gemini-3.6-flash-high"
 CODEX_DEFAULT_EFFORT = "max"
 # Consults/plans default to the flagship (gpt-5.6-sol) at max — quality is the priority.
@@ -177,8 +179,6 @@ CODEX_SERIOUS_TASK_KINDS = {
 }
 
 MODEL_ALIASES = {
-    "gemini flash": "Gemini 3.6 Flash (High)",
-    "gemini flash high": "Gemini 3.6 Flash (High)",
     "gemini 3.6 flash": "Gemini 3.6 Flash (High)",
     "gemini 3.6 flash high": "Gemini 3.6 Flash (High)",
     "gemini 3.6 high": "Gemini 3.6 Flash (High)",
@@ -223,12 +223,15 @@ GENERIC_MODEL_REQUESTS = {
     "claude",
     "anthropic",
     "gemini",
+    "gemini flash",
+    "gemini flash high",
+    "flash high",
     "antigravity",
 }
 
 # Default CLI model per family. Codex and Claude use their highest-quality
-# defaults; Antigravity uses the current fast implementation default and still
-# honors any explicitly named model from the live CLI catalog.
+# defaults. Antigravity's entry is an offline fallback; its live workhorse is
+# selected dynamically from the advertised stable Flash High slugs.
 FAMILY_FLAGSHIP = {
     "codex": CODEX_FLAGSHIP_MODEL,
     "claude": CLAUDE_FLAGSHIP_MODEL,
@@ -551,13 +554,16 @@ GENERIC_GROUND_RULES = [
 COST_AWARE_ROUTING_RULES = [
     "The model selected for the main session is the brain; never rewrite that user choice. It owns requirements, architecture, planning, hard diagnosis, risk decisions, and final signoff.",
     "For non-trivial planning or a hard issue, obtain one opposite-vendor maximum-effort consultation: Codex brain -> moving Claude Fable alias (Opus only when Fable is explicitly unavailable); Claude brain -> the live Codex frontier at its highest single-agent effort.",
-    "Native first: same-vendor labour uses the host's managed native subagents (Codex explorer/worker; Claude Explore/economy-worker). Agent Switchboard is only for opposite-vendor consultation or an explicitly documented native-unavailable fallback.",
+    "Capability tier outranks model version. Gemini Flash High is a useful, non-authoritative workhorse-level adviser; a higher version does not promote it above Sol/Fable or make its advice automatically authoritative. When Claude's Fable -> Opus chain is unavailable because of quota, reachability, entitlement, or another availability failure, a Codex brain should request a second opinion from the newest live Flash High, label it degraded advisory fallback, and retain final judgment.",
+    "Native first: same-vendor labour uses the host's managed native subagents (Codex explorer/worker; Claude Explore/economy-worker). Agent Switchboard is reserved for opposite-vendor consultation, the external Antigravity Flash workhorse lane, or an explicitly documented native-unavailable fallback; Flash is not a native child agent.",
+    "Codex and Claude brains should proactively consider the newest live Antigravity Gemini Flash High through Agent Switchboard/agy as a fast, cheap external workhorse for bounded search, reading, extraction, summaries, drafting, low-risk implementation/tests from an approved plan, and independent parallel packages.",
+    "If agy or Flash is missing, quota-limited, times out, mismatches the requested model, or otherwise fails, fall back to the host's native cheap roles (Codex explorer/worker; Claude Explore/economy-worker) and record the fallback.",
     "Classify risk and difficulty at every work-package boundary. Reader/low handles bounded reading, search, extraction, and formatting; workhorse/medium handles routine writing, light implementation, tests, scripts, and reversible deployment from an approved plan.",
     "Portable packages state Lane | mechanism | exact resolved model/effort | deliverable | verification | escalation. Imported foreign-vendor reader/workhorse routes are re-resolved to the executor's current same-vendor native role at execution start.",
     "A worker follows the resolved package. A retained package uses `override: brain - <WP-ID>: <specific reason>` in the Routing audit; bare/global overrides are invalid.",
     "A worker must stop and escalate on security, authentication, payments, destructive operations, schema or data migrations, plan deviation, ambiguous requirements, or failed verification.",
     "On the first ambiguity or failed fix, the item returns to the brain immediately; the brain resolves it and re-delegates only the remaining deterministic work, instead of letting the worker improvise past the blocker.",
-    "Default execution order: read-only work packages run in parallel, write/edit work packages run serially, unless the plan explicitly overrides this.",
+    "Flash and native workers may run concurrently only on independent stages/packages. Read-only packages may run in parallel; writes run serially unless their files and state transitions are demonstrably isolated. The brain reviews evidence and actual diffs and owns the final decision.",
     "A dirty worktree or same-session ownership never excuses keeping read-only inventory, tests, evidence, docs, or isolated mechanical work on the brain; only the exact overlapping write or high-risk state transition may be retained.",
     "The installed native-first PreToolUse gate allows ten direct brain labour calls, then denies the next eligible labour call until a managed same-vendor reader/workhorse starts or the brain registers the exact package/reason with the local routing-override command supplied by the gate. Each relief opens only the next bounded block; registered overrides must appear in the final audit.",
     "Brain-context ingress defaults to at most 8,000 characters (roughly 1-2k tokens). Verification calls declare a field projection and output cap; oversized raw evidence stays outside context with its query and location.",
@@ -2323,7 +2329,7 @@ def antigravity_model_entry_from_slug(slug: str, source: str = "antigravity-cli"
     display = model_id
     aliases = [model_id, model_id.replace("-", " ")]
 
-    gemini_match = re.fullmatch(r"gemini-([0-9]+(?:\.[0-9]+)?)-(flash|pro)", base, re.I)
+    gemini_match = re.fullmatch(r"gemini-([0-9]+(?:\.[0-9]+)*)-(flash|pro)", base, re.I)
     claude_match = re.fullmatch(r"claude-(sonnet|opus)-([0-9]+)-([0-9]+)(-thinking)?", base, re.I)
     if gemini_match:
         version, tier = gemini_match.groups()
@@ -2354,6 +2360,66 @@ def antigravity_model_entry_from_slug(slug: str, source: str = "antigravity-cli"
             display += f" ({effort.title()})"
         aliases.extend(["gpt oss 120b", "gpt-oss 120b"])
     return model_entry(model_id, display, list(dict.fromkeys(aliases)), source)
+
+
+_STABLE_GEMINI_FLASH_HIGH_SLUG = re.compile(
+    r"gemini-([0-9]+(?:\.[0-9]+)*)-flash-high", re.I
+)
+
+
+def antigravity_roles_from_models(models: list[dict[str, Any]]) -> dict[str, Any]:
+    """Select the newest stable Flash High workhorse advertised by ``agy``.
+
+    Numeric version segments are compared as integers, so 3.10 sorts after 3.9.
+    Nonconforming/preview slugs and static/config entries cannot auto-promote.
+    """
+    live: list[tuple[tuple[int, ...], dict[str, Any]]] = []
+    for item in models:
+        if item.get("source") != "antigravity-cli":
+            continue
+        match = _STABLE_GEMINI_FLASH_HIGH_SLUG.fullmatch(str(item.get("id") or ""))
+        if match:
+            live.append((tuple(int(part) for part in match.group(1).split(".")), item))
+    selected = max(live, key=lambda candidate: candidate[0])[1] if live else None
+    workhorse = selected or next(
+        (
+            item
+            for item in models
+            if normalize_lookup(item.get("id")) == normalize_lookup(ANTIGRAVITY_DEFAULT_MODEL)
+        ),
+        model_entry(ANTIGRAVITY_DEFAULT_MODEL, "Gemini 3.6 Flash (High)", source="offline-fallback"),
+    )
+    return {
+        "frontier": None,
+        "workhorse": workhorse,
+        "authoritative": False,
+        "peer_brain_eligible": False,
+        "capability_tier": "workhorse",
+        "source": "antigravity-cli" if selected else "offline-fallback",
+        "rule": (
+            "Gemini Flash High is a useful, non-authoritative external workhorse for Codex/Claude "
+            "brains to consider proactively; it is not a native child agent. A higher version does "
+            "not promote it above Sol/Fable. On agy/model absence, quota, timeout, mismatch, or "
+            "failure, use the host native cheap reader/workhorse and record the fallback. The main "
+            "frontier brain reviews evidence/diffs and retains judgment."
+        ),
+    }
+
+
+def current_antigravity_workhorse_model() -> str:
+    role = antigravity_roles_from_models(discover_antigravity_models()).get("workhorse") or {}
+    return str(role.get("id") or ANTIGRAVITY_DEFAULT_MODEL)
+
+
+def antigravity_model_slugs_from_output(output: Any) -> list[str]:
+    """Parse both legacy slug-only and current ``slug<TAB>display`` output."""
+    slugs: list[str] = []
+    for line in str(output or "").splitlines():
+        fields = line.strip().split(maxsplit=1)
+        slug = fields[0] if fields else ""
+        if slug and re.fullmatch(r"[a-z0-9][a-z0-9.-]*", slug):
+            slugs.append(slug)
+    return slugs
 
 
 _ANTIGRAVITY_MODEL_CACHE: list[dict[str, Any]] | None = None
@@ -2408,10 +2474,8 @@ def discover_antigravity_models() -> list[dict[str, Any]]:
                 creationflags=WINDOWS_NO_WINDOW,
             )
             if proc.returncode == 0:
-                for line in proc.stdout.splitlines():
-                    slug = line.strip()
-                    if slug and re.fullmatch(r"[a-z0-9][a-z0-9.-]*", slug):
-                        models.append(antigravity_model_entry_from_slug(slug))
+                for slug in antigravity_model_slugs_from_output(proc.stdout):
+                    models.append(antigravity_model_entry_from_slug(slug))
             else:
                 log(f"agy models exited {proc.returncode}: {proc.stderr[:500]}")
         except Exception as exc:  # noqa: BLE001
@@ -2428,13 +2492,17 @@ def discover_antigravity_models() -> list[dict[str, Any]]:
                 display = str(item).strip()
                 if not any(normalize_lookup(existing.get("display")) == normalize_lookup(display) for existing in models):
                     models.append(model_entry(display, display, [display], "antigravity-cdp"))
-    seen: set[str] = set()
+    seen: dict[str, int] = {}
     result: list[dict[str, Any]] = []
     for item in models:
         key = normalize_lookup(item.get("id"))
         if key and key not in seen:
-            seen.add(key)
+            seen[key] = len(result)
             result.append(item)
+        elif key and item.get("source") == "antigravity-cli":
+            # The advertised entry outranks an identical static fallback so role
+            # selection can distinguish an online 3.6 catalog from offline mode.
+            result[seen[key]] = item
     _ANTIGRAVITY_MODEL_CACHE = [dict(item) for item in result]
     _ANTIGRAVITY_MODEL_CACHE_AT = time.monotonic()
     return result
@@ -2513,6 +2581,8 @@ def list_agent_models(agent: str | None = None, project: str | None = None, topi
             family_catalog["roles"] = codex_roles_from_models(models)
         elif family == "claude":
             family_catalog["roles"] = model_roles.select_claude_roles()
+        elif family == "antigravity":
+            family_catalog["roles"] = antigravity_roles_from_models(models)
         catalogs[family] = family_catalog
     defaults = get_model_defaults(project, topic) if project or topic else {"items": []}
     return {"agent": agent or "all", "catalogs": catalogs, "defaults": defaults.get("items", [])}
@@ -2526,10 +2596,18 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
     codex_frontier = str((codex_roles.get("frontier") or {}).get("id") or CODEX_FLAGSHIP_MODEL)
     codex_workhorse = str((codex_roles.get("workhorse") or {}).get("id") or CODEX_BALANCED_MODEL)
     codex_reader = str((codex_roles.get("reader") or {}).get("id") or CODEX_CHEAP_MODEL)
+    antigravity_catalog = catalog.get("catalogs", {}).get("antigravity", {})
+    antigravity_roles = antigravity_catalog.get("roles") or antigravity_roles_from_models(
+        discover_antigravity_models()
+    )
+    antigravity_workhorse = str(
+        (antigravity_roles.get("workhorse") or {}).get("id") or ANTIGRAVITY_DEFAULT_MODEL
+    )
     guide: dict[str, Any] = {
         "purpose": "Use this before routing if you are unsure which model/effort to request.",
         "execution_precedence": [
             "Same-vendor bounded labour uses native subagents first: Codex explorer/worker or Claude Explore/economy-worker.",
+            "Proactively consider the newest live Antigravity Gemini Flash High through Agent Switchboard/agy as a fast, cheap external workhorse; it is not a native child agent.",
             "Use Agent Switchboard for opposite-vendor maximum-effort consultation.",
             "Use a same-vendor broker worker only when the named native role is unavailable or failed to start, and record the fallback.",
         ],
@@ -2571,10 +2649,24 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
             },
             "antigravity_cli": {
                 "target_agent": "antigravity",
-                "target_model": ANTIGRAVITY_DEFAULT_MODEL,
+                "target_model": antigravity_workhorse,
                 "effort": "high",
                 "surface": "cli",
-                "rule": "Antigravity routes through the agy CLI by default. Name a live model explicitly when requested; use surface='extension' or 'inbox' only for the in-app bridge.",
+                "role": "workhorse",
+                "authoritative": False,
+                "peer_brain_eligible": False,
+                "native_child_agent": False,
+                "recommended_for": [
+                    "bounded search/read/extraction/summaries/drafting",
+                    "low-risk implementation/tests from an approved plan",
+                    "independent parallel stages/packages",
+                ],
+                "failure_fallback": {
+                    "codex": ["explorer", "worker"],
+                    "claude": ["Explore", "economy-worker"],
+                    "record_fallback": True,
+                },
+                "rule": "Antigravity routes through agy using the newest stable numeric Gemini Flash High advertised live. Codex and Claude brains should proactively consider it as a fast, cheap external workhorse, not a native child agent. Flash remains non-authoritative: version does not promote it above Sol/Fable or make it automatically authoritative. If agy/Flash is missing, quota-limited, times out, mismatches, or fails, use the host's native cheap reader/workhorse and record the fallback. Flash and native workers may run concurrently only on independent packages; reads may be parallel, while writes are serial unless demonstrably isolated. The brain reviews evidence/diffs and owns the final decision. Explicit version pins remain exact.",
             },
         },
         "caller_examples": {
@@ -2617,17 +2709,38 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                 },
                 "broker_resolves_to": {"target_model": CLAUDE_BALANCED_MODEL, "effort": CLAUDE_BALANCED_EFFORT},
             },
-            "antigravity_implementation": {
+            "antigravity_external_read": {
                 "tool": "route_agent_task",
                 "args": {
                     "target_agent": "antigravity",
-                    "target_model": "flash high 3.6",
-                    "task_kind": "implementation",
-                    "prompt": "Implement the requested change and run focused checks.",
+                    "surface": "cli",
+                    "target_model": "gemini flash",
+                    "effort": "high",
+                    "mode": "plan",
+                    "task_kind": "quick_check",
+                    "prompt": "Read the bounded scope and return concise evidence.",
                 },
                 "broker_resolves_to": {
                     "route": "antigravity_cli",
-                    "target_model": "gemini-3.6-flash-high",
+                    "target_model": antigravity_workhorse,
+                    "effort": "high",
+                    "mode": "plan",
+                },
+            },
+            "antigravity_external_implementation": {
+                "tool": "route_agent_task",
+                "args": {
+                    "target_agent": "antigravity",
+                    "surface": "cli",
+                    "target_model": "gemini flash",
+                    "effort": "high",
+                    "mode": "accept-edits",
+                    "task_kind": "implementation",
+                    "prompt": "Implement the approved isolated package and run focused checks.",
+                },
+                "broker_resolves_to": {
+                    "route": "antigravity_cli",
+                    "target_model": antigravity_workhorse,
                     "effort": "high",
                     "mode": "accept-edits",
                 },
@@ -2636,6 +2749,11 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
         "notes": [
             "Use target_model for the model slug only; put reasoning in effort.",
             "Antigravity CLI models are discovered live with `agy models`; newly released models become routable without changing the static catalog.",
+            "The newest exact stable gemini-<numeric>-flash-high slug is the Antigravity workhorse; numeric version order never promotes previews or renamed/nonconforming SKUs.",
+            "Capability tier outranks version: Gemini Flash is useful non-authoritative workhorse-level advice, and a higher version does not promote it above Sol/Fable or make it automatically authoritative. If Claude's Fable -> Opus chain is unavailable because of quota, reachability, entitlement, or another availability failure, Codex should request a second opinion from the newest live Flash High, label it degraded advisory fallback, and retain final judgment.",
+            "Both Codex and Claude brains should proactively consider newest live Flash High for bounded external workhorse labour; this does not make Flash a native child agent.",
+            "If agy/Flash is missing, quota-limited, times out, mismatches, or fails, use the host native explorer/worker or Explore/economy-worker and record the fallback.",
+            "Flash and native workers may run concurrently only for independent stages/packages: parallel reads are allowed, while writes are serial unless demonstrably isolated; the brain reviews evidence/diffs and owns the final decision.",
             "An automatic Antigravity route falls back to the in-app bridge if agy is missing. An explicit surface='cli' reports a missing CLI instead of silently changing surfaces.",
             "For a serious live-frontier Codex consult/audit/review/debate, a lower effort is allowed only when the caller explicitly marks the downshift with a cost policy or says lower effort is enough.",
             "Claude family aliases move with Claude Code: Fable/max is the peer brain, Opus/max is the availability fallback, Haiku is the reader, and Sonnet/medium is the workhorse.",
@@ -2867,13 +2985,19 @@ def model_guard_text(requested_label: Any, *, strict: bool) -> str:
 
 
 def match_model_request(family: str, requested_model: Any) -> dict[str, Any]:
+    requested_text = str(requested_model or "").strip()
+    # Preserve an empty/bare Antigravity request as generic. normalize_model_name
+    # uses a UI-facing "current selected model" label for empty values, which must
+    # not turn a CLI-default request into a model-selection prompt.
+    if not requested_text or normalize_lookup(requested_text) in GENERIC_MODEL_REQUESTS:
+        return {"status": "generic", "requested": requested_text}
     # Only the Antigravity catalog uses the Antigravity display-name aliases.
     # Applying them to Claude/Codex/Gemini turns "opus" into "Claude Opus 4.6
     # (Thinking)" and breaks CLI alias matching, so use the raw text there.
     if family == "antigravity":
-        raw = normalize_model_name(requested_model)
+        raw = normalize_model_name(requested_text)
     else:
-        raw = str(requested_model or "").strip()
+        raw = requested_text
     lookup = normalize_lookup(raw)
     if lookup in GENERIC_MODEL_REQUESTS:
         return {"status": "generic", "requested": raw}
@@ -2950,13 +3074,19 @@ def split_model_and_effort(raw: Any) -> tuple[str, str | None]:
 def family_frontier_model(family: str) -> str | None:
     if family == "codex":
         return current_codex_role_model("frontier")
+    if family == "antigravity":
+        # Antigravity has no frontier-brain role. Generic requests use its moving
+        # Flash High workhorse; the historical function name is retained for API
+        # compatibility with the shared CLI resolver.
+        return current_antigravity_workhorse_model()
     return FAMILY_FLAGSHIP.get(family)
 
 
 def pick_cli_model(family: str, model_text: Any) -> str | None:
     """Resolve an (effort-stripped) model request for a CLI family. Generic/empty ->
-    the family flagship (most capable). A named model resolves to its catalog id; an
-    unmatched name passes through unchanged so brand-new CLI models still work."""
+    the family default (frontier for Codex/Claude, workhorse for Antigravity). A named
+    model resolves to its catalog id; an unmatched name passes through unchanged so
+    brand-new CLI models still work."""
     text = str(model_text or "").strip()
     if not text or normalize_lookup(text) in GENERIC_MODEL_REQUESTS:
         return family_frontier_model(family)
@@ -3208,9 +3338,9 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
             if effort_policy:
                 result["effort_policy"] = effort_policy
             return result
-        # No explicit pin: default to the family flagship at highest effort instead of
-        # interrupting to ask. Families with no flagship (antigravity / gemini) still ask.
-        flagship = FAMILY_FLAGSHIP.get(family)
+        # No explicit pin: default to the family's moving default instead of
+        # interrupting to ask. Antigravity's moving default is a workhorse, not a brain.
+        flagship = family_frontier_model(family)
         if flagship is not None:
             flagship = (
                 antigravity_model_for_effort(flagship, resolved_effort)
@@ -3229,7 +3359,7 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
                 "target_agent": default_target_agent_for_family(family),
                 "target_model": flagship,
                 "effort": final_effort,
-                "source": "family_flagship",
+                "source": "family_workhorse" if family == "antigravity" else "family_flagship",
             }
             if model_policy:
                 result["model_policy"] = model_policy
@@ -7757,7 +7887,7 @@ TOOLS = [
     },
     {
         "name": "consult_antigravity",
-        "description": "Ask Antigravity through the standalone agy CLI. Defaults to Gemini 3.6 Flash High in plan/sandbox mode and returns stdout directly. Name any model from list_agent_models; live agy model discovery makes newly released model slugs available without a broker update. Use route_agent_task with surface='extension' or surface='inbox' for the in-app bridge instead.",
+        "description": "Use the standalone agy CLI for the newest live stable Gemini Flash High. Codex and Claude brains should proactively consider this fast, cheap external workhorse (not a native child agent) for bounded reading/search/extraction/summaries/drafting and approved low-risk isolated implementation/tests. Flash is non-authoritative; the brain reviews evidence/diffs and decides. If agy/Flash is missing, quota-limited, times out, mismatches, or fails, use the host native reader/workhorse and record fallback. The CLI defaults to plan/sandbox; name an exact model to pin it.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -7774,7 +7904,7 @@ TOOLS = [
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
-                "target_model": {"type": "string", "description": "Model name or stable agy slug, e.g. 'flash high 3.6' or 'gemini-3.6-flash-high'."},
+                "target_model": {"type": "string", "description": "Model name or stable agy slug. Omit it or use 'gemini flash' for the moving Flash High workhorse; use a versioned gemini-<version>-flash-high slug for an exact pin."},
                 "effort": {"type": "string", "description": "Antigravity reasoning effort: low|medium|high. Explicit effort selects the matching live model variant when available."},
                 "timeout_seconds": {"type": "integer", "minimum": 15, "maximum": 240},
             },
@@ -7834,14 +7964,14 @@ TOOLS = [
     },
     {
         "name": "route_agent_task",
-        "description": "Route a task to Antigravity, Codex, Claude, or Gemini. CLI-FIRST DEFAULTS: Codex, Claude, and Antigravity use their headless CLIs unless a surface is explicitly requested. Bare Antigravity defaults to Gemini 3.6 Flash High; a request such as target_model='flash high 3.6' resolves to the stable agy slug. Live agy model discovery exposes future models when installed. Pass surface='extension' or surface='inbox' (or use_inbox=true) for the Antigravity in-app bridge, or surface='app' for visible-app delivery. If agy is missing, an automatic Antigravity route falls back to the bridge/inbox. Name target_model for a specific model and keep effort in the effort field. KEEP prompt SHORT: let the receiver read project files/work-memory and use context refs for large unique data.",
+        "description": "Route a task to Antigravity, Codex, Claude, or Gemini. Codex/Claude brains should proactively consider target_agent='antigravity', surface='cli', target_model='gemini flash', effort='high' as a fast, cheap external workhorse lane: mode='plan' for bounded read-only work or mode='accept-edits' only for approved isolated low-risk implementation/tests. Flash is not a native child agent and remains non-authoritative. Use Flash and native workers concurrently only for independent packages; parallel reads, serial or demonstrably isolated writes. On agy/model absence, quota, timeout, mismatch, or failure, use the host native cheap reader/workhorse and record fallback. Explicit version pins remain exact; the brain reviews evidence/diffs and decides. KEEP prompt SHORT.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": {"type": "string"},
                 "topic": {"type": "string"},
                 "target_agent": {"type": "string"},
-                "target_model": {"type": "string", "description": "Model only (e.g. 'opus', 'gpt-5.6-sol', 'flash high 3.6', 'gemini-3.6-flash-high'). Bare Codex/Claude/Antigravity requests resolve to their family defaults. Keep reasoning effort in the effort field."},
+                "target_model": {"type": "string", "description": "Model only (e.g. 'opus', 'gpt-5.6-sol', or 'gemini flash'). Bare Antigravity/'gemini flash' moves to the latest stable Flash High; a versioned agy slug pins exactly. Keep reasoning effort in the effort field."},
                 "effort": {"type": "string", "description": "Reasoning effort for CLI surfaces. Codex: minimal|low|medium|high|xhigh|max; Claude: low|medium|high|xhigh|max; Antigravity: low|medium|high."},
                 "target_host": {
                     "type": "string",
@@ -7893,7 +8023,7 @@ TOOLS = [
     },
     {
         "name": "list_agent_models",
-        "description": "List available/detected models for Codex, Claude Code, and Antigravity, including topic defaults.",
+        "description": "List detected models, defaults, and roles. Antigravity Gemini Flash is a non-authoritative external workhorse for proactive bounded labour, not a native child agent or frontier role.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -7905,7 +8035,7 @@ TOOLS = [
     },
     {
         "name": "get_model_routing_guide",
-        "description": "Explain the broker's brain/worker model policy and return the model catalog. Serious consults use Sol/max or Fable/max; explicit cheap_read uses Luna/low or Haiku; balanced uses Terra/medium or Sonnet/medium.",
+        "description": "Explain frontier, native worker, and proactive external Antigravity Flash routing. Includes failure fallback, concurrency/write-isolation rules, exact route_agent_task examples, and the live model catalog.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -8427,11 +8557,11 @@ PUBLIC_TOOL_NAMES = CLAUDE_LITE_TOOL_NAMES | {
 
 TOOL_DESCRIPTION_OVERRIDES = {
     "route_agent_task": (
-        "Route a task to Antigravity, Codex, Claude, or Gemini. CLI-FIRST: bare Antigravity "
-        "uses agy with Gemini 3.6 Flash High; bare Codex uses gpt-5.6-sol/max; bare Claude "
-        "uses fable/max. Same-vendor Codex/Claude labour must use native subagents first; MCP "
-        "fallback requires native_unavailable_reason. Use surface='extension'/'inbox' to force "
-        "in-app delivery. Cross-vendor fallback policies can select reader/workhorse tiers. "
+        "Route work CLI-first. Codex/Claude brains should proactively consider external Antigravity "
+        "Flash High for bounded cheap labour via target_agent='antigravity', surface='cli', "
+        "target_model='gemini flash', effort='high'; plan is read-only and accept-edits requires an "
+        "approved isolated package. Flash is non-authoritative and not a native child. On failure, "
+        "use the host native reader/workhorse and record fallback. Parallelize only independent work. "
         "Call get_model_routing_guide/list_agent_models if unsure."
     ),
 }
@@ -8439,15 +8569,15 @@ TOOL_DESCRIPTION_OVERRIDES = {
 COMPACT_TOOL_DESCRIPTIONS = {
     "consult_codex": "Cross-vendor Codex consultation; same-vendor fallback requires native_unavailable_reason.",
     "consult_claude": "Cross-vendor Claude consultation; same-vendor fallback requires native_unavailable_reason.",
-    "consult_antigravity": "Ask Antigravity through agy CLI; defaults to Gemini 3.6 Flash High in plan mode.",
+    "consult_antigravity": "Use newest live Flash High as a proactive non-authoritative external workhorse through agy; fall back to host native cheap roles on failure.",
     "consult_gemini": "Ask Gemini through the configured CLI/API. Long answers return an excerpt plus response_ref.",
-    "route_agent_task": "Route cross-vendor work CLI-first; same-vendor Codex/Claude labour uses native subagents first.",
+    "route_agent_task": "Route CLI-first, including proactive external Antigravity Flash workhorse packages; same-vendor labour remains native-first.",
     "queue_codex_request": "Queue Codex work; same-vendor callers require native_unavailable_reason after native subagents fail.",
     "get_codex_requests": "List recent queued/completed Codex extension requests.",
     "queue_claude_request": "Queue Claude work; same-vendor callers require native_unavailable_reason after native subagents fail.",
     "get_claude_requests": "List recent queued/completed Claude extension requests.",
-    "list_agent_models": "List detected models and remembered defaults.",
-    "get_model_routing_guide": "Show frontier-brain and cost-aware worker routing for Codex and Claude.",
+    "list_agent_models": "List detected models, defaults, and frontier/native/external-workhorse roles.",
+    "get_model_routing_guide": "Show frontier, native worker, and proactive external Antigravity Flash routing with failure/concurrency rules.",
     "get_consultation_history": "Return recent consultation summaries. Pass include_raw=true only when excerpts are needed.",
     "get_work_memory": "Return the compact per-topic continuation log.",
     "record_work_memory": "Write a compact continuation update for the next model.",
