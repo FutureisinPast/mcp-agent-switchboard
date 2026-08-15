@@ -1102,6 +1102,95 @@ class RoutingGateTests(unittest.TestCase):
                     )
                 )
 
+    def test_extract_dispatch_result_matrix(self):
+        # Locks in the shape matrix that used to silently return None for the
+        # real host shapes (bare list of content blocks, list of raw strings,
+        # bare JSON string, content-as-string) -- see routing_gate.py
+        # _extract_dispatch_result. Each parseable shape must yield a dict
+        # whose receipt matches; each non-dispatch payload must yield None
+        # without raising.
+        result = {
+            "receipt": f"broker:{uuid.uuid4()}",
+            "outcome": "completed_verified",
+            "work_package_id": "WP-SHAPE",
+        }
+        text = json.dumps(result)
+
+        must_parse = {
+            "bare result object": result,
+            "content list of text blocks": {"content": [{"type": "text", "text": text}]},
+            "bare list of content blocks": [{"type": "text", "text": text}],
+            "list of raw strings": [text],
+            "bare JSON string": text,
+            "content as a string": {"content": text},
+        }
+        for label, shape in must_parse.items():
+            with self.subTest(shape=label):
+                parsed = routing_gate._extract_dispatch_result({"tool_response": shape})
+                self.assertIsInstance(parsed, dict, f"{label} did not parse to a dict")
+                self.assertEqual(parsed.get("receipt"), result["receipt"], label)
+
+        must_be_none = {
+            "missing tool_response": None,
+            "plain int": 5,
+            "plain non-JSON text": "hello",
+            "empty list": [],
+        }
+        for label, shape in must_be_none.items():
+            with self.subTest(shape=label):
+                parsed = routing_gate._extract_dispatch_result({"tool_response": shape})
+                self.assertIsNone(parsed, f"{label} should not have parsed")
+
+    def test_credit_granted_from_bare_list_of_content_blocks(self):
+        # This is the shape that was previously unparseable in production:
+        # tool_response as a bare list of content blocks (no wrapping dict).
+        request_id = str(uuid.uuid4())
+        self._seed_ledger(request_id)
+        receipt = f"broker:{request_id}"
+        text = json.dumps(
+            {"receipt": receipt, "outcome": "completed_verified", "work_package_id": "WP-BARE-LIST"}
+        )
+        payload = {
+            "session_id": "session-1",
+            "tool_use_id": "dispatch-bare-list",
+            "tool_name": routing_gate.CREDITABLE_DISPATCH_TOOL,
+            "tool_input": {"target_agent": "antigravity", "surface": "cli"},
+            "tool_response": [{"type": "text", "text": text}],
+            "_switchboard_host": "claude",
+        }
+
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 1):
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("bl-1")), {})
+            denied = routing_gate.pre_tool_use(self.pre_payload("bl-2"))
+            self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+
+            credit_result = routing_gate.post_tool_use(payload)
+            self.assertIn(
+                receipt, credit_result["hookSpecificOutput"]["additionalContext"]
+            )
+
+            allowed = routing_gate.pre_tool_use(self.pre_payload("bl-3"))
+            self.assertEqual(allowed, {})
+
+    def test_no_credit_is_logged_for_unparseable_dispatch_response(self):
+        payload = {
+            "session_id": "session-1",
+            "tool_use_id": "dispatch-unparseable",
+            "tool_name": routing_gate.CREDITABLE_DISPATCH_TOOL,
+            "tool_input": {"target_agent": "antigravity", "surface": "cli"},
+            "tool_response": "hello",
+            "_switchboard_host": "claude",
+        }
+        result = routing_gate.post_tool_use(payload)
+        self.assertNotIn("Routing credit", json.dumps(result))
+
+        entries = self._read_log_entries()
+        no_credit_entries = [e for e in entries if e.get("decision") == "no-credit"]
+        self.assertEqual(len(no_credit_entries), 1)
+        entry = no_credit_entries[0]
+        self.assertIn("parseable", entry.get("reason", ""))
+        self.assertEqual(entry.get("response_type"), "str")
+
     def test_credit_requires_ledger_row(self):
         # Well-formed receipt (valid UUID shape) but never written to the ledger:
         # _receipt_resolves() must fail closed and grant no credit.
