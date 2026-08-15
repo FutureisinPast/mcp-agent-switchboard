@@ -684,9 +684,22 @@ def _standing_policy_context(session_id: str) -> str:
         if not re.fullmatch(r"\d+\.\d+\.\d+", version):
             version = "unknown"
         relaxed = " | POLICY RELAXED (weaker than shipped default)" if policy_is_relaxed() else ""
+        # Carried per-turn rather than left to the instruction file, because a session
+        # loads its instructions ONCE at start: a policy change reaches new sessions
+        # only, while every conversation already in flight keeps obeying the old rule
+        # (and keeps imitating its own prior turns). This line reaches all of them on
+        # the very next turn.
+        audit_line = (
+            "Do NOT write a routing audit into your reply -- the broker records every lane "
+            "automatically. Only produce one if the user asks, by running "
+            "`agent-switchboard.exe routing-report --table` and returning its output. "
+            if audit_mode() == "on-demand"
+            else "A routing audit IS required in your final message this turn. "
+        )
         return (
             f"[routing] delegation-policy: active | gate: {mode} | "
             f"direct-labour budget: {remaining}/{limit} remaining | switchboard {version}{relaxed}. "
+            f"{audit_line}"
             "The owner has a STANDING REQUEST to delegate eligible labour: dispatching one "
             "bounded package to the Flash workhorse (route_agent_task, target_agent='antigravity', "
             "surface='cli', target_model='gemini flash', effort='high') or to a managed native "
