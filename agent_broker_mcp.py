@@ -18,6 +18,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import urllib.error
@@ -3811,9 +3812,9 @@ def validate_flash_workhorse_result(
             if isinstance(value, (dict, list)):
                 shape.append(f"{key}:{type(value).__name__}[{len(value)}]")
             elif isinstance(value, str):
-                shape.append(f"{key}:str[{len(value)}]" if len(value) > 40 else f"{key}={value!r}")
+                shape.append(f"{key}:str[{len(value)}]")
             else:
-                shape.append(f"{key}={value!r}")
+                shape.append(f"{key}:{type(value).__name__}")
         return None, errors + [
             "structured_output is missing or not an object; the backend returned "
             f"{{{', '.join(shape)}}}. The worker did not produce schema-conforming "
@@ -4626,10 +4627,14 @@ def consult_antigravity_cli(
         command.extend(["--model", str(model_name)])
     if effort:
         command.extend(["--effort", str(effort)])
-    if implementation_mode:
-        command.extend(["--mode", "accept-edits"])
-    else:
-        command.extend(["--mode", "plan", "--sandbox"])
+    # agy ignores --mode in print mode ("--mode is not supported in print mode") and
+    # auto-denies every tool it cannot prompt for, which is why runs exited 0, reported
+    # SUCCESS, and returned nothing whatsoever: the worker was never able to read a
+    # single file. Settings allow-rules do not apply headlessly and agy offers no scoped
+    # read-only grant, so this flag is the only way the worker gets tool access at all.
+    # It is acceptable ONLY because the worker is confined below to a disposable copy of
+    # the package -- it never sees, and cannot damage, the real tree.
+    command.append("--dangerously-skip-permissions")
     command.extend(
         [
             "--output-format",
@@ -4662,12 +4667,30 @@ def consult_antigravity_cli(
         if scan_error:
             return f"Antigravity CLI structured-output validation failed: {scan_error}"
 
-    code, stdout, stderr = run_process(
-        command,
-        project_info.root_path,
-        None,
-        timeout=timeout,
+    # The worker runs against a throwaway copy, never the project itself. With agy's
+    # permission checks off it could otherwise write, delete, or run commands anywhere;
+    # confining it to a copy makes that power land somewhere disposable.
+    source_root = (
+        containment_root
+        if implementation_mode and containment_root is not None
+        else Path(project_info.root_path)
     )
+    staging_root, staging_error = _prepare_staging(source_root)
+    if staging_error or staging_root is None:
+        return f"Antigravity CLI structured-output validation failed: {staging_error}"
+
+    apply_report: dict[str, Any] | None = None
+    try:
+        code, stdout, stderr = run_process(
+            command,
+            str(staging_root),
+            None,
+            timeout=timeout,
+        )
+        if implementation_mode and code == 0:
+            apply_report = _apply_staged_changes(staging_root, source_root, allowed_resolved)
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
     containment_report: dict[str, Any] | None = None
     if implementation_mode and containment_root is not None:
@@ -4701,19 +4724,26 @@ def consult_antigravity_cli(
     if code != 0:
         return f"Antigravity CLI exited with code {code}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}".strip()
     raw = stdout or stderr
+    # agy auto-denies every tool in headless print mode and can exit 0 with status
+    # SUCCESS and an empty response; the only explanation for that lives on stderr.
+    # Surface it (bounded, single-line) whenever we report a validation failure below,
+    # instead of discarding it -- that silent discard made real failures undiagnosable.
+    stderr_note = (
+        " | agy stderr: " + " ".join(stderr.split())[:400]
+    ) if stderr and stderr.strip() else ""
     if not raw:
-        return "Antigravity CLI structured-output validation failed: agy returned no output."
+        return "Antigravity CLI structured-output validation failed: agy returned no output." + stderr_note
     try:
         outer = json.loads(raw)
     except json.JSONDecodeError as exc:
-        return f"Antigravity CLI structured-output validation failed: invalid JSON ({exc})."
+        return f"Antigravity CLI structured-output validation failed: invalid JSON ({exc})." + stderr_note
     structured, validation_errors = validate_flash_workhorse_result(outer, package)
     if validation_errors:
-        return "Antigravity CLI structured-output validation failed: " + "; ".join(validation_errors)
+        return "Antigravity CLI structured-output validation failed: " + "; ".join(validation_errors) + stderr_note
     attested_model = outer.get("model") or outer.get("model_id") or None
     conflict = attested_model_conflict(model_name, attested_model)
     if conflict:
-        return "Antigravity CLI structured-output validation failed: " + conflict
+        return "Antigravity CLI structured-output validation failed: " + conflict + stderr_note
     normalized = {
         "package_id": package["package_id"],
         "worker_status": structured.get("status") if structured else "failed",
@@ -4729,6 +4759,8 @@ def consult_antigravity_cli(
         },
         "containment": containment_report,
     }
+    if apply_report is not None:
+        normalized["containment_apply"] = apply_report
     return json.dumps(normalized, ensure_ascii=False)
 
 
@@ -4784,6 +4816,115 @@ def _containment_root(allowed_files: list[str], fallback: str) -> Path:
     except ValueError:
         # Different drives: no common ancestor, so there is nothing safe to scan.
         return Path(fallback).resolve()
+
+
+STAGING_MAX_FILES = 4000
+STAGING_MAX_BYTES = 200 * 1024 * 1024
+
+
+def _prepare_staging(source: Path) -> tuple[Path | None, str | None]:
+    """Copy `source` into a disposable tree; return (staging_root, refusal).
+
+    Flash runs with agy's permission checks disabled, because that is the only way
+    agy grants tool access at all in print mode: settings allow-rules are ignored
+    there, and there is no scoped read-only grant. That flag approves writes and
+    command execution too, so the worker must never be pointed at the real tree.
+    Copying first means a bad write, a delete, or a stray command damages a copy
+    that is thrown away, instead of the user's project.
+
+    Refuses rather than truncating: a partial copy would make the worker report on
+    files that silently were not there, which reads as a finding rather than a
+    setup error.
+    """
+    file_count = 0
+    total_bytes = 0
+    for dirpath, dirnames, filenames in os.walk(source):
+        dirnames[:] = [d for d in dirnames if d not in CONTAINMENT_SKIP_DIRS]
+        for filename in filenames:
+            file_count += 1
+            try:
+                total_bytes += (Path(dirpath) / filename).stat().st_size
+            except OSError:
+                continue
+            if file_count > STAGING_MAX_FILES or total_bytes > STAGING_MAX_BYTES:
+                return None, (
+                    f"package root {source} is too large to stage safely "
+                    f"({file_count}+ files, {total_bytes // (1024 * 1024)}+ MB; caps are "
+                    f"{STAGING_MAX_FILES} files / {STAGING_MAX_BYTES // (1024 * 1024)} MB). "
+                    "Narrow the package to the directory the worker actually needs."
+                )
+
+    # Copy INTO the temp root itself rather than a child of it, so cleanup only ever
+    # removes the directory this function created. An earlier shape returned a child
+    # and deleted its parent, which would erase the whole temp directory the moment
+    # anything returned a path from elsewhere.
+    staging = Path(tempfile.mkdtemp(prefix="flash-staging-"))
+    try:
+        shutil.copytree(
+            source,
+            staging,
+            ignore=shutil.ignore_patterns(*CONTAINMENT_SKIP_DIRS),
+            symlinks=False,
+            dirs_exist_ok=True,
+        )
+    except (OSError, shutil.Error) as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        return None, f"could not stage {source} for the worker: {exc}"
+    return staging, None
+
+
+def _apply_staged_changes(
+    staging_root: Path, source_root: Path, allowed: set[str]
+) -> dict[str, Any]:
+    """Copy the worker's edits from the staging copy back onto the real tree.
+
+    Only files the package explicitly allowed are applied. Anything else the worker
+    touched stays behind in the staging tree and is reported instead: an
+    out-of-scope change may be a genuine mistake or may be the worker exceeding its
+    package, and deciding which is the brain's call, not this function's.
+    """
+    applied: list[str] = []
+    withheld: list[str] = []
+    failed: list[str] = []
+
+    for dirpath, dirnames, filenames in os.walk(staging_root):
+        dirnames[:] = [d for d in dirnames if d not in CONTAINMENT_SKIP_DIRS]
+        for filename in filenames:
+            staged = Path(dirpath) / filename
+            try:
+                relative = staged.relative_to(staging_root)
+            except ValueError:
+                continue
+            target = (source_root / relative).resolve()
+
+            try:
+                staged_bytes = staged.read_bytes()
+            except OSError:
+                failed.append(str(target))
+                continue
+            if target.exists():
+                try:
+                    if target.read_bytes() == staged_bytes:
+                        continue  # untouched by the worker
+                except OSError:
+                    failed.append(str(target))
+                    continue
+
+            if str(target) not in allowed:
+                withheld.append(str(target))
+                continue
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(staged_bytes)
+                applied.append(str(target))
+            except OSError:
+                failed.append(str(target))
+
+    return {
+        "applied": sorted(applied),
+        "withheld_out_of_scope": sorted(withheld),
+        "failed_to_apply": sorted(failed),
+    }
 
 
 def _containment_diff(

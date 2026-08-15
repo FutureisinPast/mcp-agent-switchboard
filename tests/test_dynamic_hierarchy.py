@@ -254,22 +254,54 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
     def test_agy_cli_always_uses_schema_and_returns_validated_structure(self):
         package = self._flash_package()
         stdout = json.dumps(self._flash_output(package["package_id"]))
-        with mock.patch.object(broker, "load_config", return_value={}), \
-             mock.patch.object(broker, "discover_antigravity_cli", return_value="agy"), \
-             mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
-             mock.patch.object(broker, "run_process", return_value=(0, stdout, "")) as run:
-            response = broker.consult_antigravity_cli(
-                "p", "bounded prompt", "accept-edits", "gemini-3.7-flash-high", "high", 60, package
-            )
+        staging = broker.Path(broker.tempfile.mkdtemp(prefix="flash-test-staging-"))
+        try:
+            with mock.patch.object(broker, "load_config", return_value={}), \
+                 mock.patch.object(broker, "discover_antigravity_cli", return_value="agy"), \
+                 mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
+                 mock.patch.object(broker, "_prepare_staging", return_value=(staging, None)), \
+                 mock.patch.object(broker, "run_process", return_value=(0, stdout, "")) as run:
+                response = broker.consult_antigravity_cli(
+                    "p", "bounded prompt", "accept-edits", "gemini-3.7-flash-high", "high", 60, package
+                )
+        finally:
+            broker.shutil.rmtree(staging, ignore_errors=True)
         command = run.call_args.args[0]
         self.assertEqual(command[command.index("--output-format") + 1], "json")
         schema = json.loads(command[command.index("--json-schema") + 1])
         self.assertIn("brain_verification_required", schema["required"])
         self.assertEqual(schema["properties"]["package_id"]["enum"], ["WP-TEST"])
-        self.assertNotIn("--dangerously-skip-permissions", command)
+        # agy grants NO tool access headlessly without this flag -- settings allow-rules
+        # are ignored in print mode and there is no scoped read-only grant -- so the old
+        # assertion that it is never passed would now simply forbid the worker from
+        # reading anything. The safety property moved rather than disappeared: the flag
+        # is acceptable only while the worker is confined to a disposable copy, so that
+        # confinement is what this test guards.
+        self.assertIn("--dangerously-skip-permissions", command)
+        self.assertEqual(str(run.call_args.args[1]), str(staging))
         parsed = json.loads(response)
         self.assertEqual(parsed["worker_status"], "completed")
         self.assertEqual(parsed["structured_output"]["package_id"], "WP-TEST")
+
+    def test_agy_cli_never_runs_in_the_real_project_tree(self):
+        """The worker must never be pointed at the user's own files.
+
+        With permission checks disabled a stray write or command would otherwise land
+        on the real project, so this asserts the working directory is a staging copy
+        and not the resolved project root.
+        """
+        package = self._flash_package()
+        stdout = json.dumps(self._flash_output(package["package_id"]))
+        with mock.patch.object(broker, "load_config", return_value={}), \
+             mock.patch.object(broker, "discover_antigravity_cli", return_value="agy"), \
+             mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
+             mock.patch.object(broker, "run_process", return_value=(0, stdout, "")) as run:
+            broker.consult_antigravity_cli(
+                "p", "bounded prompt", "plan", "gemini-3.7-flash-high", "high", 60, package
+            )
+        cwd = broker.Path(str(run.call_args.args[1])).resolve()
+        self.assertNotEqual(cwd, broker.Path(".").resolve())
+        self.assertIn("flash-staging-", str(cwd))
 
     def test_flash_danger_full_access_is_rejected_before_agy_starts(self):
         package = self._flash_package()
