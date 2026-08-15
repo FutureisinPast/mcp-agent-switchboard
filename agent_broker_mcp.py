@@ -2484,6 +2484,35 @@ def local_port_open(port: int, timeout: float = 0.2) -> bool:
         return False
 
 
+# `agy models` is a network round-trip. 20s was too tight on this machine and timed
+# out repeatedly, which silently pinned every brain to the bundled static catalog.
+ANTIGRAVITY_MODEL_DISCOVERY_TIMEOUT = max(
+    20, int(os.environ.get("AGENT_BROKER_MODEL_DISCOVERY_TIMEOUT") or 75)
+)
+ANTIGRAVITY_CATALOG_PATH = BROKER_DIR / "antigravity-models.json"
+
+
+def _save_antigravity_catalog(slugs: list[str]) -> None:
+    """Remember the last catalog `agy` actually advertised."""
+    try:
+        ANTIGRAVITY_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ANTIGRAVITY_CATALOG_PATH.write_text(
+            json.dumps({"slugs": list(slugs), "observed_at": utc_now()}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"antigravity catalog save failed: {exc}")
+
+
+def _load_antigravity_catalog() -> list[str]:
+    try:
+        data = json.loads(ANTIGRAVITY_CATALOG_PATH.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    slugs = data.get("slugs")
+    return [str(s) for s in slugs] if isinstance(slugs, list) else []
+
+
 def discover_antigravity_models() -> list[dict[str, Any]]:
     global _ANTIGRAVITY_MODEL_CACHE, _ANTIGRAVITY_MODEL_CACHE_AT
     if (
@@ -2510,6 +2539,7 @@ def discover_antigravity_models() -> list[dict[str, Any]]:
             models.append(antigravity_model_entry_from_slug(str(item).strip(), "config"))
 
     agy = discover_antigravity_cli(config)
+    discovered_live = False
     if agy:
         try:
             proc = subprocess.run(
@@ -2519,17 +2549,29 @@ def discover_antigravity_models() -> list[dict[str, Any]]:
                 encoding="utf-8",
                 errors="replace",
                 capture_output=True,
-                timeout=20,
+                timeout=ANTIGRAVITY_MODEL_DISCOVERY_TIMEOUT,
                 check=False,
                 creationflags=WINDOWS_NO_WINDOW,
             )
             if proc.returncode == 0:
-                for slug in antigravity_model_slugs_from_output(proc.stdout):
+                slugs = antigravity_model_slugs_from_output(proc.stdout)
+                for slug in slugs:
                     models.append(antigravity_model_entry_from_slug(slug))
+                if slugs:
+                    discovered_live = True
+                    _save_antigravity_catalog(slugs)
             else:
                 log(f"agy models exited {proc.returncode}: {proc.stderr[:500]}")
         except Exception as exc:  # noqa: BLE001
             log(f"agy model discovery failed: {exc}")
+    if not discovered_live:
+        # Live discovery is a network call and is genuinely slow sometimes. Falling
+        # straight back to the bundled static list silently DOWNGRADES every brain to
+        # an older Flash than the one actually available -- the exact failure this
+        # round exists to prevent. A previously observed catalog is stale at worst;
+        # the static list is wrong by construction the moment a new model ships.
+        for slug in _load_antigravity_catalog():
+            models.append(antigravity_model_entry_from_slug(slug))
 
     # Keep models visible only in the IDE picker as inbox choices too.
     helper = BROKER_DIR / "extensions" / "antigravity-agent-broker-bridge" / "cdp_list_models.mjs"

@@ -67,6 +67,11 @@ DIRECT_LABOUR_LIMIT = max(
     1, _env_int("AGENT_BROKER_DIRECT_LABOUR_LIMIT", DIRECT_LABOUR_LIMIT_DEFAULT)
 )
 GATE_MODE_ENV = "AGENT_BROKER_GATE_MODE"
+# How long a hook waits for the per-session state lock before failing open. See
+# _update_state for why this is a trade rather than a bug.
+STATE_LOCK_TIMEOUT_SECONDS = max(
+    1.0, float(os.environ.get("AGENT_BROKER_STATE_LOCK_TIMEOUT") or 4.0)
+)
 
 
 def gate_mode() -> str:
@@ -329,12 +334,22 @@ def _update_state(session_id: str, update) -> dict | None:
     Parallel native subagents can start and stop at nearly the same time. A
     short lock prevents one receipt from overwriting another; timeout is
     fail-open because hooks must never wedge the host session.
+
+    That fail-open is a deliberate trade, and it has a real cost: a call that
+    cannot take the lock in time is allowed AND not counted, so under heavy
+    concurrency the allowance can be exceeded by the number of timed-out
+    reservations. Wedging the user's session is still the worse failure, so the
+    fix is to make the window small rather than to hold the lock indefinitely.
+    One second was tight enough to lose races in a 12-way parallel test; a few
+    seconds is invisible to a human but ample for a hook that only rewrites a
+    small JSON file. Every fail-open is recorded with fail_open=True so the
+    routing report can show when enforcement was actually skipped.
     """
     if not session_id:
         return None
     try:
         with atomic_io.FileLock(
-            _session_lock_path(session_id), timeout=1.0, stale_seconds=30.0
+            _session_lock_path(session_id), timeout=STATE_LOCK_TIMEOUT_SECONDS, stale_seconds=30.0
         ):
             state = _read_state(session_id)
             update(state)
@@ -556,11 +571,41 @@ def _shell_command_text(tool_input: object) -> str:
     )
 
 
+def _neutralize_quoted_separators(command: str) -> str:
+    """Blank out command separators that sit INSIDE a quoted string.
+
+    The invocation matcher keys off shell separators (`|`, `&`, `;`) to find where a
+    command starts, but a regex has no idea what is quoted. So a perfectly innocent
+    `Select-String -Pattern "foo|agy models"` reads as `... | agy models` — a piped
+    invocation — and gets denied. That happened twice to read-only diagnostics in one
+    session, and a security control that cries wolf is one that gets switched off.
+
+    Only the separator CHARACTERS inside quotes are replaced (with spaces), never the
+    quotes or any other content, so a genuinely quoted executable path such as
+    `"C:\\tools\\agy.exe" --print x` still matches exactly as before."""
+    out = []
+    quote: str | None = None
+    for ch in command:
+        if quote:
+            if ch == quote:
+                quote = None
+                out.append(ch)
+            elif ch in "|&;":
+                out.append(" ")
+            else:
+                out.append(ch)
+        else:
+            if ch in "\"'":
+                quote = ch
+            out.append(ch)
+    return "".join(out)
+
+
 def _is_direct_agy_shell_invocation(tool_name: object, tool_input: object) -> bool:
     name = normalize_tool_name(tool_name)
     if name not in SHELL_TOOL_NAMES and "shell" not in name:
         return False
-    command = _shell_command_text(tool_input)
+    command = _neutralize_quoted_separators(_shell_command_text(tool_input))
     return bool(
         DIRECT_AGY_COMMAND_RE.search(command)
         or START_PROCESS_AGY_RE.search(command)

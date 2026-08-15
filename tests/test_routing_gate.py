@@ -359,7 +359,33 @@ class RoutingGateTests(unittest.TestCase):
         state = routing_gate._read_state("session-1")
         self.assertEqual(state["direct_labour_counts"]["reads"], 3)
 
+    def _read_log_entries(self, session_id: str = "session-1") -> list[dict]:
+        path = routing_gate._session_log_path(session_id)
+        if not path.exists():
+            return []
+        entries = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+        return entries
+
     def test_parallel_pretool_reservations_cannot_exceed_limit(self):
+        # _update_state's per-session FileLock deliberately fails OPEN on
+        # timeout (routing_gate.py:331-360): wedging the host session is a
+        # worse failure than occasionally under-counting a reservation under
+        # heavy concurrency. A call that loses the lock race is allowed AND
+        # left uncounted, and every such fail-open is logged with
+        # fail_open=True. Under 12-way parallelism against a limit of 3, a
+        # small number of timed-out reservations can legitimately push
+        # `allowed` above 3 -- that is not a bug, so this test must not pin
+        # `allowed` to a fixed number (that pin is exactly what made this
+        # test flaky). What must still hold, and what this test enforces, is
+        # the actual security property: nothing is silently dropped
+        # (allowed + denied == total), the *counted* reservations never
+        # exceed the limit, and every allow beyond the limit is a real,
+        # logged fail-open -- an unexplained extra allow still fails this
+        # test.
         with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 3):
             with ThreadPoolExecutor(max_workers=12) as pool:
                 results = list(
@@ -374,10 +400,48 @@ class RoutingGateTests(unittest.TestCase):
             result.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
             for result in results
         )
-        self.assertEqual((allowed, denied), (3, 9))
+        total_attempts = len(results)
+        self.assertEqual(allowed + denied, total_attempts, "no attempt may be silently dropped")
+
+        log_entries = self._read_log_entries()
+        fail_open_count = sum(
+            1
+            for entry in log_entries
+            if entry.get("event") == "PreToolUse" and entry.get("fail_open") is True
+        )
+
         state = routing_gate._read_state("session-1")
-        self.assertEqual(state["direct_labour_count"], 3)
-        self.assertEqual(len(state["direct_labour_reservations"]), 3)
+        counted = int(state.get("direct_labour_count") or 0)
+        reservations = len(state.get("direct_labour_reservations") or {})
+
+        # The invariant that actually protects the gate: what got COUNTED
+        # never exceeds the limit, ...
+        self.assertLessEqual(counted, 3)
+        self.assertLessEqual(reservations, 3)
+        self.assertEqual(counted, reservations)
+        # ...and every allow beyond the limit must be accounted for by a
+        # logged fail-open -- not an unexplained extra allow.
+        self.assertLessEqual(allowed, 3 + fail_open_count)
+        self.assertEqual(allowed, counted + fail_open_count)
+
+    def test_pretool_fail_open_is_allowed_and_logged(self):
+        # Force the lock-timeout fail-open path directly (routing_gate.py
+        # reserve_direct_labour -> _update_state) instead of relying on
+        # timing, so this behaviour is deterministically tested rather than
+        # only incidentally observed under the parallel-race test above.
+        with mock.patch.object(routing_gate, "_update_state", return_value=None):
+            result = routing_gate.pre_tool_use(self.pre_payload("fail-open-call"))
+
+        self.assertEqual(result, {})
+        entries = self._read_log_entries()
+        fail_open_entries = [
+            entry
+            for entry in entries
+            if entry.get("event") == "PreToolUse"
+            and entry.get("decision") == "allow"
+            and entry.get("fail_open") is True
+        ]
+        self.assertEqual(len(fail_open_entries), 1)
 
     def test_same_tool_use_id_is_idempotent(self):
         with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 1):

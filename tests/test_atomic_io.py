@@ -32,8 +32,22 @@ class AtomicWriteTextTests(unittest.TestCase):
             real_replace = os.replace
 
             def spy_replace(src, dst):
+                # _replace_with_retry() legitimately retries os.replace() on a
+                # transient PermissionError (brief Windows scanner/indexer
+                # lock on the just-created temp file) -- that's correct
+                # production behaviour, not a bug, and it means this spy can
+                # be invoked more than twice for two atomic_write_text()
+                # calls. Only record the name once the real os.replace()
+                # SUCCEEDS, and let the exception keep propagating so the
+                # retry path in atomic_io._replace_with_retry is still
+                # exercised. Each write still produces exactly one
+                # successful replace, so the length/uniqueness assertions
+                # below continue to guard the real behaviour (unique temp
+                # name per write, not a fixed ".new" suffix) without being
+                # inflated by retried-but-failed attempts.
+                result = real_replace(src, dst)
                 seen_tmp_names.append(Path(src).name)
-                return real_replace(src, dst)
+                return result
 
             with mock.patch.object(atomic_io.os, "replace", side_effect=spy_replace):
                 atomic_io.atomic_write_text(target, "one")
