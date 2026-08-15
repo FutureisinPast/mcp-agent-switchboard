@@ -9279,6 +9279,11 @@ CLAUDE_LITE_TOOL_NAMES = {
     "consult_antigravity",
     "consult_gemini",
     "route_agent_task",
+    # The evidence lane has to be visible to the client that needs it most. Claude
+    # sessions get this trimmed list, so a tool missing here is invisible to the very
+    # brain it exists for -- it dispatches fine when called, but nothing ever calls a
+    # tool it cannot see.
+    "run_evidence_probe",
     "queue_codex_request",
     "get_codex_requests",
     "queue_claude_request",
@@ -9342,6 +9347,7 @@ COMPACT_TOOL_DESCRIPTIONS = {
     "consult_antigravity": "Low-level compatibility/diagnostic route. For Flash labour, call route_agent_task with surface=cli; never invoke agy directly.",
     "consult_gemini": "Ask Gemini through the configured CLI/API. Long answers return an excerpt plus response_ref.",
     "route_agent_task": "Required MCP entry for cross-vendor work, including Antigravity Flash packages; surface=cli selects the backend without direct agy invocation.",
+    "run_evidence_probe": "Read-only measurement the reader lane cannot do: file hashes, encoding/BOM, git state, file stat, bounded literal grep, filtered process list. Fixed catalog, no shell pass-through.",
     "queue_codex_request": "Queue Codex work; same-vendor callers require native_unavailable_reason after native subagents fail.",
     "get_codex_requests": "List recent queued/completed Codex extension requests.",
     "queue_claude_request": "Queue Claude work; same-vendor callers require native_unavailable_reason after native subagents fail.",
