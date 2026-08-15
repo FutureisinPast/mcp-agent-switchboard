@@ -478,6 +478,11 @@ def subagent_start(payload: dict) -> dict:
             ) + 1
 
     _update_state(session_id, update)
+    log_gate_decision(
+        session_id, "SubagentStart", "-", None, "native-start",
+        extra={"agent_id": agent_id, "agent_type": agent_type,
+               "model": str(payload.get("model") or "")},
+    )
     return {}
 
 
@@ -716,7 +721,16 @@ def register_brain_override(session_id: str, package_id: str, reason: str) -> bo
             state.get("labour_relief_sequence") or 0
         ) + 1
 
-    return _update_state(session_id, update) is not None
+    ok = _update_state(session_id, update) is not None
+    if ok:
+        # Also append to the durable log. Session STATE is reset each turn, so
+        # anything recorded only there vanishes and the rendered audit silently
+        # loses packages; the log is append-only and survives.
+        log_gate_decision(
+            session_id, "Override", "-", None, "override",
+            extra={"work_package_id": package_id, "reason": reason},
+        )
+    return ok
 
 
 def routing_override_cli(argv: list[str]) -> int:
@@ -820,6 +834,67 @@ def _format_routing_report(label: str, state: dict, log_records: list[dict]) -> 
     return "\n".join(lines)
 
 
+_AGENT_LANES = {
+    "explore": "reader",
+    "explorer": "reader",
+    "economy-worker": "workhorse",
+    "worker": "workhorse",
+    "plan": "workhorse",
+    "general-purpose": "brain-priced",
+}
+
+
+def _format_routing_audit_table(label: str, log_records: list[dict]) -> str:
+    """Render the routing audit FROM THE LEDGER, as a markdown table.
+
+    Built from the append-only decision log rather than session state, because
+    state is reset every turn: anything read from state loses packages from
+    earlier in the session and silently under-reports. This is the whole point of
+    having the backend render it -- one source of truth, one format, no drift
+    between turns, and no cost to the model at all."""
+    rows: list[tuple[str, str, str, str, str]] = []
+    counts = {name: 0 for name in DIRECT_BRAIN_LABOUR_CATEGORIES}
+
+    for record in log_records:
+        decision = str(record.get("decision") or "")
+        event = str(record.get("event") or "")
+        if event == "PreToolUse" and decision in {"reserve", "allow", "warn", "deny"}:
+            category = record.get("category")
+            if category in counts and decision != "deny":
+                counts[category] += 1
+        elif decision == "override":
+            package = str(record.get("work_package_id") or "WP-unknown")
+            reason = str(record.get("reason") or "")
+            rows.append((package, "brain", "direct", "-",
+                         f"override: brain - {package}: {reason}"))
+        elif decision == "native-start":
+            agent_id = str(record.get("agent_id") or "")
+            agent_type = str(record.get("agent_type") or "")
+            lane = _AGENT_LANES.get(agent_type.lower(), "workhorse")
+            model = str(record.get("model") or "") or "configured (runtime unverified)"
+            rows.append((f"native:{agent_type}", lane, f"native {agent_type}", model,
+                         f"native:{agent_id}"))
+        elif decision == "credit":
+            package = str(record.get("work_package_id") or "WP-unknown")
+            receipt = str(record.get("receipt") or "")
+            rows.append((package, "workhorse", "switchboard", "gemini flash (resolved)", receipt))
+
+    lines = [f"## Routing audit — {label}", "", f"packages: {len(rows)}", ""]
+    if rows:
+        lines.append("| Package | Lane | Mechanism | Model | Receipt |")
+        lines.append("|---|---|---|---|---|")
+        for row in rows:
+            lines.append("| " + " | ".join(cell.replace("|", "/") for cell in row) + " |")
+    else:
+        lines.append("_No packages recorded for this session._")
+    lines.append("")
+    lines.append(
+        "direct-brain-labour: "
+        + " | ".join(f"{name}={counts[name]}" for name in DIRECT_BRAIN_LABOUR_CATEGORIES)
+    )
+    return "\n".join(lines)
+
+
 def routing_report_cli(argv: list[str]) -> int:
     """Print a compact human summary of session gate state + decision log.
 
@@ -831,6 +906,10 @@ def routing_report_cli(argv: list[str]) -> int:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--session")
     group.add_argument("--last", type=int, default=1)
+    parser.add_argument(
+        "--table", action="store_true",
+        help="render the routing audit as a markdown table from the ledger",
+    )
     try:
         args = parser.parse_args(argv)
     except SystemExit:
@@ -856,8 +935,11 @@ def routing_report_cli(argv: list[str]) -> int:
             except Exception:  # noqa: BLE001
                 state = {}
             log_path = state_path.with_name(state_path.stem + ".log.jsonl")
+            records = _read_session_log(log_path)
             reports.append(
-                _format_routing_report(label, state, _read_session_log(log_path))
+                _format_routing_audit_table(label, records)
+                if args.table
+                else _format_routing_report(label, state, records)
             )
         sys.stdout.write("\n\n".join(reports) + "\n")
     except Exception:  # noqa: BLE001 - a report must never fail a session
@@ -1427,12 +1509,44 @@ def _lookup_routing_audit_valid(
     return True
 
 
+AUDIT_MODE_ENV = "AGENT_BROKER_AUDIT_MODE"
+
+
+def audit_mode() -> str:
+    """`on-demand` (default) or `require`.
+
+    The Stop gate used to demand that the model retype, in prose, a summary of work
+    the hooks had already recorded. That was worth doing when the hooks saw only some
+    tool calls and the model's declaration was the only record. It is not worth doing
+    now: PreToolUse/PostToolUse intercept every call, so the append-only decision log
+    is strictly MORE reliable than the model's account of itself -- prose can
+    misreport, the log cannot. Requiring it bought nothing and cost a great deal:
+    ~700-900 output tokens on every mutating turn, format-only rejections that
+    discarded and regenerated whole messages, and an observer effect where a session
+    had to spend a labour call reading its own gate state in order to describe it.
+
+    So the default is now silent-but-recorded. Enforcement is untouched -- the
+    allowance, the credit rules and the denials all still apply. Only the demand for
+    a model-written summary is gone. Ask for it with `routing-report` and the backend
+    renders it from the ledger, correctly and identically every time.
+
+    `require` restores the old attestation behaviour for anyone who wants the model
+    to sign its own work."""
+    mode = str(os.environ.get(AUDIT_MODE_ENV, "on-demand")).strip().lower()
+    return "require" if mode in {"require", "required", "strict", "always"} else "on-demand"
+
+
 def stop(payload: dict) -> dict:
     sweep_stale()
     session_id = str(payload.get("session_id") or "").strip()
     if not session_id or not has_mutation(session_id):
         return {}
     if payload.get("stop_hook_active"):
+        return {}
+    if audit_mode() == "on-demand":
+        # Recorded, not recited. Everything the audit would have said is already in
+        # the decision log and the consultation ledger.
+        log_gate_decision(session_id, "Stop", "-", None, "recorded", extra={"mutated": True})
         return {}
     last_message = str(payload.get("last_assistant_message") or "")
     if not ROUTING_AUDIT_SECTION_RE.search(last_message) and not _ledger_reachable():

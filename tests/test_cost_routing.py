@@ -10,6 +10,7 @@ home is redirected to a TemporaryDirectory for the duration of each test.
 """
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import os
@@ -292,14 +293,16 @@ class RoutingContractStringsTests(unittest.TestCase):
             line.encode("ascii")
 
     def test_mixed_native_and_broker_receipt_audit_required(self):
-        matches = [
-            line
-            for line in broker.COST_AWARE_ROUTING_RULES
-            if "native:<agent-id>" in line
-            and "broker:<uuid>" in line
-            and "structured per-package brain override" in line
-        ]
-        self.assertTrue(matches, "expected the mixed native/broker routing audit rule")
+        # The old COST_AWARE_ROUTING_RULES prose rule combining these three markers
+        # is gone: the model is no longer asked to recite an audit by default, so
+        # there is nothing to teach it to write in the common case. The guarantee
+        # survives where enforcement actually lives now -- the require-mode block
+        # message in routing_gate.stop(), which still names all three valid receipt
+        # forms for anyone using AGENT_BROKER_AUDIT_MODE=require.
+        source = inspect.getsource(routing_gate.stop)
+        self.assertIn("native:<agent-id>", source)
+        self.assertIn("broker:<uuid>", source)
+        self.assertIn("override: brain - <WP-ID>", source)
 
     def test_plan_contract_defines_reader_located_decision_premise(self):
         text = " ".join(broker.TASK_CONTRACTS["implementation_plan"]).lower()
@@ -314,11 +317,18 @@ class RoutingContractStringsTests(unittest.TestCase):
         self.assertIn("raw evidence external", text)
 
     def test_global_rules_cover_premises_and_unplanned_direct_labour(self):
+        # The model-recited "planned and unplanned packages ... direct-brain-labour:"
+        # audit rule is gone by design (audit_mode() defaults to on-demand). Unplanned
+        # direct labour is still counted and reported -- now by the ledger rather than
+        # recited by the model, since PreToolUse/PostToolUse see every call regardless
+        # of whether it was declared. Assert the replacement guarantee instead.
         text = " ".join(broker.COST_AWARE_ROUTING_RULES).lower()
         self.assertIn("brain-context ingress", text)
         self.assertIn("decision premise", text)
-        self.assertIn("planned and unplanned packages", text)
-        self.assertIn("direct-brain-labour:", text)
+        self.assertIn("do not write a routing audit", text)
+        self.assertIn("every lane automatically", text)
+        self.assertIn("routing-report --table", text)
+        self.assertIn("agent_broker_audit_mode=require", text)
 
     def test_global_rules_never_promote_flash_to_peer_brain(self):
         text = " ".join(broker.COST_AWARE_ROUTING_RULES).lower()

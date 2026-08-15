@@ -328,8 +328,9 @@ class HierarchyInstallTests(unittest.TestCase):
         self.assertIn("brain-context ingress", hierarchy_lower)
         self.assertIn("decision premise", hierarchy_lower)
         self.assertIn("reader locates", hierarchy_lower)
-        self.assertIn("every planned and unplanned package", hierarchy_lower)
-        self.assertIn("direct-brain-labour", hierarchy_lower)
+        self.assertIn("do not write a routing audit into your reply", hierarchy_lower)
+        self.assertIn("routing-report --table", hierarchy_lower)
+        self.assertIn("agent_broker_audit_mode=require", hierarchy_lower)
         self.assertIn("pretooluse", hierarchy_lower)
         self.assertIn("allowance is four direct labour calls", hierarchy_lower)
         self.assertIn("each relief opens only the next bounded block", hierarchy_lower)
@@ -520,12 +521,42 @@ class HierarchyInstallTests(unittest.TestCase):
             "MUST NOT invoke `agy`",
             "Only the Switchboard backend may start `agy`",
             "A Flash completion is never acceptance",
-            "Routing audit",
-            "broker:<uuid>",
+            "routing-override",
+            "AGENT_BROKER_AUDIT_MODE=require",
         ):
             self.assertIn(phrase, body, phrase)
 
     def test_body_has_no_pinned_flash_version(self):
+        body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
+        self.assertNotIn("3.6", body)
+        self.assertNotIn("3.7", body)
+        self.assertIsNone(re.search(r"[Ff]lash\s*3\.\d", body))
+
+    # -- WP-AUDIT-HIERARCHY-TEXT: audit is ledger-recorded, not model-written --
+
+    def test_body_does_not_demand_a_written_audit(self):
+        body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
+        self.assertNotIn(
+            "Do not claim implementation complete without a `Routing audit`", body
+        )
+        self.assertNotIn("direct-brain-labour: reads=N", body)
+        self.assertIn("Do NOT write a routing audit into your reply", body)
+
+    def test_body_points_at_routing_report_for_the_audit(self):
+        body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
+        self.assertIn("routing-report --table", body)
+        self.assertIn("broker records every lane automatically", body)
+
+    def test_body_keeps_override_and_flash_skip_rules(self):
+        body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
+        for phrase in (
+            "routing-override",
+            "override: brain - <WP-ID>: <specific reason>",
+            "flash_skip",
+        ):
+            self.assertIn(phrase, body, phrase)
+
+    def test_body_still_has_no_pinned_flash_version(self):
         body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
         self.assertNotIn("3.6", body)
         self.assertNotIn("3.7", body)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -71,7 +72,9 @@ class RoutingGateTests(unittest.TestCase):
 
     def test_bare_global_override_does_not_bypass_audit(self):
         routing_gate.mark_mutated("session-1")
-        with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
+        with mock.patch.object(
+            routing_gate, "_ledger_reachable", return_value=True
+        ), mock.patch.dict(os.environ, {routing_gate.AUDIT_MODE_ENV: "require"}):
             result = routing_gate.stop(
                 self.payload("override: brain - coordination costs more than this tiny edit")
             )
@@ -95,7 +98,9 @@ class RoutingGateTests(unittest.TestCase):
             "packages: 1\n"
             "- WP1 | receipt: override: brain - WP1: retained for architecture risk\n"
         )
-        with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
+        with mock.patch.object(
+            routing_gate, "_ledger_reachable", return_value=True
+        ), mock.patch.dict(os.environ, {routing_gate.AUDIT_MODE_ENV: "require"}):
             result = routing_gate.stop(self.payload(message))
         self.assertEqual(result.get("decision"), "block")
         self.assertIn("direct-brain-labour", result.get("reason", ""))
@@ -109,7 +114,9 @@ class RoutingGateTests(unittest.TestCase):
             "tests=0 | docs=0 | other=0\n"
             "- WP1 | receipt: override: brain - WP1: retained for architecture risk\n"
         )
-        with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
+        with mock.patch.object(
+            routing_gate, "_ledger_reachable", return_value=True
+        ), mock.patch.dict(os.environ, {routing_gate.AUDIT_MODE_ENV: "require"}):
             result = routing_gate.stop(self.payload(message))
         self.assertEqual(result.get("decision"), "block")
 
@@ -133,7 +140,9 @@ class RoutingGateTests(unittest.TestCase):
 
     def test_blocks_only_once_for_missing_audit(self):
         routing_gate.mark_mutated("session-1")
-        with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
+        with mock.patch.object(
+            routing_gate, "_ledger_reachable", return_value=True
+        ), mock.patch.dict(os.environ, {routing_gate.AUDIT_MODE_ENV: "require"}):
             first = routing_gate.stop(self.payload("implementation complete"))
             second = routing_gate.stop(self.payload("implementation complete"))
         self.assertEqual(first.get("decision"), "block")
@@ -261,7 +270,9 @@ class RoutingGateTests(unittest.TestCase):
             f"## Routing audit\npackages: 1\n{DIRECT_BRAIN_LABOUR}"
             "- WP1 | receipt: native:agent-missing | verified\n"
         )
-        with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
+        with mock.patch.object(
+            routing_gate, "_ledger_reachable", return_value=True
+        ), mock.patch.dict(os.environ, {routing_gate.AUDIT_MODE_ENV: "require"}):
             self.assertEqual(routing_gate.stop(self.payload(message)).get("decision"), "block")
 
     def test_unfinished_native_receipt_blocks(self):
@@ -279,7 +290,9 @@ class RoutingGateTests(unittest.TestCase):
             f"## Routing audit\npackages: 1\n{DIRECT_BRAIN_LABOUR}"
             "- WP1 | receipt: native:agent-worker-pending | pending\n"
         )
-        with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
+        with mock.patch.object(
+            routing_gate, "_ledger_reachable", return_value=True
+        ), mock.patch.dict(os.environ, {routing_gate.AUDIT_MODE_ENV: "require"}):
             self.assertEqual(routing_gate.stop(self.payload(message)).get("decision"), "block")
 
     def test_every_declared_package_requires_its_own_receipt_row(self):
@@ -290,7 +303,9 @@ class RoutingGateTests(unittest.TestCase):
             f"{DIRECT_BRAIN_LABOUR}"
             "- WP1 | receipt: override: brain - WP1: retained for architecture risk\n"
         )
-        with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
+        with mock.patch.object(
+            routing_gate, "_ledger_reachable", return_value=True
+        ), mock.patch.dict(os.environ, {routing_gate.AUDIT_MODE_ENV: "require"}):
             self.assertEqual(routing_gate.stop(self.payload(message)).get("decision"), "block")
 
     def test_multiple_receipts_in_one_package_row_block(self):
@@ -302,7 +317,9 @@ class RoutingGateTests(unittest.TestCase):
             "- WP1 | receipt: native:agent-worker-1 | "
             "override: brain - WP1: brain also claims the same package\n"
         )
-        with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True):
+        with mock.patch.object(
+            routing_gate, "_ledger_reachable", return_value=True
+        ), mock.patch.dict(os.environ, {routing_gate.AUDIT_MODE_ENV: "require"}):
             self.assertEqual(routing_gate.stop(self.payload(message)).get("decision"), "block")
 
     def test_same_vendor_broker_receipt_requires_native_unavailable_reason(self):
@@ -707,7 +724,7 @@ class RoutingGateTests(unittest.TestCase):
         )
         with mock.patch.object(routing_gate, "_ledger_reachable", return_value=True), mock.patch.dict(
             sys.modules, {"agent_broker_mcp": fake}
-        ):
+        ), mock.patch.dict(os.environ, {routing_gate.AUDIT_MODE_ENV: "require"}):
             self.assertEqual(routing_gate.stop(self.payload(message)).get("decision"), "block")
 
     def test_receipt_validation_error_fails_open(self):
@@ -1211,6 +1228,113 @@ class RoutingGateTests(unittest.TestCase):
 
             denied = routing_gate.pre_tool_use(self.pre_payload("nl-2"))
             self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    # -- WP-AUDIT-MODE-TESTS: on-demand default vs. require, and the ledger --
+
+    def test_stop_is_silent_in_on_demand_mode(self):
+        routing_gate.mark_mutated("session-1")
+        with mock.patch.dict(os.environ, clear=False):
+            os.environ.pop(routing_gate.AUDIT_MODE_ENV, None)
+            self.assertEqual(routing_gate.audit_mode(), "on-demand")
+            result = routing_gate.stop(self.payload("implementation complete, no audit here"))
+        self.assertEqual(result, {})
+
+    def test_stop_records_turn_in_on_demand_mode(self):
+        routing_gate.mark_mutated("session-1")
+        with mock.patch.dict(os.environ, clear=False):
+            os.environ.pop(routing_gate.AUDIT_MODE_ENV, None)
+            routing_gate.stop(self.payload("implementation complete, no audit here"))
+
+        log_path = routing_gate.STATE_DIR / "session-1.log.jsonl"
+        self.assertTrue(log_path.exists())
+        records = [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        stop_records = [r for r in records if r.get("event") == "Stop"]
+        self.assertTrue(stop_records, "expected a Stop entry in the decision log")
+        self.assertEqual(stop_records[-1].get("decision"), "recorded")
+
+    def test_require_mode_still_blocks_missing_audit(self):
+        routing_gate.mark_mutated("session-1")
+        with mock.patch.object(
+            routing_gate, "_ledger_reachable", return_value=True
+        ), mock.patch.dict(os.environ, {routing_gate.AUDIT_MODE_ENV: "require"}):
+            self.assertEqual(routing_gate.audit_mode(), "require")
+            result = routing_gate.stop(self.payload("implementation complete, no audit here"))
+        self.assertEqual(result.get("decision"), "block")
+        self.assertIn("Routing audit", result.get("reason", ""))
+
+    def test_override_and_native_start_are_logged(self):
+        ok = routing_gate.register_brain_override(
+            "session-1", "WP-LOGTEST", "coordination costs more than this tiny edit"
+        )
+        self.assertTrue(ok)
+        routing_gate.subagent_start(
+            {
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "agent_id": "agent-logtest-1",
+                "agent_type": "worker",
+                "model": "gpt-5.6-terra",
+            }
+        )
+
+        log_path = routing_gate.STATE_DIR / "session-1.log.jsonl"
+        records = [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+        override_records = [r for r in records if r.get("decision") == "override"]
+        self.assertTrue(override_records)
+        self.assertEqual(override_records[-1].get("work_package_id"), "WP-LOGTEST")
+
+        native_start_records = [r for r in records if r.get("decision") == "native-start"]
+        self.assertTrue(native_start_records)
+        self.assertEqual(native_start_records[-1].get("agent_id"), "agent-logtest-1")
+
+    def test_audit_table_renders_from_log(self):
+        log_records = [
+            {
+                "event": "Override",
+                "decision": "override",
+                "work_package_id": "WP1",
+                "reason": "retained for architecture risk",
+            },
+            {
+                "event": "SubagentStart",
+                "decision": "native-start",
+                "agent_id": "agent-worker-1",
+                "agent_type": "worker",
+                "model": "gpt-5.6-terra",
+            },
+            {
+                "event": "PostToolUse",
+                "decision": "credit",
+                "work_package_id": "WP2",
+                "receipt": "broker:e53e5d2b-dcb7-4e2d-8c03-20009a336399",
+            },
+            {"event": "PreToolUse", "decision": "allow", "category": "reads"},
+            {"event": "PreToolUse", "decision": "reserve", "category": "searches"},
+            {"event": "PreToolUse", "decision": "warn", "category": "evidence"},
+            # A denied call is not performed labour and must not be counted.
+            {"event": "PreToolUse", "decision": "deny", "category": "reads"},
+        ]
+
+        table = routing_gate._format_routing_audit_table("label-x", log_records)
+
+        self.assertIn("packages: 3", table)
+        self.assertIn("override: brain - WP1: retained for architecture risk", table)
+        self.assertIn("native:agent-worker-1", table)
+        self.assertIn("broker:e53e5d2b-dcb7-4e2d-8c03-20009a336399", table)
+        self.assertIn(
+            "direct-brain-labour: reads=1 | searches=1 | evidence=1 | "
+            "tests=0 | docs=0 | other=0",
+            table,
+        )
 
 
 if __name__ == "__main__":
