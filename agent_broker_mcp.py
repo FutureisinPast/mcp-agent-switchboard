@@ -3801,7 +3801,25 @@ def validate_flash_workhorse_result(
         except json.JSONDecodeError:
             structured = None
     if not isinstance(structured, dict):
-        return None, errors + ["structured_output is missing or not an object"]
+        # Say WHAT came back instead of only what didn't. The bare message
+        # "structured_output is missing" gave the sender nothing to act on and
+        # nothing to diagnose later, because the backend envelope is discarded
+        # here -- real rejections in the field were undiagnosable after the fact.
+        # Keys and short scalars only: the payload itself can carry file contents.
+        shape = []
+        for key, value in list(outer.items())[:12]:
+            if isinstance(value, (dict, list)):
+                shape.append(f"{key}:{type(value).__name__}[{len(value)}]")
+            elif isinstance(value, str):
+                shape.append(f"{key}:str[{len(value)}]" if len(value) > 40 else f"{key}={value!r}")
+            else:
+                shape.append(f"{key}={value!r}")
+        return None, errors + [
+            "structured_output is missing or not an object; the backend returned "
+            f"{{{', '.join(shape)}}}. The worker did not produce schema-conforming "
+            "output for this package -- re-scope it into a smaller package or retain "
+            "it, and do not treat the absence as a completed result"
+        ]
 
     required = set(flash_workhorse_output_schema(package)["required"])
     missing = sorted(required.difference(structured))
