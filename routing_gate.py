@@ -1127,30 +1127,60 @@ CREDITABLE_DISPATCH_TOOL = "mcp__agent_switchboard__route_agent_task"
 CREDITABLE_OUTCOME = "completed_verified"
 
 
+def _coerce_json_dict(value: object) -> dict | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text.startswith("{"):
+            return None
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
 def _extract_dispatch_result(payload: dict) -> dict | None:
     """Pull the router's result dict out of a PostToolUse payload.
 
-    The response arrives as MCP content blocks holding a JSON string, so it has to be
-    unwrapped before anything in it can be trusted (and it is only ever used to look up
-    a server-issued receipt in the ledger — never as authority in itself)."""
+    Hosts disagree about the shape of `tool_response` for an MCP tool: it may be the
+    result object, a list of content blocks, a dict wrapping `content`, or a bare JSON
+    string. This tried only two of those, so in practice it silently returned None and
+    the credit path never ran -- with no log line to say so, which is how a broken
+    incentive stayed invisible while looking healthy.
+
+    Whatever is found here is only ever used to look up a server-issued receipt in the
+    ledger; it is never trusted as authority in itself."""
     response = payload.get("tool_response")
-    if isinstance(response, str):
-        try:
-            response = json.loads(response)
-        except (json.JSONDecodeError, TypeError):
-            return None
-    if isinstance(response, dict) and "content" in response:
-        blocks = response.get("content") or []
-        for block in blocks:
-            if isinstance(block, dict) and block.get("type") == "text":
-                try:
-                    parsed = json.loads(block.get("text") or "")
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                if isinstance(parsed, dict):
-                    return parsed
-        return None
-    return response if isinstance(response, dict) else None
+
+    direct = _coerce_json_dict(response)
+    if direct is not None and "content" not in direct:
+        return direct
+
+    # A list of content blocks, or a dict wrapping one.
+    blocks: list = []
+    if isinstance(response, list):
+        blocks = response
+    elif isinstance(direct, dict):
+        raw = direct.get("content")
+        if isinstance(raw, list):
+            blocks = raw
+        elif isinstance(raw, (str, dict)):
+            blocks = [raw]
+
+    for block in blocks:
+        candidate = block
+        if isinstance(block, dict):
+            candidate = block.get("text", block)
+        parsed = _coerce_json_dict(candidate)
+        if parsed is not None:
+            return parsed
+
+    if direct is not None:
+        return direct
+    return None
 
 
 def _receipt_resolves(receipt: str) -> bool:
@@ -1189,6 +1219,14 @@ def _credit_switchboard_dispatch(session_id: str, normalized_tool: str, payload:
         return None
     result = _extract_dispatch_result(payload)
     if not isinstance(result, dict):
+        # Never fail silently here again: an unreadable response means the whole
+        # Flash-relieves-the-gate incentive quietly stops working while every other
+        # signal still looks healthy.
+        log_gate_decision(
+            session_id, "PostToolUse", normalized_tool, None, "no-credit",
+            extra={"reason": "tool_response not parseable",
+                   "response_type": type(payload.get("tool_response")).__name__},
+        )
         return None
     receipt = str(result.get("receipt") or "")
     outcome = str(result.get("outcome") or "")
