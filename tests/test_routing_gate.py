@@ -1037,6 +1037,71 @@ class RoutingGateTests(unittest.TestCase):
             denied = routing_gate.pre_tool_use(self.pre_payload("su-3"))
             self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
 
+    def test_neutralize_quoted_separators(self):
+        pipe = chr(124)
+        # Separator INSIDE quotes becomes a space; quotes and surrounding
+        # characters survive.
+        self.assertEqual(
+            routing_gate._neutralize_quoted_separators(f'"foo{pipe}agy models"'),
+            '"foo agy models"',
+        )
+        # Separators OUTSIDE quotes are left untouched -- real pipe detection
+        # depends on this.
+        self.assertEqual(
+            routing_gate._neutralize_quoted_separators(f"ls {pipe} agy --print x"),
+            f"ls {pipe} agy --print x",
+        )
+        # Both double and single quoting are handled.
+        self.assertEqual(
+            routing_gate._neutralize_quoted_separators(f"'a{pipe}b&c;d'"),
+            "'a b c d'",
+        )
+        self.assertEqual(
+            routing_gate._neutralize_quoted_separators(f'"a{pipe}b&c;d"'),
+            '"a b c d"',
+        )
+        # An unterminated quote does not raise, and still neutralizes the
+        # separator inside the open quote.
+        self.assertEqual(
+            routing_gate._neutralize_quoted_separators(f'"unterminated{pipe}tail'),
+            '"unterminated tail',
+        )
+
+    def test_quoted_separators_are_not_false_positive_agy_invocations(self):
+        pipe = chr(124)
+        allowed = (
+            ("PowerShell", f'Select-String -Pattern "a{pipe}agy models" f.log'),
+            ("Bash", f'grep -n "x{pipe}agy" file'),
+            ("Bash", "python explain.py --example 'agy --print task'"),
+            ("PowerShell", r"Write-Output C:\docs\agy-notes.md"),
+            ("PowerShell", r"Test-Path C:\tools\agy.exe"),
+        )
+        for tool_name, command in allowed:
+            with self.subTest(tool=tool_name, command=command):
+                self.assertFalse(
+                    routing_gate._is_direct_agy_shell_invocation(
+                        tool_name, {"command": command}
+                    )
+                )
+
+    def test_quoted_separators_still_deny_real_direct_invocations(self):
+        pipe = chr(124)
+        denied = (
+            ("Bash", "agy --print hello"),
+            ("Bash", f"ls {pipe} agy --print x"),
+            ("Bash", "cat f && agy models"),
+            ("Bash", '"C:\\tools\\agy.exe" --print x'),
+            ("PowerShell", "Start-Process agy -ArgumentList '--print'"),
+            ("PowerShell", r"C:\Users\x\agy.exe --print y"),
+        )
+        for tool_name, command in denied:
+            with self.subTest(tool=tool_name, command=command):
+                self.assertTrue(
+                    routing_gate._is_direct_agy_shell_invocation(
+                        tool_name, {"command": command}
+                    )
+                )
+
     def test_credit_requires_ledger_row(self):
         # Well-formed receipt (valid UUID shape) but never written to the ledger:
         # _receipt_resolves() must fail closed and grant no credit.
