@@ -345,7 +345,15 @@ class RoutingGateTests(unittest.TestCase):
 
         output = denied["hookSpecificOutput"]
         self.assertEqual(output["permissionDecision"], "deny")
-        self.assertIn("already performed 3 direct labour calls", output["permissionDecisionReason"])
+        reason = output["permissionDecisionReason"]
+        # New message: still reports the exact count and allowance, and still
+        # names the override command -- same guarantee, new wording.
+        self.assertIn(
+            "Routing gate: 3 direct brain labour calls since the last delegation or override",
+            reason,
+        )
+        self.assertIn("the allowance is 3", reason)
+        self.assertIn("routing-override", reason)
         state = routing_gate._read_state("session-1")
         self.assertEqual(state["direct_labour_counts"]["reads"], 3)
 
@@ -523,10 +531,28 @@ class RoutingGateTests(unittest.TestCase):
         }
         self.assertEqual(routing_gate.pre_tool_use(switchboard), {})
 
-    def test_direct_agy_gate_does_not_apply_outside_host_hooks(self):
+    def test_direct_agy_denied_even_without_host_field(self):
+        # The direct-agy deny used to require `_switchboard_host` in {codex, claude};
+        # it is now host-independent, so an unrecognized/absent host still gets denied.
         payload = self.pre_payload("backend-agy", tool_name="PowerShell", host="backend")
         payload["tool_input"] = {"command": "agy --print internal-package"}
-        self.assertEqual(routing_gate.pre_tool_use(payload), {})
+        result = routing_gate.pre_tool_use(payload)
+        output = result["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("MCP route_agent_task", output["permissionDecisionReason"])
+        self.assertIn('surface="cli"', output["permissionDecisionReason"])
+
+    def test_direct_agy_denied_without_host_field(self):
+        # Same host-independence guarantee, but with `_switchboard_host` absent
+        # entirely rather than set to an unrecognized value.
+        payload = self.pre_payload("no-host-agy", tool_name="PowerShell")
+        del payload["_switchboard_host"]
+        payload["tool_input"] = {"command": "agy --print x"}
+        result = routing_gate.pre_tool_use(payload)
+        output = result["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("MCP route_agent_task", output["permissionDecisionReason"])
+        self.assertIn('surface="cli"', output["permissionDecisionReason"])
 
     def test_oversized_mcp_is_counted_once_by_pretool_before_posttool(self):
         payload = self.pre_payload("large-mcp", tool_name="mcp__market__research")
@@ -744,6 +770,98 @@ class RoutingGateTests(unittest.TestCase):
         ) as write:
             self.assertEqual(routing_gate.main(["UnknownEvent"]), 0)
         json.loads(write.call_args.args[0])
+
+    def test_normalize_tool_name_canonicalizes_server_segment_only(self):
+        self.assertEqual(
+            routing_gate.normalize_tool_name(
+                "mcp__agent-switchboard__route_agent_task"
+            ),
+            "mcp__agent_switchboard__route_agent_task",
+        )
+        # A hyphen in the TOOL segment survives -- only the server segment is
+        # canonicalized, never a global hyphen/underscore replacement.
+        self.assertEqual(
+            routing_gate.normalize_tool_name("mcp__market-data__get-quote"),
+            "mcp__market_data__get-quote",
+        )
+        self.assertEqual(routing_gate.normalize_tool_name("Read"), "read")
+        self.assertEqual(routing_gate.normalize_tool_name("PowerShell"), "powershell")
+        # Total: never raises on missing/extra `__` separators.
+        self.assertEqual(routing_gate.normalize_tool_name("mcp__onlyserver"), "mcp__onlyserver")
+        self.assertEqual(routing_gate.normalize_tool_name("mcp__"), "mcp__")
+        self.assertEqual(routing_gate.normalize_tool_name(""), "")
+        self.assertEqual(routing_gate.normalize_tool_name(None), "")
+        self.assertEqual(
+            routing_gate.normalize_tool_name("mcp__srv__tool__with__dunders"),
+            "mcp__srv__tool__with__dunders",
+        )
+
+    def test_hyphenated_switchboard_control_is_exempt(self):
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 1):
+            hyphenated = self.pre_payload(
+                "hyphen-control", tool_name="mcp__agent-switchboard__consult_codex"
+            )
+            underscore = self.pre_payload(
+                "underscore-control", tool_name="mcp__agent_switchboard__consult_codex"
+            )
+            self.assertEqual(routing_gate.pre_tool_use(hyphenated), {})
+            self.assertEqual(routing_gate.pre_tool_use(underscore), {})
+        self.assertIsNone(
+            routing_gate._direct_labour_category(
+                "mcp__agent-switchboard__consult_codex", {}
+            )
+        )
+        self.assertIsNone(
+            routing_gate._direct_labour_category(
+                "mcp__agent_switchboard__consult_codex", {}
+            )
+        )
+        # Neither spelling consumed any direct-labour allowance.
+        self.assertNotIn("direct_labour_count", routing_gate._read_state("session-1"))
+
+    def test_powershell_classified_as_shell_labour(self):
+        category = routing_gate._direct_labour_category(
+            "PowerShell", {"command": "Get-ChildItem"}
+        )
+        self.assertIsNotNone(category)
+        self.assertFalse(
+            routing_gate._is_mutating("PowerShell", {"command": "Get-ChildItem"})
+        )
+        self.assertTrue(
+            routing_gate._is_mutating(
+                "PowerShell", {"command": "Set-Content file.txt value"}
+            )
+        )
+
+    def test_gate_decision_log_records_no_arguments(self):
+        secret = "sk-super-secret-token-do-not-log-12345"
+        payload = self.pre_payload(
+            "secret-call", tool_name="Read", host="claude"
+        )
+        payload["tool_input"] = {"path": "source.py", "command": secret}
+        routing_gate.pre_tool_use(payload)
+
+        log_path = routing_gate.STATE_DIR / "session-1.log.jsonl"
+        self.assertTrue(log_path.exists())
+        content = log_path.read_text(encoding="utf-8")
+        lines = [line for line in content.splitlines() if line.strip()]
+        self.assertGreaterEqual(len(lines), 1)
+        self.assertNotIn(secret, content)
+        record = json.loads(lines[0])
+        self.assertIn("decision", record)
+        self.assertIn("tool", record)
+        self.assertIn("category", record)
+
+    def test_routing_report_cli_runs_on_empty_session(self):
+        with mock.patch("sys.stdout.write") as write:
+            result = routing_gate.routing_report_cli(["--session", "no-such-session"])
+        self.assertEqual(result, 0)
+        self.assertTrue(write.called)
+
+    def test_routing_report_cli_last_n_runs_without_raising(self):
+        with mock.patch("sys.stdout.write"):
+            self.assertEqual(routing_gate.routing_report_cli(["--last", "3"]), 0)
+            self.assertEqual(routing_gate.routing_report_cli([]), 0)
 
 
 if __name__ == "__main__":

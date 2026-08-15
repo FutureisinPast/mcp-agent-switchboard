@@ -37,6 +37,11 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    from switchboard_version import BROKER_VERSION
+except Exception:  # noqa: BLE001 - the gate must load even from a partial install
+    BROKER_VERSION = "unknown"
+
 import atomic_io
 
 BROKER_HOME = Path(os.environ.get("AGENT_BROKER_HOME", Path.home() / ".agent-broker"))
@@ -53,9 +58,44 @@ def _env_int(name: str, default: int) -> int:
 
 
 STATE_TTL_SECONDS = 24 * 60 * 60
+# The allowance covers non-mutating micro-work only: reading your own handoff and
+# adjudicating a premise or two before the first delegation. It was ten, which in
+# practice exempted almost every real turn -- a brain finished the whole task inside
+# the allowance and the gate never engaged. Four is enough to orient and no more.
+DIRECT_LABOUR_LIMIT_DEFAULT = 4
 DIRECT_LABOUR_LIMIT = max(
-    1, _env_int("AGENT_BROKER_DIRECT_LABOUR_LIMIT", 10)
+    1, _env_int("AGENT_BROKER_DIRECT_LABOUR_LIMIT", DIRECT_LABOUR_LIMIT_DEFAULT)
 )
+GATE_MODE_ENV = "AGENT_BROKER_GATE_MODE"
+
+
+def gate_mode() -> str:
+    """`enforce` (deny past the allowance) or `warn` (log the denial, allow the call).
+
+    `warn` exists for one shakedown session after a policy change: a gate that starts
+    denying on day one of a new classifier gets disabled by the user, and a disabled
+    gate enforces nothing at all."""
+    mode = str(os.environ.get(GATE_MODE_ENV, "enforce")).strip().lower()
+    return "warn" if mode in {"warn", "warning", "shadow", "observe"} else "enforce"
+
+
+def effective_direct_labour_limit() -> int:
+    """The allowance actually applied.
+
+    The configured value is honoured rather than silently clamped: this env var is
+    owner-facing configuration, and an owner who sets 10 should get 10. The risk it
+    creates -- `AGENT_BROKER_DIRECT_LABOUR_LIMIT=999` quietly turning the policy off
+    while every report still claims the gate is active -- is handled by making it
+    LOUD instead of impossible; see `policy_is_relaxed()`, which surfaces in the
+    per-turn status line and in routing-report."""
+    return DIRECT_LABOUR_LIMIT
+
+
+def policy_is_relaxed() -> bool:
+    """True when the running configuration is weaker than the shipped default."""
+    return gate_mode() == "warn" or DIRECT_LABOUR_LIMIT > DIRECT_LABOUR_LIMIT_DEFAULT
+
+
 CONTEXT_INGRESS_MAX_CHARS = max(
     2_000, _env_int("AGENT_BROKER_CONTEXT_INGRESS_MAX_CHARS", 8_000)
 )
@@ -194,6 +234,29 @@ VALID_RESPONDER_PREFIXES = ("codex:", "claude:", "antigravity:")
 NATIVE_CHEAP_AGENT_TYPES = {"explore", "explorer", "worker", "economy-worker"}
 
 
+def normalize_tool_name(name: str) -> str:
+    """Canonicalize a tool name for classification.
+
+    Lowercases the whole name. For an MCP-style ``mcp__<server>__<tool>``
+    name, hyphens are folded to underscores ONLY in the ``<server>`` segment
+    so that ``mcp__agent-switchboard__route_agent_task`` (Claude's live
+    hyphenated namespace) and ``mcp__agent_switchboard__route_agent_task``
+    (Codex's underscore namespace) classify identically. The split uses only
+    the first two ``__`` separators, so a tool segment that itself contains
+    ``__`` (or hyphens) is left untouched -- never a global hyphen/underscore
+    replacement, which would collapse genuinely distinct tool names. Total:
+    never raises, regardless of how many (or few) ``__`` separators appear.
+    """
+    text = str(name or "").strip().lower()
+    if not text.startswith("mcp__"):
+        return text
+    parts = text.split("__", 2)
+    if len(parts) < 3:
+        return text
+    prefix, server, tool = parts
+    return f"{prefix}__{server.replace('-', '_')}__{tool}"
+
+
 def _session_path(session_id: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)[:200]
     return STATE_DIR / f"{safe}.json"
@@ -201,6 +264,49 @@ def _session_path(session_id: str) -> Path:
 
 def _session_lock_path(session_id: str) -> Path:
     return _session_path(session_id).with_suffix(".lock")
+
+
+def _session_log_path(session_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)[:200]
+    return STATE_DIR / f"{safe}.log.jsonl"
+
+
+def log_gate_decision(
+    session_id: str,
+    event: str,
+    tool: str,
+    category: str | None,
+    decision: str,
+    extra: dict | None = None,
+) -> None:
+    """Append one JSON decision record per line to the session's local log.
+
+    Records classification/decision metadata only: never tool arguments,
+    prompts, command strings, file contents, or tool output. Must never
+    raise -- a logging failure is not allowed to affect gate behaviour.
+    """
+    try:
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return
+        record = {
+            "ts": time.time(),
+            "event": str(event or ""),
+            "tool": str(tool or ""),
+            "category": None if category is None else str(category),
+            "decision": str(decision or ""),
+        }
+        if extra:
+            for key, value in extra.items():
+                key = str(key)
+                if key not in record:
+                    record[key] = value
+        path = _session_log_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:  # noqa: BLE001 - logging must never affect gate behaviour
+        pass
 
 
 def _read_state(session_id: str) -> dict:
@@ -280,7 +386,7 @@ def reserve_direct_labour(
         if tool_use_id and tool_use_id in reservations:
             return
         since_relief = int(state.get("direct_labour_since_relief") or 0)
-        if since_relief >= DIRECT_LABOUR_LIMIT:
+        if since_relief >= effective_direct_labour_limit():
             decision["allowed"] = False
             state["labour_gate_denials"] = int(state.get("labour_gate_denials") or 0) + 1
             return
@@ -415,7 +521,7 @@ def sweep_stale(max_age_seconds: float = STATE_TTL_SECONDS) -> None:
 
 
 def _is_mutating(tool_name: str, tool_input: dict) -> bool:
-    name = str(tool_name or "").strip().lower()
+    name = normalize_tool_name(tool_name)
     if name in MUTATING_TOOL_NAMES:
         return True
     if name in SHELL_TOOL_NAMES or "shell" in name:
@@ -451,7 +557,7 @@ def _shell_command_text(tool_input: object) -> str:
 
 
 def _is_direct_agy_shell_invocation(tool_name: object, tool_input: object) -> bool:
-    name = str(tool_name or "").strip().lower()
+    name = normalize_tool_name(tool_name)
     if name not in SHELL_TOOL_NAMES and "shell" not in name:
         return False
     command = _shell_command_text(tool_input)
@@ -462,12 +568,15 @@ def _is_direct_agy_shell_invocation(tool_name: object, tool_input: object) -> bo
 
 
 def _direct_labour_category(tool_name: object, tool_input: object) -> str | None:
-    name = str(tool_name or "").strip().lower()
+    name = normalize_tool_name(tool_name)
     if not name or name in DELEGATION_TOOL_NAMES:
         return None
     # Opposite-vendor consultation is brain work, not same-vendor labour. The
     # broker independently rejects same-vendor labour unless native-unavailable
     # is documented, so consultation controls must remain usable at the gate.
+    # Both the underscore (Codex) and hyphenated (Claude's live tool names)
+    # Switchboard namespace spellings are exempt -- normalize_tool_name folds
+    # them to the same canonical `mcp__agent_switchboard__` form.
     if name.startswith("mcp__agent_switchboard__") and any(
         name.endswith(suffix) for suffix in SWITCHBOARD_CONTROL_SUFFIXES
     ):
@@ -492,7 +601,51 @@ def user_prompt_submit(payload: dict) -> dict:
     sweep_stale()
     session_id = str(payload.get("session_id") or "").strip()
     reset_turn_state(session_id)
-    return {}
+    context = _standing_policy_context(session_id)
+    if not context:
+        return {}
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    }
+
+
+def _standing_policy_context(session_id: str) -> str:
+    """A fixed, field-validated status line injected each turn.
+
+    Why this exists: a harness-level system instruction on some hosts says "do not call
+    the AgentTool unless the user requested it", which outranks a policy file and left
+    the brain doing everything itself. This states the owner's standing request as
+    user-owned configuration, so the harness condition is satisfied rather than fought.
+
+    Everything interpolated below is a validated int/enum/semver produced by this
+    module. No free-form ids, error text, tool names, or user-derived strings — an
+    injected status line must never become a channel for prompt content."""
+    try:
+        limit = int(effective_direct_labour_limit())
+        mode = "warn" if gate_mode() == "warn" else "enforce"
+        used = 0
+        if session_id:
+            used = int(_read_state(session_id).get("direct_labour_since_relief") or 0)
+        remaining = max(0, limit - used)
+        version = str(BROKER_VERSION)
+        if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+            version = "unknown"
+        relaxed = " | POLICY RELAXED (weaker than shipped default)" if policy_is_relaxed() else ""
+        return (
+            f"[routing] delegation-policy: active | gate: {mode} | "
+            f"direct-labour budget: {remaining}/{limit} remaining | switchboard {version}{relaxed}. "
+            "The owner has a STANDING REQUEST to delegate eligible labour: dispatching one "
+            "bounded package to the Flash workhorse (route_agent_task, target_agent='antigravity', "
+            "surface='cli', target_model='gemini flash', effort='high') or to a managed native "
+            "subagent is pre-authorized and does not need fresh permission this turn. Flash is the "
+            "default lane for bounded reading, search, extraction, summarising and drafting; use a "
+            "native role when the package needs host-only tools or session state, and say why."
+        )
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def register_brain_override(session_id: str, package_id: str, reason: str) -> bool:
@@ -535,6 +688,138 @@ def routing_override_cli(argv: list[str]) -> int:
     return 0 if ok else 2
 
 
+def _report_state_files_by_mtime(limit: int) -> list[Path]:
+    try:
+        files = list(STATE_DIR.glob("*.json"))
+    except OSError:
+        return []
+    try:
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        pass
+    return files[: max(0, limit)]
+
+
+def _read_session_log(log_path: Path) -> list[dict]:
+    records: list[dict] = []
+    if not log_path.exists():
+        return records
+    try:
+        text = log_path.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return records
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _format_routing_report(label: str, state: dict, log_records: list[dict]) -> str:
+    lines = [f"Routing report: {label}"]
+    counts = state.get("direct_labour_counts") or {}
+    nonzero = [
+        f"{name}={int(counts.get(name) or 0)}"
+        for name in DIRECT_BRAIN_LABOUR_CATEGORIES
+        if int(counts.get(name) or 0)
+    ]
+    lines.append("Direct labour by category: " + (", ".join(nonzero) if nonzero else "(none)"))
+    lines.append(f"Total direct labour: {int(state.get('direct_labour_count') or 0)}")
+    lines.append(
+        f"Direct labour since last relief: {int(state.get('direct_labour_since_relief') or 0)}"
+    )
+    lines.append(f"Relief sequence: {int(state.get('labour_relief_sequence') or 0)}")
+    lines.append(f"Denials: {int(state.get('labour_gate_denials') or 0)}")
+
+    agents = state.get("native_agents") or {}
+    started = [a for a in agents.values() if isinstance(a, dict)]
+    completed = [a for a in started if a.get("completed")]
+    lines.append(f"Native agents: started={len(started)} completed={len(completed)}")
+    for agent_id, agent in agents.items():
+        if isinstance(agent, dict):
+            lines.append(
+                f"  {agent_id}: type={agent.get('agent_type')} status={agent.get('status')}"
+            )
+
+    overrides = state.get("brain_overrides") or {}
+    lines.append(f"Brain overrides: {len(overrides)}")
+    for package_id, override in overrides.items():
+        if isinstance(override, dict):
+            lines.append(f"  {package_id}: {override.get('reason')}")
+
+    denial_log_count = sum(
+        1 for r in log_records if str(r.get("decision") or "") == "deny"
+    )
+    credit_log_count = sum(
+        1 for r in log_records if str(r.get("decision") or "") == "credit"
+    )
+    dispatch_outcomes: dict[str, int] = {}
+    for record in log_records:
+        tool = str(record.get("tool") or "")
+        if "route_agent_task" in tool:
+            outcome = str(record.get("outcome") or record.get("decision") or "unknown")
+            dispatch_outcomes[outcome] = dispatch_outcomes.get(outcome, 0) + 1
+    if dispatch_outcomes:
+        lines.append(
+            "Switchboard dispatches: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(dispatch_outcomes.items()))
+        )
+    lines.append(f"Log denials: {denial_log_count}")
+    lines.append(f"Log credits: {credit_log_count}")
+    return "\n".join(lines)
+
+
+def routing_report_cli(argv: list[str]) -> int:
+    """Print a compact human summary of session gate state + decision log.
+
+    A report never fails a session: any lookup/parse problem falls back to
+    an empty/"no sessions found" report rather than raising or exiting
+    non-zero.
+    """
+    parser = argparse.ArgumentParser(prog="agent-switchboard routing-report")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--session")
+    group.add_argument("--last", type=int, default=1)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit:
+        return 0
+    try:
+        if args.session:
+            state_path = _session_path(args.session)
+            sessions = [(args.session, state_path)]
+        else:
+            limit = args.last if args.last and args.last > 0 else 1
+            sessions = [(p.stem, p) for p in _report_state_files_by_mtime(limit)]
+        if not sessions:
+            sys.stdout.write("Routing report: no sessions found\n")
+            return 0
+        reports = []
+        for label, state_path in sessions:
+            try:
+                state = (
+                    json.loads(state_path.read_text(encoding="utf-8"))
+                    if state_path.exists()
+                    else {}
+                )
+            except Exception:  # noqa: BLE001
+                state = {}
+            log_path = state_path.with_name(state_path.stem + ".log.jsonl")
+            reports.append(
+                _format_routing_report(label, state, _read_session_log(log_path))
+            )
+        sys.stdout.write("\n\n".join(reports) + "\n")
+    except Exception:  # noqa: BLE001 - a report must never fail a session
+        sys.stdout.write("Routing report: unavailable\n")
+    return 0
+
+
 def _routing_override_command(session_id: str) -> str:
     if getattr(sys, "frozen", False):
         argv = [sys.executable, "routing-override"]
@@ -560,9 +845,19 @@ def pre_tool_use(payload: dict) -> dict:
     """
     sweep_stale()
     host = str(payload.get("_switchboard_host") or "").strip().lower()
-    if host in {"codex", "claude"} and _is_direct_agy_shell_invocation(
+    session_id = str(payload.get("session_id") or "").strip()
+    normalized_tool = normalize_tool_name(payload.get("tool_name"))
+    # Host-independent on purpose. This used to require host in {codex, claude}, which
+    # meant a hook invoked without its host argument silently stopped enforcing a
+    # security boundary. Nothing legitimate needs the SENDER to run agy itself: the
+    # Switchboard backend runs it out of process, well outside this hook.
+    if _is_direct_agy_shell_invocation(
         payload.get("tool_name"), payload.get("tool_input") or {}
     ):
+        log_gate_decision(
+            session_id, "PreToolUse", normalized_tool, None, "deny",
+            extra={"reason": "direct_agy_shell"},
+        )
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -577,11 +872,11 @@ def pre_tool_use(payload: dict) -> dict:
                 ),
             }
         }
-    session_id = str(payload.get("session_id") or "").strip()
     category = _direct_labour_category(
         payload.get("tool_name"), payload.get("tool_input") or {}
     )
     if not session_id or not category:
+        log_gate_decision(session_id, "PreToolUse", normalized_tool, category, "allow")
         return {}
     reserved = reserve_direct_labour(
         session_id,
@@ -591,28 +886,51 @@ def pre_tool_use(payload: dict) -> dict:
         _payload_is_cheap_native_call(payload),
     )
     if reserved is None:
+        log_gate_decision(
+            session_id, "PreToolUse", normalized_tool, category, "allow",
+            extra={"fail_open": True},
+        )
         return {}
     allowed, state = reserved
     if allowed:
+        log_gate_decision(session_id, "PreToolUse", normalized_tool, category, "reserve")
         return {}
     counts = state.get("direct_labour_counts") or {}
     observed = ", ".join(
         f"{name}={int(counts.get(name) or 0)}"
         for name in DIRECT_BRAIN_LABOUR_CATEGORIES
         if int(counts.get(name) or 0) > 0
-    ) or f"total={DIRECT_LABOUR_LIMIT}"
+    ) or f"total={effective_direct_labour_limit()}"
+    # Lead with the cheapest lane and give it as a copy-pasteable call. The old message
+    # named only the native roles and the override syntax, so a blocked brain reached
+    # for a native subagent (or an override) and never discovered the workhorse that is
+    # a tenth of the price -- the gate was quietly teaching the expensive habit.
     reason = (
-        f"Native-first labour gate: the main brain already performed "
-        f"{int(state.get('direct_labour_since_relief') or 0)} direct labour calls since "
-        "the last native package/brain override "
-        f"({observed}). The next {category} call is blocked. Start the same-vendor "
-        "managed reader/workhorse for a bounded package; Agent/Task/spawn_agent remains "
-        "available. For a genuinely brain-owned package, register the exact override with: "
-        f"{_routing_override_command(session_id)}. High-risk judgment and final approval "
-        "stay with the brain, but the "
-        "deterministic evidence, test, documentation, or mechanical remainder must be "
-        "delegated. Any registered override must appear verbatim in the completion audit."
+        f"Routing gate: {int(state.get('direct_labour_since_relief') or 0)} direct brain "
+        f"labour calls since the last delegation or override ({observed}); the allowance is "
+        f"{effective_direct_labour_limit()}. The next {category} call is blocked. Pick a lane:\n"
+        "1. DEFAULT — dispatch the bounded package to the Flash workhorse (~1/10 the cost of "
+        "the native workhorse, several times faster):\n"
+        "   route_agent_task {target_agent:'antigravity', surface:'cli', "
+        "target_model:'gemini flash', effort:'high', mode:'plan', task_kind:'quick_check', "
+        "work_package_id:'WP-<id>', prompt:'<one bounded package>'}\n"
+        "   (add mode:'accept-edits' + allowed_files + acceptance_criteria to implement)\n"
+        "2. Native cheap role (Agent/Task) when the package needs host-only tools or session "
+        "state Flash cannot see — then state the flash_skip reason in the audit.\n"
+        "3. Brain-retained package — register it exactly:\n"
+        f"   {_routing_override_command(session_id)}\n"
+        "Delegation tools are never blocked. High-risk judgment and final approval stay with "
+        "the brain; the deterministic evidence, test, documentation, or mechanical remainder "
+        "does not. Any registered override must appear verbatim in the completion audit."
     )
+    if gate_mode() == "warn":
+        # Shakedown mode: record exactly what WOULD have been denied, then allow it.
+        log_gate_decision(
+            session_id, "PreToolUse", normalized_tool, category, "warn",
+            extra={"would_deny": True},
+        )
+        return {}
+    log_gate_decision(session_id, "PreToolUse", normalized_tool, category, "deny")
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -708,12 +1026,24 @@ def post_tool_use(payload: dict) -> dict:
     sweep_stale()
     session_id = str(payload.get("session_id") or "").strip()
     tool_input = payload.get("tool_input") or {}
+    normalized_tool = normalize_tool_name(payload.get("tool_name"))
     mutated = _is_mutating(payload.get("tool_name"), tool_input)
     if session_id and mutated and not _payload_is_cheap_native_call(payload):
         mark_mutated(session_id)
     ingress_feedback = _context_ingress_feedback(payload)
+    log_gate_decision(
+        session_id,
+        "PostToolUse",
+        normalized_tool,
+        None,
+        "deny" if ingress_feedback is not None else "allow",
+        extra={"mutated": bool(mutated)},
+    )
     if ingress_feedback is not None:
         return ingress_feedback
+    credit = _credit_switchboard_dispatch(session_id, normalized_tool, payload)
+    if credit is not None:
+        return credit
     if session_id:
         notify = {"value": False}
 
@@ -725,7 +1055,7 @@ def post_tool_use(payload: dict) -> dict:
             )
             if (
                 int(state.get("direct_labour_since_relief") or 0)
-                == DIRECT_LABOUR_LIMIT
+                == effective_direct_labour_limit()
                 and checkpoint_sequence != sequence
             ):
                 state["labour_checkpoint_sequence"] = sequence
@@ -737,14 +1067,132 @@ def post_tool_use(payload: dict) -> dict:
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",
                     "additionalContext": (
-                        f"Native-first checkpoint: this turn reached {DIRECT_LABOUR_LIMIT} "
-                        "direct brain labour calls since the last native package/override. "
-                        "The next eligible labour call will be denied until another bounded "
-                        "same-vendor native package starts or an exact brain override is registered."
+                        f"Routing checkpoint: {effective_direct_labour_limit()} direct brain "
+                        "labour calls since the last delegation or override. The next eligible "
+                        "labour call will be denied. Cheapest next move: dispatch the bounded "
+                        "package with route_agent_task (target_agent='antigravity', "
+                        "surface='cli', target_model='gemini flash', effort='high', mode='plan')."
                     ),
                 }
             }
     return {}
+
+
+CREDITABLE_DISPATCH_TOOL = "mcp__agent_switchboard__route_agent_task"
+CREDITABLE_OUTCOME = "completed_verified"
+
+
+def _extract_dispatch_result(payload: dict) -> dict | None:
+    """Pull the router's result dict out of a PostToolUse payload.
+
+    The response arrives as MCP content blocks holding a JSON string, so it has to be
+    unwrapped before anything in it can be trusted (and it is only ever used to look up
+    a server-issued receipt in the ledger — never as authority in itself)."""
+    response = payload.get("tool_response")
+    if isinstance(response, str):
+        try:
+            response = json.loads(response)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if isinstance(response, dict) and "content" in response:
+        blocks = response.get("content") or []
+        for block in blocks:
+            if isinstance(block, dict) and block.get("type") == "text":
+                try:
+                    parsed = json.loads(block.get("text") or "")
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if isinstance(parsed, dict):
+                    return parsed
+        return None
+    return response if isinstance(response, dict) else None
+
+
+def _receipt_resolves(receipt: str) -> bool:
+    """True when the receipt names a real consultation row.
+
+    This is the whole point of a server-issued receipt: without the ledger lookup a
+    sender could mint `broker:<any-uuid>` and claim credit for a dispatch it never made.
+
+    Fails CLOSED, unlike the rest of the gate. That is safe here rather than merely
+    strict: a genuine receipt can only have been issued by a server new enough to have
+    the `request_id` column, and that same server creates the column on startup. So an
+    unreadable or unmigrated ledger cannot be hiding a real receipt — it can only be
+    hiding a fabricated one. The cost of a false negative is one override or native
+    package; the cost of a false positive is that the receipt means nothing at all."""
+    request_id = str(receipt or "").split(":", 1)[-1].strip()
+    if not request_id:
+        return False
+    try:
+        with sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2.0) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM consultations WHERE request_id = ? LIMIT 1", (request_id,)
+            ).fetchone()
+        return bool(row)
+    except sqlite3.Error:
+        return False
+
+
+def _credit_switchboard_dispatch(session_id: str, normalized_tool: str, payload: dict) -> dict | None:
+    """Grant one bounded block for a dispatch that actually completed.
+
+    Only `completed_verified` earns relief. A blocked, rejected, failed, or
+    unavailable dispatch earns nothing: otherwise a sender could farm credit by
+    repeatedly firing a route it knows is broken, which is strictly cheaper than
+    doing the work and would make the gate an incentive to spam a dead lane."""
+    if not session_id or normalized_tool != CREDITABLE_DISPATCH_TOOL:
+        return None
+    result = _extract_dispatch_result(payload)
+    if not isinstance(result, dict):
+        return None
+    receipt = str(result.get("receipt") or "")
+    outcome = str(result.get("outcome") or "")
+    work_package = str(result.get("work_package_id") or "") or "unnamed-package"
+    if not BROKER_RECEIPT_RE.search(receipt):
+        log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "no-credit",
+                          extra={"reason": "missing or malformed receipt", "outcome": outcome})
+        return None
+    if outcome != CREDITABLE_OUTCOME:
+        log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "no-credit",
+                          extra={"reason": f"outcome={outcome or 'unknown'}", "receipt": receipt})
+        return None
+    if not _receipt_resolves(receipt):
+        log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "no-credit",
+                          extra={"reason": "receipt does not resolve in the ledger"})
+        return None
+
+    granted = {"value": False}
+
+    def update(state: dict) -> None:
+        credited = state.setdefault("credited_receipts", [])
+        if receipt in credited:
+            return  # one-use: a replayed receipt buys nothing
+        credited.append(receipt)
+        state["direct_labour_since_relief"] = 0
+        state["labour_relief_sequence"] = int(state.get("labour_relief_sequence") or 0) + 1
+        dispatches = state.setdefault("switchboard_dispatches", [])
+        dispatches.append({"receipt": receipt, "work_package_id": work_package, "outcome": outcome})
+        granted["value"] = True
+
+    _update_state(session_id, update)
+    if not granted["value"]:
+        log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "no-credit",
+                          extra={"reason": "receipt already credited", "receipt": receipt})
+        return None
+    log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "credit",
+                      extra={"receipt": receipt, "work_package_id": work_package})
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": (
+                f"Routing credit: {work_package} completed on the Flash workhorse lane "
+                f"({receipt}); the next bounded block is open. The result is EVIDENCE, not "
+                "acceptance — check the cited lines, the actual diff, and any check output "
+                "before accepting it or dispatching the next package, and cite this receipt "
+                "in the routing audit."
+            ),
+        }
+    }
 
 
 def _ledger_reachable(timeout: float = 1.5) -> bool:

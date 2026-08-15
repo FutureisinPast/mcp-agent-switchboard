@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -208,8 +209,7 @@ class HierarchyInstallTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "Read" in str(group.get("matcher", ""))
-                and "mcp__.*" in str(group.get("matcher", ""))
+                str(group.get("matcher", "")) == ".*"
                 for group in settings["hooks"]["PostToolUse"]
             )
         )
@@ -238,8 +238,7 @@ class HierarchyInstallTests(unittest.TestCase):
             )
         self.assertTrue(
             any(
-                "Read" in str(group.get("matcher", ""))
-                and "mcp__.*" in str(group.get("matcher", ""))
+                str(group.get("matcher", "")) == ".*"
                 for group in settings["hooks"]["PreToolUse"]
             )
         )
@@ -260,8 +259,7 @@ class HierarchyInstallTests(unittest.TestCase):
             )
         self.assertTrue(
             any(
-                "Read" in str(group.get("matcher", ""))
-                and "mcp__.*" in str(group.get("matcher", ""))
+                str(group.get("matcher", "")) == ".*"
                 for group in codex_hooks["PostToolUse"]
             )
         )
@@ -280,15 +278,14 @@ class HierarchyInstallTests(unittest.TestCase):
             )
         self.assertTrue(
             any(
-                "Read" in str(group.get("matcher", ""))
-                and "mcp__.*" in str(group.get("matcher", ""))
+                str(group.get("matcher", "")) == ".*"
                 for group in codex_hooks["PreToolUse"]
             )
         )
 
         hierarchy_lower = codex_text.lower()
         self.assertIn("same-vendor", hierarchy_lower)
-        self.assertIn("native subagents first", hierarchy_lower)
+        self.assertIn("default workhorse", hierarchy_lower)
         self.assertIn("agent switchboard", hierarchy_lower)
         self.assertIn("opposite-vendor", hierarchy_lower)
         self.assertIn("fallback", hierarchy_lower)
@@ -302,7 +299,7 @@ class HierarchyInstallTests(unittest.TestCase):
         self.assertIn("retain final judgment", hierarchy_lower)
         self.assertIn("external antigravity flash lane", hierarchy_lower)
         self.assertIn("not a native child agent", hierarchy_lower)
-        self.assertIn("codex, claude, and gemini brains should proactively consider", hierarchy_lower)
+        self.assertIn("codex, claude, and gemini brains use the newest live antigravity gemini flash high", hierarchy_lower)
         self.assertIn("bounded search, reading, extraction, summaries, drafting", hierarchy_lower)
         self.assertIn("low-risk implementation/tests from an approved plan", hierarchy_lower)
         self.assertIn("must call mcp `route_agent_task`", hierarchy_lower)
@@ -334,8 +331,8 @@ class HierarchyInstallTests(unittest.TestCase):
         self.assertIn("every planned and unplanned package", hierarchy_lower)
         self.assertIn("direct-brain-labour", hierarchy_lower)
         self.assertIn("pretooluse", hierarchy_lower)
-        self.assertIn("first ten direct labour calls", hierarchy_lower)
-        self.assertIn("each native start or registered override opens the next bounded block", hierarchy_lower)
+        self.assertIn("allowance is four direct labour calls", hierarchy_lower)
+        self.assertIn("each relief opens only the next bounded block", hierarchy_lower)
         self.assertIn("reconcile every claude-managed background", hierarchy_lower)
         self.assertIn("launching or detaching a job is never verification", hierarchy_lower)
 
@@ -499,6 +496,109 @@ class HierarchyInstallTests(unittest.TestCase):
                 for item in remaining_handlers
             )
         )
+
+
+    # -- WP8-HIERARCHY-TEXT: Flash-first routing body + full-tool matcher --
+
+    def test_body_makes_flash_the_default_workhorse(self):
+        body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
+        self.assertIn("route_agent_task", body)
+        self.assertIn("gemini flash", body.lower())
+        self.assertIn("surface", body.lower())
+        self.assertIn("STANDING REQUEST", body)
+        self.assertNotIn("Native-first routing order is mandatory", body)
+        self.assertNotIn("first ten", body.lower())
+
+    def test_body_keeps_flash_prohibitions(self):
+        body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
+        for phrase in (
+            "danger-full-access",
+            "production SSH",
+            "destructive operations, migrations, or live deployment",
+            "exactly one bounded work package",
+            "never a frontier consultant",
+            "MUST NOT invoke `agy`",
+            "Only the Switchboard backend may start `agy`",
+            "A Flash completion is never acceptance",
+            "Routing audit",
+            "broker:<uuid>",
+        ):
+            self.assertIn(phrase, body, phrase)
+
+    def test_body_has_no_pinned_flash_version(self):
+        body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
+        self.assertNotIn("3.6", body)
+        self.assertNotIn("3.7", body)
+        self.assertIsNone(re.search(r"[Ff]lash\s*3\.\d", body))
+
+    def test_matcher_intercepts_all_tools(self):
+        path = self.paths.claude_settings
+        path.parent.mkdir(parents=True, exist_ok=True)
+        hierarchy_install.update_hooks(
+            path,
+            '"C:\\Agent Switchboard\\agent-switchboard.exe" routing-hook',
+            "claude",
+            self.backup,
+        )
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for event in ("PreToolUse", "PostToolUse"):
+            matchers = [group.get("matcher") for group in data["hooks"][event]]
+            self.assertIn(".*", matchers)
+
+    def test_refresh_replaces_prior_installer_block_without_edited_refusal(self):
+        self.paths.claude_md.parent.mkdir(parents=True, exist_ok=True)
+        known_checksum = next(iter(hierarchy_install.KNOWN_HIERARCHY_BODY_CHECKSUMS))
+        # Simulate a block written by a prior installer release whose marker
+        # checksum does not self-hash the body beneath it (e.g. an older
+        # canonicalization). It is still recognized because the checksum is
+        # one this installer has shipped before.
+        stale_block = (
+            f"<!-- agent-switchboard:cost-routing:begin sha256={known_checksum} -->\n"
+            "old policy text from a prior installer release\n"
+            f"{hierarchy_install.BLOCK_END}\n"
+        )
+        self.paths.claude_md.write_text(
+            "# My CLAUDE.md\nkeep this\n\n" + stale_block, encoding="utf-8"
+        )
+
+        first = self.refresh()["Claude global hierarchy"]
+        self.assertEqual(first, "updated")
+        text = self.paths.claude_md.read_text(encoding="utf-8")
+        self.assertNotIn("old policy text from a prior installer release", text)
+        self.assertIn("# My CLAUDE.md\nkeep this", text)
+        self.assertEqual(text.count("agent-switchboard:cost-routing:begin"), 1)
+
+        second = self.refresh()["Claude global hierarchy"]
+        self.assertEqual(second, "unchanged")
+
+    def test_refresh_still_refuses_user_edited_block(self):
+        self.paths.claude_md.parent.mkdir(parents=True, exist_ok=True)
+        unknown_checksum = "0" * 64
+        edited_block = (
+            f"<!-- agent-switchboard:cost-routing:begin sha256={unknown_checksum} -->\n"
+            "hand-edited routing policy text\n"
+            f"{hierarchy_install.BLOCK_END}\n"
+        )
+        self.paths.claude_md.write_text(edited_block, encoding="utf-8")
+
+        result = self.refresh()["Claude global hierarchy"]
+
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertEqual(self.paths.claude_md.read_text(encoding="utf-8"), edited_block)
+
+    def test_all_three_globals_get_equivalent_body(self):
+        self.refresh()
+        bodies = {}
+        for name, path in (
+            ("codex", self.paths.codex_agents_md),
+            ("claude", self.paths.claude_md),
+            ("gemini", self.paths.gemini_md),
+        ):
+            parts = hierarchy_install._block_parts(path.read_text(encoding="utf-8"))
+            self.assertIsNotNone(parts, name)
+            bodies[name] = parts[2]
+        self.assertEqual(bodies["codex"], bodies["claude"])
+        self.assertEqual(bodies["claude"], bodies["gemini"])
 
 
 if __name__ == "__main__":

@@ -26,6 +26,29 @@ BLOCK_END = "<!-- agent-switchboard:cost-routing:end -->"
 LEGACY_HEADING_RE = re.compile(r"(?im)^(#{1,2})\s+cost-aware model routing\s*$")
 MANAGED_FILE_RE = re.compile(r"(?m)^# agent-switchboard:managed sha256=([0-9a-f]{64})\s*$")
 
+# sha256 checksums of `routing_rules_body()` output that this installer has
+# shipped in an earlier release, recorded so an in-place upgrade recognizes
+# its own prior block as legacy-replaceable rather than "user edited". The
+# marker's self-consistency check (see `_block_checksum_valid`) already lets
+# any installer-written block -- old policy text or new -- be replaced,
+# because the installer always writes a checksum that matches the body
+# beneath it regardless of what that body says. This set is the defensive
+# fallback for the case where an older installer release computed the marker
+# checksum a different way (e.g. a canonicalization change) so
+# self-consistency no longer holds for a block it wrote. A block whose
+# checksum matches neither check is a genuine user edit and stays refused.
+# Never hand-edit a checksum line to add yourself to this set; only record a
+# checksum actually produced by a prior `routing_rules_body()` release.
+KNOWN_HIERARCHY_BODY_CHECKSUMS = frozenset(
+    {
+        # v1.0.33 routing_rules_body(), rendered against the installer's test
+        # role fixture (CODEX_ROLES/CLAUDE_ROLES in
+        # tests/test_hierarchy_install.py), captured 2026-08-15 by calling
+        # the pre-WP8 routing_rules_body() before its rewrite.
+        "d3612ab90cd701c91ab254b0ea52841ba04e314a435992c829ed19207b737184",
+    }
+)
+
 
 @dataclass(frozen=True)
 class HierarchyPaths:
@@ -131,9 +154,13 @@ def update_instruction_block(
     except ValueError as exc:
         return f"ERROR: {exc}; left untouched"
     if parts:
-        if not _block_checksum_valid(existing):
-            return "ERROR: managed routing block was edited; left untouched"
         start, end, _old_body = parts
+        marker_checksum = start.group(1)
+        if (
+            not _block_checksum_valid(existing)
+            and marker_checksum not in KNOWN_HIERARCHY_BODY_CHECKSUMS
+        ):
+            return "ERROR: managed routing block was edited; left untouched"
         updated = existing[: start.start()] + rendered + existing[end + len(BLOCK_END) :]
     elif replace_legacy and replace_legacy(existing):
         updated = rendered + "\n"
@@ -261,27 +288,41 @@ def routing_rules_body(codex_roles: dict, claude_roles: dict) -> str:
     return f"""## Cost-aware model hierarchy
 
 - The model selected for the main session is the brain. Never rewrite that user choice. The brain owns requirements, architecture, planning, decomposition, hard diagnosis, high-risk decisions, and final sign-off.
-- Native-first routing order is mandatory: for same-vendor labour, use native subagents first. A Codex brain uses the managed `explorer` (`{reader}`/low) and `worker` (`{workhorse}`/medium); a Claude brain uses managed `Explore` (`{claude_roles.get('reader') or 'haiku'}`) and `economy-worker` (`{claude_roles.get('workhorse') or 'sonnet'}`/medium). Do not use Agent Switchboard to launch same-vendor labour unless the named native role is unavailable or fails to start, and record that fallback. The external Antigravity Flash lane below is a distinct allowed Switchboard use, not a native child agent.
+- The owner has issued a STANDING REQUEST to delegate eligible labour: dispatching a bounded package to the Flash workhorse or to a managed native subagent is pre-authorized work, not an optional extra that needs fresh permission each turn.
+- DEFAULT WORKHORSE = the newest live Antigravity Gemini Flash High through Agent Switchboard. For a bounded package -- reading, search, extraction, summaries, drafting, independent parallel read-only packages, and (once containment is enabled) light implementation and tests from an approved plan -- the default lane is `route_agent_task` with `target_agent="antigravity"`, `surface="cli"`, `target_model="gemini flash"`, `effort="high"`, a `work_package_id`, the correct `task_kind`, and `mode="plan"` or `mode="accept-edits"` plus the implementation envelope. It is roughly a tenth the cost of the same-vendor native workhorse and several times faster.
+- Codex, Claude, and Gemini brains use the newest live Antigravity Gemini Flash High through Agent Switchboard as the default fast, cheap external workhorse for bounded search, reading, extraction, summaries, drafting, independent parallel read-only packages, and (once containment is enabled) low-risk implementation/tests from an approved plan.
+- Flash is the default with OBJECTIVE EXCEPTIONS, not an unconditional rule. A Flash-eligible package must end in exactly one of: a Switchboard dispatch, the small direct allowance for non-mutating micro-work, or a native/brain lane carrying a stated `flash_skip` reason with evidence -- `host-tools:<tool-id>` (the package needs host-only MCP tools, skills, or an IDE session), `unshared-state:<evidence-id>` (it depends on session state Flash cannot see), `flash-failed:<broker-receipt>`, `flash-unavailable:<health-id>`, or `atomic-oversize:<plan-id>` (an indivisible package over five files or past the input preflight). "It felt easier to do myself" is not one of them.
+- Native cheap roles: a Codex brain uses the managed `explorer` (`{reader}`/low) and `worker` (`{workhorse}`/medium); a Claude brain uses managed `Explore` (`{claude_roles.get('reader') or 'haiku'}`) and `economy-worker` (`{claude_roles.get('workhorse') or 'sonnet'}`/medium). They remain the correct lane only for the stated exceptions above and for anything needing the host's own tools -- the fallback, not the first choice; record the fallback when one is used. The external Antigravity Flash lane is the default workhorse in the table below, not a native child agent, and never a frontier consultant: a higher Gemini version number does not promote it above Sol/Fable.
 - For non-trivial planning or a hard issue, the brain must obtain one opposite-vendor maximum-effort consultation: a Codex brain uses Claude `{claude_chain}` with runtime attestation; a Claude brain uses the live Codex frontier `{frontier}` at the highest available single-agent effort. On explicit availability/entitlement failure, use the next advertised frontier candidate and report the fallback.
 - Capability tier outranks model version. Gemini Flash High is a useful, non-authoritative workhorse-level adviser; a higher version does not promote it above Sol/Fable or make its advice automatically authoritative. When Claude's `{claude_chain}` frontier chain is unavailable because of quota, reachability, entitlement, or another availability failure, a Codex brain should request a second opinion from the newest live Antigravity Flash High, label it degraded advisory fallback, and retain final judgment.
 - Cross-vendor routing must enter through Agent Switchboard's MCP tools whenever Switchboard is registered. For Flash labour, the sender brain MUST call MCP `route_agent_task`; a request to use Flash "through CLI" means `surface="cli"` on that MCP call. The brain MUST NOT invoke `agy` in a shell or call `consult_antigravity` directly. Only the Switchboard backend may start `agy`; sender-side direct `agy` is prohibited.
-- Codex, Claude, and Gemini brains should proactively consider the newest live Antigravity Gemini Flash High through Agent Switchboard as a fast, cheap external workhorse for bounded search, reading, extraction, summaries, drafting, low-risk implementation/tests from an approved plan, and independent parallel packages. Use `route_agent_task` with `target_agent="antigravity"`, `surface="cli"`, `target_model="gemini flash"`, `effort="high"`, the correct `task_kind`, and `mode="plan"` or `mode="accept-edits"` plus the required implementation envelope.
 - Every Flash call is exactly one bounded work package. Never hand Flash an entire autonomous plan or let it select/continue to another package. For implementation, the sender must provide `work_package_id`, 1-5 exact `allowed_files`, explicit `acceptance_criteria`, and any package-specific `forbidden_actions`; Switchboard rejects an incomplete envelope.
 - A Switchboard-launched Gemini Flash session is the non-authoritative worker for exactly its assigned envelope, never the brain or router. It must not dispatch agents, reinterpret the whole plan, or continue to another package.
 - Switchboard must invoke its internal `agy` backend with the mandatory `--output-format json --json-schema` contract. Missing/malformed fields, scope violations, contradictory completion, ambiguity, failed checks, or unsupported intentional/by-design claims are failures to escalate, not answers to accept.
 - Flash never receives `danger-full-access`, production SSH, live credentials, destructive operations, migrations, or live deployment. It may prepare bounded local changes and checks; the brain owns live deployment and approval.
 - If `agy` or Flash is missing, quota-limited, times out, mismatches the requested model, or otherwise fails, fall back to the host's native cheap roles (Codex `explorer`/`worker`; Claude `Explore`/`economy-worker`) and record the fallback.
 - Flash and native workers may run concurrently only on independent stages/packages. Read-only packages may run in parallel; writes run serially unless their files and state transitions are demonstrably isolated. The brain reviews evidence and actual diffs. A Flash completion is never acceptance: before dispatching another package, the brain independently inspects cited primary lines, the actual diff, and check output. Unsupported claims that a defect is intentional/by design keep the investigation open.
-- Delegate when handoff is cheaper than direct work and verification is cheap: bulk reading/search/extraction/formatting to the native reader; routine writing, light implementation, tests, scripts, and reversible deployment steps from an approved plan to the native workhorse.
-- Plans are portable across vendors. Every package states `Lane | mechanism | exact resolved model/effort | deliverable | verification | escalation`, where Lane is semantic (`brain`, `reader`, or `workhorse`). At execution start, resolve the semantic lane to the executing brain's current same-vendor native role and record the exact model/effort. Never follow an imported foreign-vendor labour model literally; re-resolve it for the current executor.
+- Delegate when handoff is cheaper than direct work and verification is cheap: bulk reading/search/extraction/formatting and routine writing/light implementation/tests/scripts/reversible deployment from an approved plan go to Flash first, with the native reader/workhorse as the stated `flash_skip` fallback.
+- Plans are portable across vendors. Every package states `Lane | mechanism | exact resolved model/effort | deliverable | verification | escalation`, where Lane is semantic (`brain`, `reader`, or `workhorse`). At execution start, resolve the semantic lane to Flash or to the executing brain's current same-vendor native role and record the exact model/effort. Never follow an imported foreign-vendor labour model literally; re-resolve it for the current executor.
 - Keep ambiguous architecture, security/auth/payment/data-loss/migration work, irreversible actions, and approval with the brain. Workers stop on ambiguity, plan deviation, high-risk scope, or a failed fix; the brain diagnoses before redelegating a deterministic remainder.
 - A dirty worktree, same-session ownership, or deployment authority is not a blanket reason to keep reading, test execution, evidence gathering, documentation, or isolated mechanical edits on the brain. Retain only the specific overlapping write or high-risk state transition.
-- Brain overrides are package-specific and use exactly `override: brain - <WP-ID>: <specific reason>`. Bare/global overrides are invalid. The first ten direct labour calls remain flexible; after that, the installed `PreToolUse` gate denies the next eligible read/search/evidence/test/documentation/mechanical call until a same-vendor managed cheap-role agent starts or the brain registers the exact package/reason using the gate-provided local `routing-override` command. Each native start or registered override opens the next bounded block; completed planning delegation never disables implementation enforcement. Registered overrides must appear with the same reason in the final audit.
+- Brain overrides are package-specific and use exactly `override: brain - <WP-ID>: <specific reason>`. Bare/global overrides are invalid. The allowance is four direct labour calls per bounded block for non-mutating micro-work (no writes, no broad shell inspection, no delegation-sized evidence); after that, the installed `PreToolUse` gate denies the next eligible read/search/evidence/test/documentation/mechanical call until relief arrives. Relief comes from a verified Switchboard dispatch receipt, a managed native reader/workhorse package start, or a registered brain override using the gate-provided local `routing-override` command -- a failed, blocked, rejected, or unavailable dispatch earns no relief. Each relief opens only the next bounded block; completed planning delegation never disables implementation enforcement. Registered overrides must appear with the same reason in the final audit.
 - Brain-context ingress is capped by default at roughly 1-2k tokens (8,000 characters). Before a verification response enters brain context, request an explicit field projection and output cap. Oversized MCP evidence is quarantined outside context with its query and location; do not pull the whole artifact back into context.
 - A claim is a decision premise when it being false would change the patch, risk classification, or release decision. The reader locates it; the brain adjudicates only the minimum primary evidence. Every brain-retained premise read states `premise | what changes if false | bounded primary evidence` before inspection. "Needs judgment" never justifies broad rereading.
 - Readers return file:line evidence and distinguish observed facts from interpretation. The brain reviews actual diffs and verification output. Reads may run in parallel; writes are serial unless files are demonstrably independent.
 - Background shell lifecycle is part of package completion: before claiming completion or returning, reconcile every Claude-managed background Bash/PowerShell/Monitor job started in that package by obtaining its terminal result or stopping it. Launching or detaching a job is never verification.
 - Do not claim implementation complete without a `Routing audit` mapping every planned and unplanned package to its lane, mechanism, resolved model/effort, verification, and one receipt: `native:<agent-id>` for a host-attested completed managed subagent, `broker:<uuid>` for an Agent Switchboard call, or the structured per-package brain override. The audit must include `direct-brain-labour: reads=N | searches=N | evidence=N | tests=N | docs=N | other=N`; every nonzero category must appear in a package row as `direct=reads,searches,...`. Native lifecycle attests agent id/type/completion; its checksum-protected role file attests configured model/effort unless the runtime exposes stronger attestation. Never treat prose self-identification as proof; label unavailable runtime model attestation unverified.
+
+### Lane table
+
+| Work | Default lane | Mechanism | Fallback |
+|---|---|---|---|
+| Architecture, ambiguity, security/auth/payment/migration, irreversible ops, approval, hard diagnosis, opposite-vendor consult | brain | direct / `consult_codex`/`consult_claude` (Sol/Fable max) | -- |
+| Bounded read/search/extract/summarize; drafting; independent parallel read-only packages | workhorse = Flash High | `route_agent_task target_agent=antigravity surface=cli target_model="gemini flash" effort=high mode=plan work_package_id=...` | native reader (Explore/Haiku . explorer/Luna) with `flash_skip` |
+| Bounded implementation + tests from an approved plan (<=5 files) -- after containment | workhorse = Flash High | same + `mode=accept-edits package_root allowed_files acceptance_criteria [forbidden_actions verify_commands]` | native workhorse (economy-worker/Sonnet . worker/Terra) with `flash_skip` |
+| Measurement/evidence (hashes, encoding, git state, process state) | broker probes | `run_evidence_probe` | Flash plan-mode -> economy-worker read-only envelope |
+| Host-only tools (session MCP tools, skills, IDE), session-bound state, atomic >5 files, oversize input | native | Agent/spawn_agent cheap role + `flash_skip` evidence | brain override |
+| Tiny non-mutating lookups (<= allowance per block) | brain-direct | Read/Grep/Glob | -- |
 """
 
 
@@ -431,17 +472,24 @@ def update_hooks(
         _merge_hook_event(data, "UserPromptSubmit", _hook_handler(command_prefix, "UserPromptSubmit", host), None)
         _merge_hook_event(data, "SubagentStart", _hook_handler(command_prefix, "SubagentStart", host), None)
         _merge_hook_event(data, "SubagentStop", _hook_handler(command_prefix, "SubagentStop", host), None)
+        # Intercept every tool call, not a hand-maintained name list: a static
+        # matcher silently regresses whenever a host adds or renames a tool
+        # (PowerShell -- this box's primary shell tool -- was missing from the
+        # old list, so PowerShell calls bypassed labour counting, mutation
+        # tracking, and the direct-`agy` hard deny). The classifier owns
+        # per-tool categorization; the matcher's only job is to make sure it
+        # sees everything.
         _merge_hook_event(
             data,
             "PreToolUse",
             _hook_handler(command_prefix, "PreToolUse", host),
-            "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch|Read|Grep|Glob|WebFetch|WebSearch|mcp__.*",
+            ".*",
         )
         _merge_hook_event(
             data,
             "PostToolUse",
             _hook_handler(command_prefix, "PostToolUse", host),
-            "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch|Read|Grep|Glob|WebFetch|WebSearch|mcp__.*",
+            ".*",
         )
         _merge_hook_event(data, "Stop", _hook_handler(command_prefix, "Stop", host), None)
     except Exception as exc:  # noqa: BLE001

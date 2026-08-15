@@ -37,6 +37,10 @@ from pathlib import Path
 
 import hierarchy_install
 import model_roles
+from switchboard_version import BROKER_VERSION
+
+# Keep child probes from flashing a console window on Windows.
+WINDOWS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # --- locations -------------------------------------------------------------
 HOME = Path.home()
@@ -184,6 +188,171 @@ def broker_command() -> tuple[str, list[str]]:
 
 def which(name: str) -> str | None:
     return shutil.which(name) or shutil.which(name + ".cmd") or shutil.which(name + ".exe")
+
+
+# --- registration health (WP1) --------------------------------------------
+# A host can keep running an OLD broker binary forever: `refresh` deliberately skips
+# MCP registration (safe while IDE windows are open), so a hand-pinned or historical
+# command such as `agent-switchboard-1.0.25.exe serve` survives every upgrade. The
+# hooks then run the NEW exe while the MCP server is years behind, which silently
+# disables every server-side capability (tool schemas, envelopes, validation).
+_VERSION_RE = re.compile(r"Agent Switchboard\s+(\d+\.\d+\.\d+)")
+LEGACY_VERSION = "legacy (<1.0.26)"
+
+
+def probe_exe_version(command: str, timeout: float = 20.0) -> str | None:
+    """Version reported by a registered broker command, or LEGACY_VERSION when the
+    binary predates `--version`, or None when it cannot be run at all.
+
+    Only probes a self-contained exe; a `python agent_broker_mcp.py` registration is
+    reported as None (the source tree is whatever is checked out)."""
+    if not command:
+        return None
+    path = Path(command)
+    if path.suffix.lower() != ".exe":
+        return None
+    if not path.exists():
+        return None
+    try:
+        proc = subprocess.run(
+            [str(path), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=WINDOWS_NO_WINDOW,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    blob = f"{proc.stdout}\n{proc.stderr}"
+    match = _VERSION_RE.search(blob)
+    if match:
+        return match.group(1)
+    # Ran, but printed no version banner: a pre-1.0.26 build (usage text only).
+    return LEGACY_VERSION
+
+
+def registered_command(host: str) -> str | None:
+    """The command string a host currently has registered for the broker, if any."""
+    try:
+        if host == "codex":
+            if not CODEX_TOML.exists():
+                return None
+            text = CODEX_TOML.read_text(encoding="utf-8", errors="ignore")
+            section = f"[mcp_servers.{CODEX_KEY}]"
+            index = text.find(section)
+            if index < 0:
+                return None
+            tail = text[index + len(section) :]
+            for line in tail.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    break
+                if stripped.startswith("command"):
+                    _, _, value = stripped.partition("=")
+                    try:
+                        return json.loads(value.strip())
+                    except Exception:  # noqa: BLE001
+                        return value.strip().strip('"').strip("'")
+            return None
+        path = {
+            "claude": CLAUDE_JSON,
+            "claude_desktop": CLAUDE_DESKTOP_CONFIG,
+            "antigravity": antigravity_mcp_path(),
+            "vscode": VSCODE_MCP,
+        }.get(host)
+        if not path or not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        servers = data.get("mcpServers") or data.get("servers") or {}
+        entry = servers.get(MCP_KEY) or {}
+        command = entry.get("command")
+        return str(command) if command else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def canonical_registration() -> tuple[str, list[str]]:
+    """The command hosts SHOULD be registered to.
+
+    Deliberately NOT just `broker_command()`: running this installer from source
+    (`py setup.py status`) makes broker_command() return `python agent_broker_mcp.py`,
+    and treating that as canonical would "repair" a perfectly good self-contained
+    exe registration into a source registration on a machine that has no dev tree.
+    A durable exe in BROKER_HOME always wins."""
+    exe = frozen_broker_exe()
+    if exe.exists():
+        return str(exe), ["serve"]
+    return broker_command()
+
+
+def registration_report() -> list[dict]:
+    """Per-host registration health: what is registered vs what SHOULD be, and the
+    version the registered command actually reports."""
+    canonical, _ = canonical_registration()
+    rows = []
+    version_cache: dict[str, str | None] = {}
+    for host, label in (
+        ("codex", "Codex"),
+        ("claude", "Claude Code"),
+        ("claude_desktop", "Claude Desktop"),
+        ("antigravity", "Antigravity"),
+        ("vscode", "VS Code"),
+    ):
+        current = registered_command(host)
+        if current is None:
+            continue
+        if current not in version_cache:
+            version_cache[current] = probe_exe_version(current)
+        version = version_cache[current]
+        same = bool(current) and Path(current).name.lower() == Path(canonical).name.lower() and (
+            Path(current).resolve() == Path(canonical).resolve()
+            if Path(current).exists() and Path(canonical).exists()
+            else current == canonical
+        )
+        healthy = same and (version is None or version == BROKER_VERSION)
+        rows.append({
+            "host": host,
+            "label": label,
+            "registered": current,
+            "canonical": canonical,
+            "version": version,
+            "matches_canonical": same,
+            "healthy": healthy,
+        })
+    return rows
+
+
+def repair_registrations(dry: bool) -> dict[str, str]:
+    """Re-point any host whose registered broker command is not the canonical exe.
+
+    Deliberately narrow: hosts already on the canonical command are left untouched,
+    so this is safe to run from `refresh` while IDE windows are open (a host only
+    reads its MCP config at startup, so a reload is still required to take effect)."""
+    results: dict[str, str] = {}
+    # MUST be the same source of truth the health report uses. Using broker_command()
+    # here instead would let a source-mode run ("py setup.py hierarchy") re-point a
+    # working self-contained-exe registration at `python agent_broker_mcp.py`.
+    command, cargs = canonical_registration()
+    writers = {
+        "codex": ("Codex MCP", register_codex),
+        "claude": ("Claude MCP", register_claude),
+        "claude_desktop": ("Claude Desktop MCP", register_claude_desktop),
+        "antigravity": ("Antigravity MCP", register_antigravity),
+        "vscode": ("VS Code MCP", register_vscode),
+    }
+    for row in registration_report():
+        if row["matches_canonical"]:
+            continue
+        label, writer = writers[row["host"]]
+        stale = Path(row["registered"]).name
+        if dry:
+            results[label] = f"would re-point {stale} -> {Path(command).name}"
+            continue
+        outcome = writer(command, cargs, False)
+        results[label] = (
+            f"re-pointed {stale} -> {Path(command).name}" if outcome == "registered" else outcome
+        )
+    return results
 
 
 def codex_cli_path_marker() -> str | None:
@@ -835,15 +1004,54 @@ def do_status() -> None:
     info(f"command: {' '.join([cmd, *cargs])}")
     info("mode:    " + ("self-contained exe (serve)" if FROZEN else "python script"))
     info(f"home:    {BROKER_HOME}")
+    info(f"version: {BROKER_VERSION}")
     vsix = latest_vsix()
     info(f"bridge:  {vsix.name if vsix else 'no .vsix found (build it: see build-release.ps1)'}")
+    show_registration_health()
+
+
+def show_registration_health() -> bool:
+    """Print what each host will actually LAUNCH as the MCP server, and whether that
+    binary is the current build. Returns True when every host is healthy.
+
+    Three distinct versions matter and only two are visible here:
+      - configured-path version : what the registered command reports (probed below)
+      - on-disk canonical version : this build, BROKER_VERSION
+      - LIVE process version : provable only from an MCP response (_meta.switchboard)
+    A host that is healthy here can still be SERVING an old process until reloaded."""
+    head("MCP registration")
+    rows = registration_report()
+    if not rows:
+        info("no host has the broker registered yet — run: install")
+        return True
+    healthy = True
+    for row in rows:
+        version = row["version"] or "unknown (python/source registration)"
+        mark = "[ok]" if row["healthy"] else "[!!]"
+        print(f"  {mark} {row['label']:<16} {Path(row['registered']).name}  reports {version}")
+        if not row["healthy"]:
+            healthy = False
+    if not healthy:
+        info("")
+        info(f"UNHEALTHY: a host is registered to a binary that is not this build ({BROKER_VERSION}).")
+        info("Every server-side capability (tool schemas, package envelopes, validation)")
+        info("comes from the REGISTERED binary, not from the hooks. Fix with:")
+        info("    agent-switchboard.exe hierarchy      (re-points stale registrations)")
+        info("then FULLY RELOAD the IDE/CLI windows so the old server process exits.")
+    else:
+        info("")
+        info("All registered commands are this build. A running window still serves the")
+        info("process it started with — reload windows after an upgrade to be certain.")
+    return healthy
 
 
 def do_refresh_hierarchy(dry: bool) -> bool:
-    """Refresh only the durable exe and global hierarchy assets.
+    """Refresh the durable exe, global hierarchy assets, and STALE registrations.
 
-    This intentionally avoids MCP/extension registration, so it is safe while
-    IDE windows are open. A later full install can update host registrations.
+    This avoids re-registering hosts that are already on the canonical command and
+    never touches the bridge extension, so it stays safe while IDE windows are open.
+    It does repair a host pinned to an OLD binary: leaving that alone was how a
+    1.0.25 MCP server survived every upgrade while the hooks ran the new build.
     """
     head("Hierarchy refresh" + (" (dry-run)" if dry else ""))
     results = {}
@@ -854,9 +1062,15 @@ def do_refresh_hierarchy(dry: bool) -> bool:
             for key, value in results.items():
                 print(f"  {key:<24} : {value}")
             return False
+    repairs = repair_registrations(dry)
+    results.update(repairs)
     results.update(refresh_hierarchy(dry=dry))
     for key, value in results.items():
         print(f"  {key:<24} : {value}")
+    if repairs and not dry:
+        info("")
+        info("A stale MCP registration was re-pointed. FULLY RELOAD the affected IDE/CLI")
+        info("windows: a running host keeps serving the process it launched at startup.")
     return not any(str(value).startswith("ERROR") for value in results.values())
 
 

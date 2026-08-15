@@ -333,12 +333,17 @@ class RoutingContractStringsTests(unittest.TestCase):
 
     def test_global_rules_define_proactive_external_flash_workhorse_lane(self):
         text = " ".join(broker.COST_AWARE_ROUTING_RULES).lower()
-        self.assertIn("external antigravity flash workhorse lane", text)
-        self.assertIn("flash is not a native child agent", text)
-        self.assertIn("codex, claude, and gemini brains should proactively consider", text)
-        for task in ("bounded search", "reading", "extraction", "summaries", "drafting"):
+        self.assertIn(
+            "default workhorse = the newest live antigravity gemini flash high", text
+        )
+        self.assertIn("never a native child agent", text)
+        self.assertIn("standing request to delegate eligible labour", text)
+        self.assertIn("pre-authorized work", text)
+        for task in ("search", "reading", "extraction", "summaries", "drafting"):
             self.assertIn(task, text)
-        self.assertIn("low-risk implementation/tests from an approved plan", text)
+        self.assertIn("light implementation and tests from an approved plan", text)
+        self.assertIn("flash is the default with objective exceptions", text)
+        self.assertIn("flash_skip", text)
         self.assertIn("every flash call is exactly one bounded work package", text)
         self.assertIn("at most five allowed files", text)
         self.assertIn("--output-format json with --json-schema", text)
@@ -367,9 +372,11 @@ class RoutingContractStringsTests(unittest.TestCase):
         global_rules = " ".join(broker.COST_AWARE_ROUTING_RULES).lower()
         for text in (implementation, global_rules):
             self.assertIn("pretooluse", text)
-            self.assertIn("ten direct", text)
             self.assertIn("next bounded block", text)
             self.assertIn("routing-override", text)
+        # The canonical allowance now lives in COST_AWARE_ROUTING_RULES as "default
+        # four" (routing_gate.DIRECT_LABOUR_LIMIT_DEFAULT), not the old "ten direct".
+        self.assertIn("default four", global_rules)
         self.assertIn("registered overrides must appear in the final audit", global_rules)
 
 

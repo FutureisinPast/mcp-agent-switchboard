@@ -555,9 +555,11 @@ COST_AWARE_ROUTING_RULES = [
     "The model selected for the main session is the brain; never rewrite that user choice. It owns requirements, architecture, planning, hard diagnosis, risk decisions, and final signoff.",
     "For non-trivial planning or a hard issue, obtain one opposite-vendor maximum-effort consultation: Codex brain -> moving Claude Fable alias (Opus only when Fable is explicitly unavailable); Claude brain -> the live Codex frontier at its highest single-agent effort.",
     "Capability tier outranks model version. Gemini Flash High is a useful, non-authoritative workhorse-level adviser; a higher version does not promote it above Sol/Fable or make its advice automatically authoritative. When Claude's Fable -> Opus chain is unavailable because of quota, reachability, entitlement, or another availability failure, a Codex brain should request a second opinion from the newest live Flash High, label it degraded advisory fallback, and retain final judgment.",
-    "Native first: same-vendor labour uses the host's managed native subagents (Codex explorer/worker; Claude Explore/economy-worker). Agent Switchboard is reserved for opposite-vendor consultation, the external Antigravity Flash workhorse lane, or an explicitly documented native-unavailable fallback; Flash is not a native child agent.",
+    "The owner has issued a STANDING REQUEST to delegate eligible labour: dispatching a bounded package to the Flash workhorse or to a managed native subagent is pre-authorized work, not an optional extra that needs fresh permission each turn.",
+    "DEFAULT WORKHORSE = the newest live Antigravity Gemini Flash High through Agent Switchboard. For a bounded package -- reading, search, extraction, summaries, drafting, independent parallel read-only packages, and (once containment is enabled) light implementation and tests from an approved plan -- the default lane is route_agent_task with target_agent=antigravity, surface=cli, target_model=gemini flash, effort=high, a work_package_id, the correct task_kind, and mode=plan or mode=accept-edits with the implementation envelope. It is roughly a tenth the cost of the same-vendor native workhorse and several times faster.",
+    "Flash is the default with OBJECTIVE EXCEPTIONS, not an unconditional rule. A Flash-eligible package must end in exactly one of: a Switchboard dispatch, the small direct allowance for non-mutating micro-work, or a native/brain lane carrying a stated flash_skip reason with evidence -- host-tools:<tool-id> (the package needs host-only MCP tools, skills, or an IDE session), unshared-state:<evidence-id> (it depends on session state Flash cannot see), flash-failed:<broker-receipt>, flash-unavailable:<health-id>, or atomic-oversize:<plan-id> (an indivisible package over five files or past the input preflight). 'It felt easier to do myself' is not one of them.",
+    "Native cheap roles (Codex explorer/worker; Claude Explore/economy-worker) remain the correct lane for those stated exceptions and for anything needing the host's own tools; they are the fallback, not the first choice. Flash is an external worker, never a native child agent, and never a frontier consultant: a higher Gemini version number does not promote it above Sol/Fable.",
     "Cross-vendor routing must enter through Agent Switchboard's MCP tools whenever Switchboard is registered. For Flash labour, the sender brain MUST call MCP route_agent_task; 'through CLI' means surface=cli on that MCP call. The brain MUST NOT shell out to agy or call consult_antigravity directly. Only the Switchboard backend may start agy; sender-side direct agy is prohibited.",
-    "Codex, Claude, and Gemini brains should proactively consider the newest live Antigravity Gemini Flash High through Agent Switchboard as a fast, cheap external workhorse for bounded search, reading, extraction, summaries, drafting, low-risk implementation/tests from an approved plan, and independent parallel packages. Use route_agent_task with target_agent=antigravity, surface=cli, target_model=gemini flash, effort=high, the correct task_kind, and mode=plan or mode=accept-edits plus the required implementation envelope.",
     "Every Flash call is exactly one bounded work package. Never hand Flash an entire autonomous plan or let it select/continue to the next package. Implementation calls must name a package id, at most five allowed files, explicit acceptance criteria, and forbidden actions; Switchboard rejects an incomplete envelope.",
     "A Switchboard-launched Gemini Flash session is the non-authoritative worker for exactly its assigned envelope, never the brain or router. It must not dispatch agents, reinterpret the whole plan, or continue to another package.",
     "Switchboard's internal agy backend must use --output-format json with --json-schema. Missing/malformed fields, scope violations, contradictory completion, unsupported design-intent claims, ambiguity, or failed checks are failures to escalate -- never prose to accept. The sender brain independently inspects cited lines, the actual diff, and check output before dispatching another package.",
@@ -570,7 +572,7 @@ COST_AWARE_ROUTING_RULES = [
     "On the first ambiguity or failed fix, the item returns to the brain immediately; the brain resolves it and re-delegates only the remaining deterministic work, instead of letting the worker improvise past the blocker.",
     "Flash and native workers may run concurrently only on independent stages/packages. Read-only packages may run in parallel; writes run serially unless their files and state transitions are demonstrably isolated. The brain reviews evidence and actual diffs and owns the final decision.",
     "A dirty worktree or same-session ownership never excuses keeping read-only inventory, tests, evidence, docs, or isolated mechanical work on the brain; only the exact overlapping write or high-risk state transition may be retained.",
-    "The installed native-first PreToolUse gate allows ten direct brain labour calls, then denies the next eligible labour call until a managed same-vendor reader/workhorse starts or the brain registers the exact package/reason with the local routing-override command supplied by the gate. Each relief opens only the next bounded block; registered overrides must appear in the final audit.",
+    "The installed PreToolUse gate allows a small allowance of direct brain labour calls (default four, for non-mutating micro-work such as reading your own handoff and adjudicating a premise), then denies the next eligible labour call until relief arrives. Relief comes from a completed Switchboard dispatch whose ledger receipt verifies, a managed same-vendor reader/workhorse package, or an exact brain override registered with the local routing-override command the gate supplies. A failed, blocked, rejected, or unavailable dispatch earns no relief -- credit cannot be farmed by firing a route known to fail. Each relief opens only the next bounded block; registered overrides must appear in the final audit.",
     "Brain-context ingress defaults to at most 8,000 characters (roughly 1-2k tokens). Verification calls declare a field projection and output cap; oversized raw evidence stays outside context with its query and location.",
     "A decision premise is a claim whose falsity changes the patch, risk classification, or release decision. The reader locates minimal primary evidence; the brain states premise | what changes if false | bounded primary evidence and adjudicates only that range. Never launder a reader interpretation into fact.",
     "Do not accept a worker summary as proof. Validate file-and-line evidence, the actual diff, and check output before signoff.",
@@ -789,6 +791,28 @@ def init_db() -> None:
             )
             """
         )
+        # A consultation row is the ledger entry a Flash receipt points at, so it needs a
+        # stable id the sender can cite. The autoincrement rowid is not usable as a receipt:
+        # it is guessable and reused across databases.
+        consultation_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(consultations)").fetchall()
+        }
+        for column_name, column_sql in (
+            ("request_id", "ALTER TABLE consultations ADD COLUMN request_id TEXT"),
+            ("receipt_meta", "ALTER TABLE consultations ADD COLUMN receipt_meta TEXT"),
+        ):
+            if column_name not in consultation_columns:
+                try:
+                    conn.execute(column_sql)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+        try:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_consultations_request_id ON consultations(request_id)"
+            )
+        except sqlite3.OperationalError:
+            pass
         claude_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(claude_requests)").fetchall()
         }
@@ -4558,12 +4582,60 @@ def consult_antigravity_cli(
             sanitize_flash_workhorse_prompt(prompt),
         ]
     )
+    # Containment baseline. The worker REPORTS which files it changed, and that report
+    # was previously the only evidence: a worker that edited something outside its
+    # allowlist and did not mention it was indistinguishable from one that behaved.
+    # Hashing the package root before and after makes that claim checkable against the
+    # filesystem instead of against the worker's own summary.
+    containment_before: dict[str, str] = {}
+    containment_root: Path | None = None
+    allowed_resolved: set[str] = set()
+    if implementation_mode:
+        allowed_files = list(package.get("allowed_files") or [])
+        containment_root = _containment_root(allowed_files, project_info.root_path)
+        for item in allowed_files:
+            try:
+                allowed_resolved.add(str(Path(item).resolve()))
+            except (OSError, RuntimeError):
+                continue
+        containment_before, scan_error = _containment_scan(containment_root)
+        if scan_error:
+            return f"Antigravity CLI structured-output validation failed: {scan_error}"
+
     code, stdout, stderr = run_process(
         command,
         project_info.root_path,
         None,
         timeout=timeout,
     )
+
+    containment_report: dict[str, Any] | None = None
+    if implementation_mode and containment_root is not None:
+        containment_after, _ = _containment_scan(containment_root)
+        delta = _containment_diff(containment_before, containment_after, allowed_resolved)
+        out_of_scope = (
+            delta["modified_out_of_scope"]
+            + delta["created_out_of_scope"]
+            + delta["deleted_out_of_scope"]
+        )
+        containment_report = {
+            "root": str(containment_root),
+            "allowed_files": sorted(allowed_resolved),
+            "verified_against": "filesystem sha256 before/after",
+            **delta,
+        }
+        if out_of_scope:
+            # Report and refuse; never "clean up". A file outside the allowlist may
+            # belong to the user or another process, and a deleted one cannot be
+            # restored from a hash at all. The brain decides what happened here.
+            containment_report["quarantined"] = True
+            return (
+                "Antigravity CLI structured-output validation failed: containment violation — "
+                f"the worker changed {len(out_of_scope)} path(s) outside its allowed_files. "
+                "Nothing was reverted automatically (an out-of-scope file may be yours). "
+                f"Inspect these paths before trusting the workspace: {out_of_scope[:20]}"
+            )
+
     if code == 124:
         return consult_timeout_message("Antigravity CLI", timeout, stdout)
     if code != 0:
@@ -4578,6 +4650,10 @@ def consult_antigravity_cli(
     structured, validation_errors = validate_flash_workhorse_result(outer, package)
     if validation_errors:
         return "Antigravity CLI structured-output validation failed: " + "; ".join(validation_errors)
+    attested_model = outer.get("model") or outer.get("model_id") or None
+    conflict = attested_model_conflict(model_name, attested_model)
+    if conflict:
+        return "Antigravity CLI structured-output validation failed: " + conflict
     normalized = {
         "package_id": package["package_id"],
         "worker_status": structured.get("status") if structured else "failed",
@@ -4587,9 +4663,154 @@ def consult_antigravity_cli(
             "duration_seconds": outer.get("duration_seconds"),
             "num_turns": outer.get("num_turns"),
             "usage": outer.get("usage"),
+            "model": attested_model,
+            "requested_model": model_name,
+            "attestation": "backend" if attested_model else "none",
         },
+        "containment": containment_report,
     }
     return json.dumps(normalized, ensure_ascii=False)
+
+
+CONTAINMENT_MAX_FILES = 2000
+CONTAINMENT_MAX_BYTES = 50 * 1024 * 1024
+CONTAINMENT_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache"}
+
+
+def _containment_scan(root: Path) -> tuple[dict[str, str], str | None]:
+    """sha256 of every file under `root`, or a refusal reason.
+
+    Bounded on purpose: an unbounded scan of a huge tree would take longer than the
+    package itself and would tempt a future maintainer to skip it entirely."""
+    digests: dict[str, str] = {}
+    total_bytes = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in CONTAINMENT_SKIP_DIRS]
+            for filename in filenames:
+                path = Path(dirpath) / filename
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    continue
+                total_bytes += size
+                if len(digests) >= CONTAINMENT_MAX_FILES or total_bytes > CONTAINMENT_MAX_BYTES:
+                    return {}, (
+                        f"package root {root} exceeds the containment scan cap "
+                        f"({CONTAINMENT_MAX_FILES} files / {CONTAINMENT_MAX_BYTES // (1024*1024)} MB). "
+                        "Narrow allowed_files to a smaller directory, or retain this package in the brain."
+                    )
+                try:
+                    digests[str(path.resolve())] = hashlib.sha256(path.read_bytes()).hexdigest()
+                except OSError:
+                    continue
+    except OSError as exc:
+        return {}, f"containment scan failed: {exc}"
+    return digests, None
+
+
+def _containment_root(allowed_files: list[str], fallback: str) -> Path:
+    """Smallest directory containing every allowed file."""
+    resolved = []
+    for item in allowed_files or []:
+        try:
+            resolved.append(Path(item).resolve())
+        except (OSError, RuntimeError):
+            continue
+    if not resolved:
+        return Path(fallback).resolve()
+    try:
+        return Path(os.path.commonpath([str(p.parent) for p in resolved]))
+    except ValueError:
+        # Different drives: no common ancestor, so there is nothing safe to scan.
+        return Path(fallback).resolve()
+
+
+def _containment_diff(
+    before: dict[str, str], after: dict[str, str], allowed: set[str]
+) -> dict[str, list[str]]:
+    changed = [p for p in after if p in before and after[p] != before[p]]
+    created = [p for p in after if p not in before]
+    deleted = [p for p in before if p not in after]
+    return {
+        "modified_out_of_scope": sorted(p for p in changed if p not in allowed),
+        "created_out_of_scope": sorted(p for p in created if p not in allowed),
+        "deleted_out_of_scope": sorted(p for p in deleted if p not in allowed),
+        "modified_in_scope": sorted(p for p in changed if p in allowed),
+        "created_in_scope": sorted(p for p in created if p in allowed),
+    }
+
+
+# Outcome taxonomy for a Flash dispatch. Only ONE value may ever earn delegation
+# credit; the rest exist so a sender cannot farm relief by repeatedly firing a route
+# it knows will fail. Infrastructure unavailability is kept distinct from validation
+# rejection: the first can justify a native fallback, the second never can (it means
+# the worker misbehaved, and rerouting it to a different worker hides that).
+FLASH_OUTCOME_CREDITABLE = "completed_verified"
+FLASH_INFRASTRUCTURE_PREFIXES = (
+    "Antigravity CLI was not found.",
+    "Antigravity CLI timed out after",
+    "Antigravity CLI exited with code",
+)
+
+
+def classify_flash_outcome(
+    response: str,
+    status: str,
+    structured: dict[str, Any] | None,
+) -> str:
+    text = str(response or "")
+    if text.startswith(FLASH_INFRASTRUCTURE_PREFIXES):
+        return "unavailable_pre_mutation"
+    if text.startswith("Antigravity CLI structured-output validation failed:"):
+        return "rejected"
+    if text.startswith("Antigravity CLI Flash safety policy rejected"):
+        return "rejected"
+    if status == "error":
+        return "failed_pre_mutation"
+    worker_status = (structured or {}).get("status") if isinstance(structured, dict) else None
+    if worker_status == "completed":
+        return FLASH_OUTCOME_CREDITABLE
+    if worker_status == "blocked":
+        return "blocked"
+    if worker_status == "failed":
+        return "failed_pre_mutation"
+    return "rejected"
+
+
+def _model_identity_tokens(name: str) -> set[str]:
+    """Family/version/tier tokens of a model id, for comparison across spellings
+    ('gemini-3.6-flash-high' vs 'Gemini 3.6 Flash (High)')."""
+    lowered = re.sub(r"[^a-z0-9.]+", " ", str(name or "").lower())
+    tokens = set()
+    for part in lowered.split():
+        if part in {"gemini", "flash", "pro", "high", "medium", "low", "thinking"}:
+            tokens.add(part)
+        elif re.fullmatch(r"\d+(\.\d+)?", part):
+            tokens.add(part)
+    return tokens
+
+
+def attested_model_conflict(requested: str | None, attested: str | None) -> str | None:
+    """A message when the backend demonstrably ran a DIFFERENT model than requested.
+
+    Deliberately one-sided. A backend that reports no model at all is recorded as
+    'attestation: none' and left for the brain to judge — failing closed there would
+    brick every dispatch on an `agy` build that omits the field. Only a positive
+    conflict (both sides known, identities incompatible) is rejected, which is the
+    case that would otherwise let a silent downgrade pass as a Flash-High result."""
+    if not requested or not attested:
+        return None
+    want = _model_identity_tokens(requested)
+    got = _model_identity_tokens(attested)
+    if not want or not got:
+        return None
+    if want <= got or got <= want:
+        return None
+    return (
+        f"requested model {requested!r} but the backend attested {attested!r}; "
+        "a resolved-model mismatch is never accepted as a completed package."
+    )
 
 
 def consult_gemini(
@@ -4660,6 +4881,8 @@ def store_consultation(
     status: str,
     error: str | None,
     started_at: str,
+    request_id: str | None = None,
+    receipt_meta: dict[str, Any] | None = None,
 ) -> None:
     init_db()
     branch = run_git(project_info.root_path, ["rev-parse", "--abbrev-ref", "HEAD"])
@@ -4670,8 +4893,9 @@ def store_consultation(
             """
             INSERT INTO consultations (
                 project, root_path, branch, commit_sha, caller, consulted_model,
-                mode, prompt, response, status, error, started_at, finished_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                mode, prompt, response, status, error, started_at, finished_at,
+                request_id, receipt_meta
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 project_info.name,
@@ -4687,8 +4911,49 @@ def store_consultation(
                 scrub_surrogates(error),
                 started_at,
                 utc_now(),
+                request_id,
+                json.dumps(receipt_meta, ensure_ascii=False) if receipt_meta else None,
             ),
         )
+
+
+def lookup_consultation_receipt(request_id: str) -> dict[str, Any] | None:
+    """Resolve a `broker:<uuid>` receipt back to its ledger row.
+
+    This is what makes a receipt verifiable rather than merely well-formed: the gate
+    can confirm the sender actually made the dispatch it is claiming credit for."""
+    rid = str(request_id or "").strip()
+    if not rid:
+        return None
+    try:
+        init_db()
+        with db_connect() as conn:
+            row = conn.execute(
+                """
+                SELECT request_id, consulted_model, mode, status, started_at, finished_at, receipt_meta
+                FROM consultations WHERE request_id = ? LIMIT 1
+                """,
+                (rid,),
+            ).fetchone()
+    except Exception:  # noqa: BLE001
+        return None
+    if not row:
+        return None
+    meta = {}
+    if row[6]:
+        try:
+            meta = json.loads(row[6])
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+    return {
+        "request_id": row[0],
+        "consulted_model": row[1],
+        "mode": row[2],
+        "status": row[3],
+        "started_at": row[4],
+        "finished_at": row[5],
+        "meta": meta,
+    }
 
 
 def _await_codex_row(request_id: str, timeout_seconds: int) -> dict[str, Any] | None:
@@ -5017,8 +5282,31 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         consulted_name = responder_model or (f"{model}:{resolved_model}" if resolved_model else model)
         if effort and model != "codex":
             consulted_name += f" [{effort}]"
+        flash_outcome = None
+        flash_cli_meta = {}
+        consult_request_id = None
+        if model == "antigravity":
+            if isinstance(antigravity_envelope, dict):
+                flash_cli_meta = antigravity_envelope.get("cli") or {}
+            flash_outcome = classify_flash_outcome(response, status, antigravity_structured)
+            consult_request_id = str(uuid.uuid4())
         if not already_stored:
-            store_consultation(project_info, consulted_name, mode, prompt, response, status, error, started_at)
+            store_consultation(
+                project_info, consulted_name, mode, prompt, response, status, error, started_at,
+                request_id=consult_request_id,
+                receipt_meta=(
+                    {
+                        "outcome": flash_outcome,
+                        "work_package_id": (flash_package or {}).get("package_id"),
+                        "requested_model": resolved_model,
+                        "attested_model": flash_cli_meta.get("model"),
+                        "attestation": flash_cli_meta.get("attestation", "none"),
+                        "mode": mode,
+                    }
+                    if model == "antigravity"
+                    else None
+                ),
+            )
         max_response_chars = max(800, min(int(args.get("max_response_chars") or DEFAULT_CONSULT_RESPONSE_CHARS), MAX_CONSULT_RESPONSE_CHARS))
         response_ref = None
         response_payload = response
@@ -5075,6 +5363,29 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
                 "acceptance_rule": "Independently inspect cited lines, the actual diff, and check output before accepting or dispatching another package.",
             }
             result["accepted"] = False
+            # The receipt is what the routing gate and the completion audit verify. It is
+            # server-issued and ledger-backed on purpose: a sender must not be able to
+            # write a plausible-looking receipt into its own audit.
+            result["receipt"] = f"broker:{consult_request_id}" if consult_request_id else None
+            result["outcome"] = flash_outcome
+            result["credit_eligible"] = flash_outcome == FLASH_OUTCOME_CREDITABLE
+            result["requested_model"] = resolved_model
+            result["resolved_model"] = resolved_model
+            result["attested_model"] = flash_cli_meta.get("model")
+            result["model_attested"] = bool(flash_cli_meta.get("model"))
+            result["attestation"] = flash_cli_meta.get("attestation", "none")
+            result["elapsed_seconds"] = flash_cli_meta.get("duration_seconds")
+            result["usage"] = flash_cli_meta.get("usage")
+            if flash_outcome == "unavailable_pre_mutation":
+                result["fallback_advice"] = (
+                    "Flash was unavailable before any work started. A native cheap role may take "
+                    "this package; cite flash-unavailable with this receipt in the routing audit."
+                )
+            elif flash_outcome == "rejected":
+                result["fallback_advice"] = (
+                    "The worker's own output was rejected. Do NOT silently reroute this package: "
+                    "inspect the rejection, then re-scope it or retain it in the brain."
+                )
         if model_policy:
             result["model_policy"] = model_policy
         if effort_policy:
@@ -8335,8 +8646,48 @@ TOOLS = [
         },
     },
     {
+        "name": "run_evidence_probe",
+        "description": (
+            "Deterministic read-only measurement the reader lane cannot do (it has no shell): "
+            "file hashes, real encoding/BOM/line endings, git state, file stat, bounded literal "
+            "grep, filtered process list. Use this instead of running a shell command yourself "
+            "for evidence. Fixed catalog — there is no pass-through command probe; paths are "
+            "canonicalized, secret-material filenames and symlink/reparse paths are refused, "
+            "every result is capped, and process listings never include command lines."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": [
+                        "hash_files", "detect_encoding", "file_stat",
+                        "git_state", "grep", "process_list",
+                    ],
+                },
+                "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 200},
+                "repo": {"type": "string"},
+                "queries": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "status", "branch", "head", "is_repo",
+                            "changed_files", "staged_files", "untracked",
+                        ],
+                    },
+                },
+                "pattern": {"type": "string"},
+                "regex": {"type": "boolean"},
+                "ignore_case": {"type": "boolean"},
+                "name_contains": {"type": "string"},
+            },
+            "required": ["kind"],
+        },
+    },
+    {
         "name": "route_agent_task",
-        "description": "Required MCP entry point for routing one task package to Antigravity, Codex, Claude, or Gemini. For Flash CLI work, set surface=cli here; never invoke agy directly. Send exactly one bounded package; implementation requires work_package_id, 1-5 allowed_files, and acceptance_criteria. Switchboard alone invokes agy and enforces --output-format json with --json-schema, rejects danger-full-access/malformed or contradictory completion, and returns brain_verification=pending. Never send Flash an entire plan, production SSH, credentials, migrations, or live deployment. The sender brain independently checks cited lines, actual diff, and tests before accepting or sending the next package. KEEP prompt SHORT.",
+        "description": "DEFAULT WORKHORSE LANE for one bounded package, and the required MCP entry point for routing to Antigravity, Codex, Claude, or Gemini. Prefer this over doing bounded reading/search/extraction/summary/drafting yourself or spending a native subagent on it: Gemini Flash High costs roughly a tenth of the same-vendor native workhorse and runs several times faster. Read-only call: {target_agent:'antigravity', surface:'cli', target_model:'gemini flash', effort:'high', mode:'plan', task_kind:'quick_check', work_package_id:'WP-...', prompt:'...'}. Implementation call: the same plus mode:'accept-edits', 1-5 allowed_files, and acceptance_criteria. Send exactly ONE package; never an entire plan, production SSH, credentials, migrations, or live deployment. Switchboard alone invokes agy, enforces --output-format json with --json-schema, rejects danger-full-access/malformed/contradictory completion and resolved-model mismatch, and returns brain_verification=pending with a ledger receipt (broker:<uuid>) you cite in the routing audit. A completed dispatch is evidence, never acceptance: check cited lines, the actual diff, and test output before accepting or sending the next package. When you use a native role instead for an eligible package, state the flash_skip reason. KEEP prompt SHORT.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -9020,6 +9371,42 @@ def tools_for_current_client() -> list[dict[str, Any]]:
     return [_copy_tool(tool, compact) for tool in TOOLS if names is None or tool.get("name") in names]
 
 
+_SERVER_BUILD_ID: str | None = None
+
+
+def server_build_id() -> str:
+    """Short fingerprint of the RUNNING server image.
+
+    The version alone cannot prove which process is answering: a host keeps serving
+    whatever binary it launched at startup, so an upgraded-on-disk build looks
+    identical to a stale one until the window reloads. Hashing the live image makes
+    'is this window actually running the new build?' answerable from any response."""
+    global _SERVER_BUILD_ID
+    if _SERVER_BUILD_ID is None:
+        try:
+            image = Path(sys.executable if getattr(sys, "frozen", False) else __file__)
+            digest = hashlib.sha256(image.read_bytes()).hexdigest()[:12]
+        except Exception:  # noqa: BLE001
+            digest = "unknown"
+        _SERVER_BUILD_ID = digest
+    return _SERVER_BUILD_ID
+
+
+def switchboard_meta() -> dict[str, Any]:
+    """Provenance stamped on every tool result.
+
+    Lives under `_meta` (an MCP-reserved, additive key) rather than as top-level
+    result fields: callers and tests snapshot result dicts by exact shape, and a new
+    ordinary key would break them."""
+    return {
+        "switchboard": {
+            "version": BROKER_VERSION,
+            "build": server_build_id(),
+            "server_pid": os.getpid(),
+        }
+    }
+
+
 def text_content(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         text = value
@@ -9028,7 +9415,7 @@ def text_content(value: Any) -> dict[str, Any]:
             text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         else:
             text = json.dumps(value, ensure_ascii=False, indent=2)
-    return {"content": [{"type": "text", "text": text}]}
+    return {"content": [{"type": "text", "text": text}], "_meta": switchboard_meta()}
 
 
 def topic_workspace_dir(project_info: "ProjectInfo", topic: str | None) -> Path:
@@ -10319,6 +10706,9 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         )
     if name == "route_agent_task":
         return text_content(route_agent_task(args))
+    if name == "run_evidence_probe":
+        import evidence_probe
+        return text_content(evidence_probe.run_evidence_probe(args))
     if name == "list_agent_models":
         return text_content(list_agent_models(args.get("agent"), args.get("project"), args.get("topic")))
     if name == "get_model_routing_guide":

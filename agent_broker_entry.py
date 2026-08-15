@@ -11,6 +11,9 @@ The one binary is dual-mode so a GitHub user needs no Python at all:
   agent-switchboard.exe bridge <args>   -> broker CLI used by the bridge extension
   agent-switchboard.exe --version       -> print the packaged release version
   agent-switchboard.exe routing-override -> register a package-specific gate override
+  agent-switchboard.exe routing-report  -> summarize a session's routing lanes
+  agent-switchboard.exe canary flash    -> live read-only Flash dispatch + receipt
+  agent-switchboard.exe gate-harness    -> deterministic proof the gate enforces
 
 `broker_command()` in setup.py registers `<this-exe> serve` with every host, so the
 exact same binary that installs the broker is also the broker server.
@@ -33,9 +36,18 @@ def run() -> int:
     if first == "routing-override":
         import routing_gate
         return routing_gate.routing_override_cli(sys.argv[2:])
+    if first == "routing-report":
+        import routing_gate
+        return routing_gate.routing_report_cli(sys.argv[2:])
     if first == "routing-hook":
         import routing_gate
         return routing_gate.main(sys.argv[2:])
+    if first == "canary":
+        import switchboard_canary
+        return switchboard_canary.main(sys.argv[2:])
+    if first == "gate-harness":
+        import switchboard_canary
+        return switchboard_canary.gate_harness(sys.argv[2:])
     if first in SERVE_ALIASES:
         import setup
         try:
