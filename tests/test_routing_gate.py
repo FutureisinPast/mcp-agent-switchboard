@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import types
 import unittest
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
@@ -862,6 +864,135 @@ class RoutingGateTests(unittest.TestCase):
         with mock.patch("sys.stdout.write"):
             self.assertEqual(routing_gate.routing_report_cli(["--last", "3"]), 0)
             self.assertEqual(routing_gate.routing_report_cli([]), 0)
+
+    def test_direct_labour_limit_default_is_four(self):
+        self.assertEqual(routing_gate.DIRECT_LABOUR_LIMIT_DEFAULT, 4)
+
+    def test_policy_is_relaxed_flags_weaker_config(self):
+        # policy_is_relaxed() is the "no silent disable" property: it flags a
+        # weaker-than-shipped configuration (env override above the default, or
+        # warn mode) rather than effective_direct_labour_limit() silently
+        # clamping it -- the owner-set value is honoured, but loudly.
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", routing_gate.DIRECT_LABOUR_LIMIT_DEFAULT):
+            with mock.patch.dict("os.environ", {routing_gate.GATE_MODE_ENV: "enforce"}):
+                self.assertFalse(routing_gate.policy_is_relaxed())
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", routing_gate.DIRECT_LABOUR_LIMIT_DEFAULT + 1):
+            with mock.patch.dict("os.environ", {routing_gate.GATE_MODE_ENV: "enforce"}):
+                self.assertTrue(routing_gate.policy_is_relaxed())
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", routing_gate.DIRECT_LABOUR_LIMIT_DEFAULT):
+            with mock.patch.dict("os.environ", {routing_gate.GATE_MODE_ENV: "warn"}):
+                self.assertTrue(routing_gate.policy_is_relaxed())
+
+    def test_warn_mode_allows_but_logs(self):
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 2), mock.patch.dict(
+            "os.environ", {routing_gate.GATE_MODE_ENV: "warn"}
+        ):
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("warn-1")), {})
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("warn-2")), {})
+            # Past the allowance: warn mode still allows the call...
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("warn-3")), {})
+        log_path = routing_gate.STATE_DIR / "session-1.log.jsonl"
+        entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+        warn_entries = [e for e in entries if e.get("decision") == "warn"]
+        self.assertTrue(warn_entries, "expected a 'warn' decision to be logged")
+        self.assertTrue(any(e.get("would_deny") for e in warn_entries))
+
+    def _seed_ledger(self, request_id: str) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("CREATE TABLE consultations (request_id TEXT)")
+            conn.execute("INSERT INTO consultations (request_id) VALUES (?)", (request_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _dispatch_response_payload(self, tool_use_id: str, receipt: str, outcome: str, work_package: str):
+        return {
+            "session_id": "session-1",
+            "tool_use_id": tool_use_id,
+            "tool_name": routing_gate.CREDITABLE_DISPATCH_TOOL,
+            "tool_input": {"target_agent": "antigravity", "surface": "cli"},
+            "tool_response": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "receipt": receipt,
+                                "outcome": outcome,
+                                "work_package_id": work_package,
+                            }
+                        ),
+                    }
+                ]
+            },
+            "_switchboard_host": "claude",
+        }
+
+    def test_credit_granted_for_completed_verified_receipt(self):
+        request_id = str(uuid.uuid4())
+        self._seed_ledger(request_id)
+        receipt = f"broker:{request_id}"
+
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 2):
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("credit-1")), {})
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("credit-2")), {})
+            denied = routing_gate.pre_tool_use(self.pre_payload("credit-3"))
+            self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+
+            credit_result = routing_gate.post_tool_use(
+                self._dispatch_response_payload("dispatch-1", receipt, "completed_verified", "WP-X")
+            )
+            self.assertIn(
+                receipt,
+                credit_result["hookSpecificOutput"]["additionalContext"],
+            )
+
+            allowed = routing_gate.pre_tool_use(self.pre_payload("credit-4"))
+            self.assertEqual(allowed, {})
+
+    def test_credit_is_single_use(self):
+        request_id = str(uuid.uuid4())
+        self._seed_ledger(request_id)
+        receipt = f"broker:{request_id}"
+
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 1):
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("su-1")), {})
+            routing_gate.post_tool_use(
+                self._dispatch_response_payload("dispatch-2", receipt, "completed_verified", "WP-X")
+            )
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("su-2")), {})
+
+            # Replaying the same receipt a second time buys nothing: no fresh
+            # "Routing credit" grant (a checkpoint nudge may still appear).
+            replay = routing_gate.post_tool_use(
+                self._dispatch_response_payload("dispatch-3", receipt, "completed_verified", "WP-X")
+            )
+            self.assertNotIn("Routing credit", json.dumps(replay))
+
+            denied = routing_gate.pre_tool_use(self.pre_payload("su-3"))
+            self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_credit_requires_ledger_row(self):
+        # Well-formed receipt (valid UUID shape) but never written to the ledger:
+        # _receipt_resolves() must fail closed and grant no credit.
+        forged_receipt = f"broker:{uuid.uuid4()}"
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("CREATE TABLE consultations (request_id TEXT)")
+            conn.commit()
+        finally:
+            conn.close()
+
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 1):
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("nl-1")), {})
+            result = routing_gate.post_tool_use(
+                self._dispatch_response_payload("dispatch-4", forged_receipt, "completed_verified", "WP-X")
+            )
+            self.assertNotIn("Routing credit", json.dumps(result))
+
+            denied = routing_gate.pre_tool_use(self.pre_payload("nl-2"))
+            self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
 
 
 if __name__ == "__main__":
