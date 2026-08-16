@@ -4061,14 +4061,54 @@ def kill_process_tree(proc: subprocess.Popen[Any]) -> None:
         pass
 
 
+CHILD_ENV_ALLOWLIST = frozenset({
+    # Without these Windows cannot start a process at all.
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "PATH",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS",
+    # The vendor CLIs read their login state from the profile, so dropping these
+    # breaks authentication outright.
+    "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH", "USERNAME",
+    "TEMP", "TMP", "LANG", "LC_ALL",
+})
+
+
+def child_environment(
+    allow_prefixes: tuple[str, ...] = (), allow_names: tuple[str, ...] = ()
+) -> dict[str, str]:
+    """Minimal environment for a spawned CLI child.
+
+    Every consult lane shares this. Copying os.environ handed each child every
+    token, API key and agent socket held by the broker -- so the Flash worker
+    received the Anthropic key, the Codex child received the Gemini key, and so on.
+    Only allowlisted names cross the boundary, and each lane names the extras it
+    genuinely needs.
+
+    Honest scope: USERPROFILE/APPDATA/LOCALAPPDATA cannot be dropped because the
+    CLIs keep their login state in the profile. This removes ENV-resident secrets
+    and inherited agent sockets. Profile-resident credentials remain reachable, and
+    this is not a security boundary.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in CHILD_ENV_ALLOWLIST
+        or key.upper() in {name.upper() for name in allow_names}
+        or any(key.upper().startswith(prefix.upper()) for prefix in allow_prefixes)
+    }
+    # Recursion guard: a dispatched child must not re-enter the broker.
+    env["AGENT_BROKER_CHILD"] = "1"
+    return env
+
+
 def run_process(
     command: list[str],
     cwd: str,
     stdin_text: str | None = None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    env_allow_prefixes: tuple[str, ...] = (),
+    env_allow_names: tuple[str, ...] = (),
 ) -> tuple[int, str, str]:
-    env = os.environ.copy()
-    env["AGENT_BROKER_CHILD"] = "1"
+    env = child_environment(env_allow_prefixes, env_allow_names)
     # CREATE_NO_WINDOW so the CLI child (codex/claude/gemini) never pops a console window,
     # even when spawned from the windowless detached worker.
     creationflags = (subprocess.CREATE_NEW_PROCESS_GROUP | WINDOWS_NO_WINDOW) if os.name == "nt" else 0
