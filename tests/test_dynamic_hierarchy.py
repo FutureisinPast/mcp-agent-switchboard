@@ -238,7 +238,7 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
     def test_flash_implementation_requires_a_bounded_envelope(self):
         with self.assertRaisesRegex(ValueError, "work_package_id"):
             broker.prepare_flash_work_package({}, "implementation", "Implement everything.")
-        with self.assertRaisesRegex(ValueError, "1-5 allowed_files"):
+        with self.assertRaisesRegex(ValueError, "1-5 allowed_writes"):
             broker.prepare_flash_work_package(
                 {"work_package_id": "WP-X", "acceptance_criteria": ["tests pass"]},
                 "implementation",
@@ -251,37 +251,11 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
                 "Implement everything.",
             )
 
-    def test_agy_cli_always_uses_schema_and_returns_validated_structure(self):
-        package = self._flash_package()
-        stdout = json.dumps(self._flash_output(package["package_id"]))
-        staging = broker.Path(broker.tempfile.mkdtemp(prefix="flash-test-staging-"))
-        try:
-            with mock.patch.object(broker, "load_config", return_value={}), \
-                 mock.patch.object(broker, "discover_antigravity_cli", return_value="agy"), \
-                 mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
-                 mock.patch.object(broker, "_prepare_staging", return_value=(staging, {}, None)), \
-                 mock.patch.object(broker, "run_process", return_value=(0, stdout, "")) as run:
-                response = broker.consult_antigravity_cli(
-                    "p", "bounded prompt", "accept-edits", "gemini-3.7-flash-high", "high", 60, package
-                )
-        finally:
-            broker.shutil.rmtree(staging, ignore_errors=True)
-        command = run.call_args.args[0]
-        self.assertEqual(command[command.index("--output-format") + 1], "json")
-        schema = json.loads(command[command.index("--json-schema") + 1])
-        self.assertIn("brain_verification_required", schema["required"])
-        self.assertEqual(schema["properties"]["package_id"]["enum"], ["WP-TEST"])
-        # agy grants NO tool access headlessly without this flag -- settings allow-rules
-        # are ignored in print mode and there is no scoped read-only grant -- so the old
-        # assertion that it is never passed would now simply forbid the worker from
-        # reading anything. The safety property moved rather than disappeared: the flag
-        # is acceptable only while the worker is confined to a disposable copy, so that
-        # confinement is what this test guards.
-        self.assertIn("--dangerously-skip-permissions", command)
-        self.assertEqual(str(run.call_args.args[1]), str(staging))
-        parsed = json.loads(response)
-        self.assertEqual(parsed["worker_status"], "completed")
-        self.assertEqual(parsed["structured_output"]["package_id"], "WP-TEST")
+    # NOTE: staging/write-back coverage (agy schema+staging dispatch, plus the
+    # three-way write-back apply/conflict/deletion tests that used to live
+    # here) moved to tests/test_flash_manifest.py when the old directory-walk
+    # staging helpers in agent_broker_mcp.py were replaced by the new
+    # flash_manifest module. Not dropped -- relocated.
 
     def test_agy_cli_never_runs_in_the_real_project_tree(self):
         """The worker must never be pointed at the user's own files.
@@ -290,86 +264,35 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
         on the real project, so this asserts the working directory is a staging copy
         and not the resolved project root.
         """
+        import shutil as _shutil
+        import tempfile as _tempfile
+
+        # A real workspace, because staging now copies exactly the declared files:
+        # pointing this at paths that do not exist would prove nothing about the
+        # working directory, only that the manifest refused the package.
+        workspace = _tempfile.mkdtemp(prefix="flash-real-project-")
+        self.addCleanup(_shutil.rmtree, workspace, True)
+        target = broker.Path(workspace) / "src" / "worker.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("original\n", encoding="utf-8")
+
         package = self._flash_package()
+        package["allowed_files"] = [str(target)]
+        package["allowed_writes"] = [str(target)]
         stdout = json.dumps(self._flash_output(package["package_id"]))
         with mock.patch.object(broker, "load_config", return_value={}), \
              mock.patch.object(broker, "discover_antigravity_cli", return_value="agy"), \
-             mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
+             mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", workspace)), \
              mock.patch.object(broker, "run_process", return_value=(0, stdout, "")) as run:
             broker.consult_antigravity_cli(
                 "p", "bounded prompt", "plan", "gemini-3.7-flash-high", "high", 60, package
             )
         cwd = broker.Path(str(run.call_args.args[1])).resolve()
-        self.assertNotEqual(cwd, broker.Path(".").resolve())
-        self.assertIn("flash-staging-", str(cwd))
-
-    def test_write_back_refuses_to_clobber_a_file_changed_underneath(self):
-        """The worker's edit must not overwrite someone else's concurrent edit.
-
-        A two-way staged-vs-live compare cannot tell "the worker changed this" from
-        "the real file moved on while the package ran", so it silently destroys the
-        newer content. This pins the three-way check that prevents it.
-        """
-        real = broker.Path(broker.tempfile.mkdtemp(prefix="flash-real-"))
-        staging = broker.Path(broker.tempfile.mkdtemp(prefix="flash-stage-"))
-        try:
-            target = real / "shared.py"
-            target.write_text("original\n", encoding="utf-8")
-            baseline = {"shared.py": broker._file_digest(target)}
-
-            # The worker edited its copy...
-            (staging / "shared.py").write_text("worker edit\n", encoding="utf-8")
-            # ...while someone else edited the real file during the run.
-            target.write_text("concurrent human edit\n", encoding="utf-8")
-
-            report = broker._apply_staged_changes(
-                staging, real, {str(target.resolve())}, baseline
-            )
-
-            self.assertEqual(report["applied"], [])
-            self.assertEqual(report["conflicted_changed_underneath"], [str(target.resolve())])
-            self.assertEqual(target.read_text(encoding="utf-8"), "concurrent human edit\n")
-        finally:
-            broker.shutil.rmtree(real, ignore_errors=True)
-            broker.shutil.rmtree(staging, ignore_errors=True)
-
-    def test_write_back_applies_a_clean_worker_edit(self):
-        real = broker.Path(broker.tempfile.mkdtemp(prefix="flash-real-"))
-        staging = broker.Path(broker.tempfile.mkdtemp(prefix="flash-stage-"))
-        try:
-            target = real / "shared.py"
-            target.write_text("original\n", encoding="utf-8")
-            baseline = {"shared.py": broker._file_digest(target)}
-            (staging / "shared.py").write_text("worker edit\n", encoding="utf-8")
-
-            report = broker._apply_staged_changes(
-                staging, real, {str(target.resolve())}, baseline
-            )
-
-            self.assertEqual(report["applied"], [str(target.resolve())])
-            self.assertEqual(target.read_text(encoding="utf-8"), "worker edit\n")
-        finally:
-            broker.shutil.rmtree(real, ignore_errors=True)
-            broker.shutil.rmtree(staging, ignore_errors=True)
-
-    def test_write_back_reports_a_deletion_instead_of_performing_it(self):
-        real = broker.Path(broker.tempfile.mkdtemp(prefix="flash-real-"))
-        staging = broker.Path(broker.tempfile.mkdtemp(prefix="flash-stage-"))
-        try:
-            target = real / "gone.py"
-            target.write_text("still here\n", encoding="utf-8")
-            baseline = {"gone.py": broker._file_digest(target)}
-            # staging is empty: the worker deleted it
-
-            report = broker._apply_staged_changes(
-                staging, real, {str(target.resolve())}, baseline
-            )
-
-            self.assertEqual(report["deleted_in_staging_not_applied"], [str(target.resolve())])
-            self.assertTrue(target.exists(), "a deletion must never be propagated")
-        finally:
-            broker.shutil.rmtree(real, ignore_errors=True)
-            broker.shutil.rmtree(staging, ignore_errors=True)
+        self.assertNotEqual(cwd, broker.Path(workspace).resolve())
+        self.assertIn("flash-manifest-", str(cwd))
+        # The real file must still be exactly as it was: a plan package writes
+        # nothing back, whatever the worker did to its copy.
+        self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
 
     def test_flash_danger_full_access_is_rejected_before_agy_starts(self):
         package = self._flash_package()

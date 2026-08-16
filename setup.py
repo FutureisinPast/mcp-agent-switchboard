@@ -322,6 +322,87 @@ def registration_report() -> list[dict]:
     return rows
 
 
+REGISTRATION_HOSTS = (
+    ("codex", "Codex"),
+    ("claude", "Claude Code"),
+    ("claude_desktop", "Claude Desktop"),
+    ("antigravity", "Antigravity"),
+    ("vscode", "VS Code"),
+)
+
+
+def host_is_installed(host: str) -> bool:
+    """Whether the host app is present, independent of any registration."""
+    try:
+        if host == "codex":
+            return bool(CODEX_TOML.exists() or which("codex"))
+        if host == "claude":
+            return bool(CLAUDE_JSON.exists() or which("claude"))
+        if host == "claude_desktop":
+            return bool(claude_desktop_installed())
+        if host == "antigravity":
+            return bool(antigravity_user_dir().exists() or antigravity_cli())
+        if host == "vscode":
+            return bool((APPDATA / "Code" / "User").exists() or vscode_cli())
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def missing_registrations() -> list[dict]:
+    """Installed hosts carrying no broker registration at all.
+
+    `registration_report()` yields a row only for hosts that HAVE a command
+    registered, so a host whose entry was removed -- or was written into a profile
+    directory the app does not actually read -- produced no row whatsoever and
+    read as healthy. An empty `mcpServers` and a missing file are the same silence.
+    Absence has to be reported as loudly as staleness, or `status` confirms a
+    working install that is not there.
+    """
+    missing = []
+    for host, label in REGISTRATION_HOSTS:
+        if registered_command(host) is not None:
+            continue
+        if not host_is_installed(host):
+            continue
+        missing.append({"host": host, "label": label})
+    return missing
+
+
+def antigravity_profile_report() -> list[dict]:
+    """Every Antigravity profile directory that exists, and its registration state.
+
+    Two profile roots can exist side by side on one box ("Antigravity IDE\\User"
+    and "Antigravity\\User"), typically because the app was renamed between
+    versions. Only the first EXISTING one is ever written, and the other keeps
+    whatever it last had. A reader that opens the wrong one concludes the IDE is
+    unregistered when it is not -- which is exactly what happened here. Report
+    both, and mark which one the installer selects, so the two are never confused
+    again.
+    """
+    selected = antigravity_user_dir()
+    rows = []
+    for directory in ANTIGRAVITY_USER_DIRS:
+        if not directory.exists():
+            continue
+        config = directory / "mcp_config.json"
+        registered = None
+        if config.exists():
+            try:
+                data = json.loads(config.read_text(encoding="utf-8"))
+                entry = (data.get("mcpServers") or {}).get(MCP_KEY) or {}
+                registered = entry.get("command")
+            except Exception:  # noqa: BLE001
+                registered = None
+        rows.append({
+            "directory": str(directory),
+            "selected": directory == selected,
+            "config_exists": config.exists(),
+            "registered": registered,
+        })
+    return rows
+
+
 def repair_registrations(dry: bool) -> dict[str, str]:
     """Re-point any host whose registered broker command is not the canonical exe.
 
@@ -1021,16 +1102,34 @@ def show_registration_health() -> bool:
     A host that is healthy here can still be SERVING an old process until reloaded."""
     head("MCP registration")
     rows = registration_report()
+    healthy = True
     if not rows:
         info("no host has the broker registered yet — run: install")
-        return True
-    healthy = True
     for row in rows:
         version = row["version"] or "unknown (python/source registration)"
         mark = "[ok]" if row["healthy"] else "[!!]"
         print(f"  {mark} {row['label']:<16} {Path(row['registered']).name}  reports {version}")
         if not row["healthy"]:
             healthy = False
+
+    # An installed host with NO registration used to print nothing at all, so a
+    # broken install and a clean one looked identical.
+    for row in missing_registrations():
+        healthy = False
+        print(f"  [!!] {row['label']:<16} installed but NOT registered — run: install")
+
+    # Two Antigravity profile roots can coexist; only one is ever written. Show
+    # both so a registration sitting in the unused profile is visible as such.
+    profiles = antigravity_profile_report()
+    if len(profiles) > 1:
+        print("  [--] Antigravity has more than one profile directory:")
+        for profile in profiles:
+            marker = "<- installer writes here" if profile["selected"] else "   (not written)"
+            state = "registered" if profile["registered"] else "no broker entry"
+            print(f"         {profile['directory']}  [{state}] {marker}")
+        if not any(p["selected"] and p["registered"] for p in profiles):
+            healthy = False
+            print("  [!!] the profile the installer writes carries no broker entry — run: install")
     if not healthy:
         info("")
         info(f"UNHEALTHY: a host is registered to a binary that is not this build ({BROKER_VERSION}).")

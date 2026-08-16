@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import flash_manifest
 import model_roles
 from switchboard_version import BROKER_VERSION
 
@@ -3654,9 +3655,27 @@ def prepare_flash_work_package(args: dict[str, Any], task_kind: str, prompt: str
     )
     forbidden_actions = list(dict.fromkeys(forbidden_actions))
 
-    if kind == "implementation" and not allowed_files:
+    # The manifest fields. `allowed_files` is the legacy spelling of allowed_writes
+    # and is still accepted; flash_manifest refuses the two if they disagree rather
+    # than guessing which one describes the package.
+    allowed_writes = _bounded_string_list(
+        args.get("allowed_writes"), "allowed_writes", flash_manifest.MANIFEST_MAX_WRITES
+    )
+    allowed_creates = _bounded_string_list(
+        args.get("allowed_creates"), "allowed_creates", flash_manifest.MANIFEST_MAX_CREATES
+    )
+    # Read context is deliberately wider than the write allowlist: a worker that
+    # cannot declare what it needs to read is a worker that goes wandering, and
+    # undeclared wandering is what the manifest exists to stop.
+    read_context = _bounded_string_list(
+        args.get("read_context"), "read_context", flash_manifest.MANIFEST_MAX_READ_CONTEXT
+    )
+    workspace_root = str(args.get("workspace_root") or "").strip() or None
+
+    if kind == "implementation" and not allowed_files and not allowed_writes and not allowed_creates:
         raise ValueError(
-            "Flash implementation requires 1-5 allowed_files; whole-plan or open-worktree access is rejected"
+            "Flash implementation requires 1-5 allowed_writes (or allowed_creates for new files); "
+            "whole-plan or open-worktree access is rejected"
         )
     if kind == "implementation" and not acceptance_criteria:
         raise ValueError("Flash implementation requires explicit acceptance_criteria")
@@ -3665,6 +3684,10 @@ def prepare_flash_work_package(args: dict[str, Any], task_kind: str, prompt: str
         "package_id": package_id,
         "task_kind": kind,
         "allowed_files": allowed_files,
+        "allowed_writes": allowed_writes,
+        "allowed_creates": allowed_creates,
+        "read_context": read_context,
+        "workspace_root": workspace_root,
         "acceptance_criteria": acceptance_criteria,
         "forbidden_actions": forbidden_actions,
     }
@@ -3756,8 +3779,25 @@ def flash_workhorse_output_schema(package: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def package_writable_paths(package: dict[str, Any]) -> list[str]:
+    """Every path this package may change, whatever spelling the sender used.
+
+    The scope check and the worker prompt both read `allowed_files` alone. Once
+    allowed_writes/allowed_creates existed, that made an out-of-scope report
+    impossible to raise for any package sent with the new field names: the check
+    compared against an empty set, which passes everything.
+    """
+    merged: list[str] = []
+    for field in ("allowed_files", "allowed_writes", "allowed_creates"):
+        for item in package.get(field) or []:
+            if item and item not in merged:
+                merged.append(item)
+    return merged
+
+
 def wrap_flash_workhorse_prompt(prompt: str, package: dict[str, Any]) -> str:
-    allowed = "\n".join(f"- {item}" for item in package["allowed_files"]) or "- Read-only scope stated in the request; make no edits."
+    allowed = "\n".join(f"- {item}" for item in package_writable_paths(package)) or "- Read-only scope stated in the request; make no edits."
+    context = "\n".join(f"- {item}" for item in (package.get("read_context") or [])) or "- None declared; everything you need is already in this prompt."
     criteria = "\n".join(f"- {item}" for item in package["acceptance_criteria"]) or "- Return the requested bounded evidence only."
     forbidden = "\n".join(f"- {item}" for item in package["forbidden_actions"])
     return f"""<flash_workhorse_contract>
@@ -3767,6 +3807,9 @@ Task kind: {package['task_kind']}
 
 Allowed files (implementation is restricted to these exact paths):
 {allowed}
+
+Read-only context supplied to you (do not modify):
+{context}
 
 Acceptance criteria:
 {criteria}
@@ -3843,7 +3886,7 @@ def validate_flash_workhorse_result(
         if field in structured and not isinstance(structured[field], list):
             errors.append(f"{field} must be an array")
 
-    allowed = {_normalized_path_for_scope(path) for path in package["allowed_files"]}
+    allowed = {_normalized_path_for_scope(path) for path in package_writable_paths(package)}
     for changed in structured.get("files_changed") or []:
         if not isinstance(changed, dict) or not str(changed.get("path") or "").strip():
             errors.append("every files_changed item requires path and change")
@@ -4663,6 +4706,33 @@ def consult_antigravity_cli(
     package_kind = "implementation" if implementation_mode else "consult"
     package = work_package or prepare_flash_work_package({}, package_kind, prompt)
     schema = flash_workhorse_output_schema(package)
+    # The manifest is built BEFORE the command, because the worker has to be told
+    # the staged paths and those do not exist until staging has run.
+    def _manifest_refusal(rejection: flash_manifest.ManifestRejection) -> str:
+        return json.dumps(
+            {
+                "package_id": package.get("package_id"),
+                "worker_status": "rejected",
+                "rejection": rejection.to_dict(),
+                "message": rejection.message(),
+            },
+            ensure_ascii=False,
+        )
+
+    try:
+        manifest = flash_manifest.build_manifest(
+            package, project_info.root_path, implementation_mode
+        )
+        # Exactly the declared files are copied into a disposable tree. Nothing is
+        # walked. The previous design staged the smallest common ancestor of the
+        # allowlist -- and, for read packages, the entire project root -- so a
+        # one-file package against a large workspace could not run at all.
+        staged = flash_manifest.stage(manifest)
+    except flash_manifest.ManifestRejection as rejection:
+        return _manifest_refusal(rejection)
+    except OSError as exc:
+        return f"Antigravity CLI structured-output validation failed: staging failed ({exc})."
+
     command = [agy]
     if model_name:
         command.extend(["--model", str(model_name)])
@@ -4685,82 +4755,40 @@ def consult_antigravity_cli(
             "--print-timeout",
             f"{int(timeout)}s",
             "--print",
-            sanitize_flash_workhorse_prompt(prompt),
+            sanitize_flash_workhorse_prompt(prompt) + flash_manifest.prompt_appendix(staged),
         ]
     )
-    # Containment baseline. The worker REPORTS which files it changed, and that report
-    # was previously the only evidence: a worker that edited something outside its
-    # allowlist and did not mention it was indistinguishable from one that behaved.
-    # Hashing the package root before and after makes that claim checkable against the
-    # filesystem instead of against the worker's own summary.
-    containment_before: dict[str, str] = {}
-    containment_root: Path | None = None
-    allowed_resolved: set[str] = set()
-    if implementation_mode:
-        allowed_files = list(package.get("allowed_files") or [])
-        containment_root = _containment_root(allowed_files, project_info.root_path)
-        for item in allowed_files:
-            try:
-                allowed_resolved.add(str(Path(item).resolve()))
-            except (OSError, RuntimeError):
-                continue
-        containment_before, scan_error = _containment_scan(containment_root)
-        if scan_error:
-            return f"Antigravity CLI structured-output validation failed: {scan_error}"
-
-    # The worker runs against a throwaway copy, never the project itself. With agy's
-    # permission checks off it could otherwise write, delete, or run commands anywhere;
-    # confining it to a copy makes that power land somewhere disposable.
-    source_root = (
-        containment_root
-        if implementation_mode and containment_root is not None
-        else Path(project_info.root_path)
-    )
-    staging_root, staging_baseline, staging_error = _prepare_staging(source_root)
-    if staging_error or staging_root is None:
-        return f"Antigravity CLI structured-output validation failed: {staging_error}"
-
     apply_report: dict[str, Any] | None = None
+    staging_changes: dict[str, Any] | None = None
     try:
         code, stdout, stderr = run_process(
             command,
-            str(staging_root),
+            str(staged.root),
             None,
             timeout=timeout,
         )
+        # The ENTIRE staging tree is diffed, not just the declared paths: the case
+        # worth catching is a worker that created or rewrote something it never
+        # mentioned. The tree is small by construction, so this walk is total.
+        staging_changes = flash_manifest.collect_changes(staged)
         if implementation_mode and code == 0:
-            apply_report = _apply_staged_changes(
-                staging_root, source_root, allowed_resolved, staging_baseline
-            )
+            apply_report = flash_manifest.apply_changes(staged, staging_changes)
     finally:
-        shutil.rmtree(staging_root, ignore_errors=True)
+        shutil.rmtree(staged.root, ignore_errors=True)
 
-    containment_report: dict[str, Any] | None = None
-    if implementation_mode and containment_root is not None:
-        containment_after, _ = _containment_scan(containment_root)
-        delta = _containment_diff(containment_before, containment_after, allowed_resolved)
-        out_of_scope = (
-            delta["modified_out_of_scope"]
-            + delta["created_out_of_scope"]
-            + delta["deleted_out_of_scope"]
+    containment_report = flash_manifest.containment_receipt(
+        staged, manifest, staging_changes, apply_report
+    )
+    if apply_report is not None and apply_report.get("refused"):
+        # Report and refuse; never "clean up". An unexpected file may belong to the
+        # user or another process, and a deleted one cannot be restored from a hash.
+        # The brain decides what happened here.
+        return (
+            "Antigravity CLI structured-output validation failed: the package was refused "
+            "and NOTHING was written back. "
+            + "; ".join(apply_report.get("reasons") or [])
+            + f" | integrity: {containment_report['integrity']}"
         )
-        containment_report = {
-            "root": str(containment_root),
-            "allowed_files": sorted(allowed_resolved),
-            "verified_against": "filesystem sha256 before/after",
-            **delta,
-        }
-        if out_of_scope:
-            # Report and refuse; never "clean up". A file outside the allowlist may
-            # belong to the user or another process, and a deleted one cannot be
-            # restored from a hash at all. The brain decides what happened here.
-            containment_report["quarantined"] = True
-            return (
-                "Antigravity CLI structured-output validation failed: containment violation — "
-                f"the worker changed {len(out_of_scope)} path(s) outside its allowed_files. "
-                "Nothing was reverted automatically (an out-of-scope file may be yours). "
-                f"Inspect these paths before trusting the workspace: {out_of_scope[:20]}"
-            )
 
     if code == 124:
         return consult_timeout_message("Antigravity CLI", timeout, stdout)
@@ -4771,9 +4799,10 @@ def consult_antigravity_cli(
     # SUCCESS and an empty response; the only explanation for that lives on stderr.
     # Surface it (bounded, single-line) whenever we report a validation failure below,
     # instead of discarding it -- that silent discard made real failures undiagnosable.
-    stderr_note = (
-        " | agy stderr: " + " ".join(stderr.split())[:400]
-    ) if stderr and stderr.strip() else ""
+    stderr_excerpt, stderr_log = persist_worker_stderr(package.get("package_id"), stderr)
+    stderr_note = f" | worker stderr: {stderr_excerpt}" if stderr_excerpt else ""
+    if stderr_log:
+        stderr_note += f" | full log: {stderr_log}"
     if not raw:
         return "Antigravity CLI structured-output validation failed: agy returned no output." + stderr_note
     try:
@@ -4807,278 +4836,76 @@ def consult_antigravity_cli(
     return json.dumps(normalized, ensure_ascii=False)
 
 
-CONTAINMENT_MAX_FILES = 2000
-CONTAINMENT_MAX_BYTES = 50 * 1024 * 1024
-CONTAINMENT_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache"}
+# Worker stderr is the only truthful channel the backend has: it exits 0 with
+# status SUCCESS even when every tool call was auto-denied, and the explanation
+# lands here and nowhere else. The previous code kept 400 characters, and only on
+# a validation failure, so success-path warnings vanished entirely -- which is how
+# a silently tool-less worker went undiagnosed for weeks.
+#
+# The raw text is written to an owner-only file rather than into the receipt:
+# receipts travel to other agents and the stream can contain file content, paths
+# and tokens. What goes back into the conversation is a redacted, bounded excerpt
+# plus the path to the full log.
+WORKER_LOG_DIR = BROKER_DIR / "flash-logs"
+WORKER_LOG_EXCERPT_CHARS = 600
+WORKER_LOG_QUOTA_BYTES = 32 * 1024 * 1024
 
 
-def _containment_scan(root: Path) -> tuple[dict[str, str], str | None]:
-    """sha256 of every file under `root`, or a refusal reason.
-
-    Bounded on purpose: an unbounded scan of a huge tree would take longer than the
-    package itself and would tempt a future maintainer to skip it entirely."""
-    digests: dict[str, str] = {}
-    total_bytes = 0
+def _prune_worker_logs() -> None:
+    """Keep the log directory under quota, oldest first."""
     try:
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in CONTAINMENT_SKIP_DIRS]
-            for filename in filenames:
-                path = Path(dirpath) / filename
-                try:
-                    size = path.stat().st_size
-                except OSError:
-                    continue
-                total_bytes += size
-                if len(digests) >= CONTAINMENT_MAX_FILES or total_bytes > CONTAINMENT_MAX_BYTES:
-                    return {}, (
-                        f"package root {root} exceeds the containment scan cap "
-                        f"({CONTAINMENT_MAX_FILES} files / {CONTAINMENT_MAX_BYTES // (1024*1024)} MB). "
-                        "Narrow allowed_files to a smaller directory, or retain this package in the brain."
-                    )
-                try:
-                    digests[str(path.resolve())] = hashlib.sha256(path.read_bytes()).hexdigest()
-                except OSError:
-                    continue
-    except OSError as exc:
-        return {}, f"containment scan failed: {exc}"
-    return digests, None
-
-
-def _containment_root(allowed_files: list[str], fallback: str) -> Path:
-    """Smallest directory containing every allowed file."""
-    resolved = []
-    for item in allowed_files or []:
+        entries = sorted(
+            (p for p in WORKER_LOG_DIR.glob("*.log") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+        )
+    except OSError:
+        return
+    total = 0
+    for item in entries:
         try:
-            resolved.append(Path(item).resolve())
-        except (OSError, RuntimeError):
+            total += item.stat().st_size
+        except OSError:
             continue
-    if not resolved:
-        return Path(fallback).resolve()
-    try:
-        return Path(os.path.commonpath([str(p.parent) for p in resolved]))
-    except ValueError:
-        # Different drives: no common ancestor, so there is nothing safe to scan.
-        return Path(fallback).resolve()
+    for item in entries:
+        if total <= WORKER_LOG_QUOTA_BYTES:
+            break
+        try:
+            size = item.stat().st_size
+            item.unlink()
+            total -= size
+        except OSError:
+            continue
 
 
-STAGING_MAX_FILES = 4000
-STAGING_MAX_BYTES = 200 * 1024 * 1024
+def persist_worker_stderr(package_id: str, stderr: str) -> tuple[str, str | None]:
+    """Write raw stderr to an owner-only log; return (redacted excerpt, log path).
 
-
-def _is_reparse_point(path: Path) -> bool:
-    """True for symlinks, junctions and every other reparse point.
-
-    These are never followed. `copytree(symlinks=False)` dereferences them, which
-    would copy data from OUTSIDE the package root into the staging tree and let a
-    write-back escape it. Anything that cannot be classified is treated as a
-    reparse point, because refusing an ordinary file is recoverable and following a
-    link out of the tree is not.
+    Failure to log is never fatal: losing the diagnostic is bad, losing the
+    dispatch because the diagnostic could not be written would be worse.
     """
+    if not stderr or not stderr.strip():
+        return "", None
+    excerpt = " ".join(redact_text(stderr).split())[:WORKER_LOG_EXCERPT_CHARS]
+    log_path: str | None = None
     try:
-        st = path.lstat()
-    except OSError:
-        return True
-    if stat.S_ISLNK(st.st_mode):
-        return True
-    attributes = getattr(st, "st_file_attributes", 0)
-    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
-
-
-def _file_digest(path: Path) -> str | None:
-    """sha256 of a file, or None if it cannot be read."""
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1 << 20), b""):
-                digest.update(chunk)
-    except OSError:
-        return None
-    return digest.hexdigest()
-
-
-def _prepare_staging(source: Path) -> tuple[Path | None, dict[str, str], str | None]:
-    """Copy `source` into a disposable tree; return (staging_root, baseline, refusal).
-
-    This is ISOLATION, not containment. The worker runs with permission checks
-    disabled -- the only way agy grants tool access in print mode -- so it can still
-    reach absolute paths, the user profile and the network. Working on a copy bounds
-    ACCIDENTAL damage (a stray relative write, a botched rewrite, a delete); it does
-    not bound a deliberate one. Do not describe it as a security boundary.
-
-    `baseline` maps each staged relative path to the sha256 it had AT COPY TIME. The
-    write-back needs it to tell "the worker changed this" from "someone else changed
-    the real file while the package ran" -- comparing staged bytes against the live
-    file cannot distinguish those and silently destroys the concurrent edit.
-
-    Refuses rather than truncating: a silently partial tree makes the worker report
-    on files that were never there, and that reads as a finding rather than a setup
-    error.
-    """
-    file_count = 0
-    total_bytes = 0
-    for dirpath, dirnames, filenames in os.walk(source):
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in CONTAINMENT_SKIP_DIRS and not _is_reparse_point(Path(dirpath) / d)
-        ]
-        for filename in filenames:
-            file_count += 1
-            try:
-                total_bytes += (Path(dirpath) / filename).stat().st_size
-            except OSError:
-                continue
-            if file_count > STAGING_MAX_FILES or total_bytes > STAGING_MAX_BYTES:
-                return None, {}, (
-                    f"package root {source} is too large to stage safely "
-                    f"({file_count}+ files, {total_bytes // (1024 * 1024)}+ MB; caps are "
-                    f"{STAGING_MAX_FILES} files / {STAGING_MAX_BYTES // (1024 * 1024)} MB). "
-                    "Narrow the package to the directory the worker actually needs."
-                )
-
-    # Copy INTO the temp root itself rather than a child of it, so cleanup only ever
-    # removes the directory this function created. An earlier shape returned a child
-    # and deleted its parent, which would erase the whole temp directory the moment
-    # anything returned a path from elsewhere.
-    staging = Path(tempfile.mkdtemp(prefix="flash-staging-"))
-    baseline: dict[str, str] = {}
-    seen_casefold: set[str] = set()
-    try:
-        for dirpath, dirnames, filenames in os.walk(source):
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in CONTAINMENT_SKIP_DIRS and not _is_reparse_point(Path(dirpath) / d)
-            ]
-            for filename in filenames:
-                origin = Path(dirpath) / filename
-                if _is_reparse_point(origin):
-                    continue
-                key = origin.relative_to(source).as_posix()
-                # NTFS is case-insensitive, so two keys differing only by case would
-                # collide on write-back and silently apply the wrong file.
-                if key.casefold() in seen_casefold:
-                    shutil.rmtree(staging, ignore_errors=True)
-                    return None, {}, (
-                        f"package root {source} contains paths differing only by case "
-                        f"({key}); resolve the collision before staging."
-                    )
-                seen_casefold.add(key.casefold())
-
-                destination = staging / key
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(origin, destination)
-                digest = _file_digest(origin)
-                if digest is not None:
-                    baseline[key] = digest
-    except (OSError, shutil.Error) as exc:
-        shutil.rmtree(staging, ignore_errors=True)
-        return None, {}, f"could not stage {source} for the worker: {exc}"
-    return staging, baseline, None
-
-
-def _apply_staged_changes(
-    staging_root: Path, source_root: Path, allowed: set[str], baseline: dict[str, str]
-) -> dict[str, Any]:
-    """Write the worker's edits back onto the real tree, or refuse to.
-
-    Three-way, never two-way: baseline B (at copy time), staged S, real R. A file is
-    applied only when S differs from B (the worker actually changed it) AND R still
-    equals B (nobody else touched it meanwhile). A two-way staged-vs-real compare
-    cannot tell those apart and overwrites a concurrent edit with a stale snapshot.
-
-    Only allowlisted paths are applied. Deletions are never propagated -- a hash
-    cannot restore a file, so a deletion the worker wanted is reported for a human to
-    make. Everything else is reported rather than applied, because deciding whether
-    an out-of-scope change is a mistake or overreach is the brain's call.
-    """
-    applied: list[str] = []
-    withheld: list[str] = []
-    conflicted: list[str] = []
-    failed: list[str] = []
-    staged_keys: set[str] = set()
-
-    for dirpath, dirnames, filenames in os.walk(staging_root):
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in CONTAINMENT_SKIP_DIRS and not _is_reparse_point(Path(dirpath) / d)
-        ]
-        for filename in filenames:
-            staged = Path(dirpath) / filename
-            if _is_reparse_point(staged):
-                failed.append(str(staged))  # worker planted a link; never follow it
-                continue
-            try:
-                relative = staged.relative_to(staging_root)
-            except ValueError:
-                continue
-            key = relative.as_posix()
-            staged_keys.add(key)
-
-            staged_digest = _file_digest(staged)
-            if staged_digest is None:
-                failed.append(str(staged))
-                continue
-            before = baseline.get(key)
-            if staged_digest == before:
-                continue  # untouched by the worker
-
-            target = (source_root / relative).resolve()
-            if str(target) not in allowed:
-                withheld.append(str(target))
-                continue
-
-            current = _file_digest(target) if target.exists() else None
-            if current != before:
-                # Either the file changed underneath us, or the worker created one
-                # that already exists. Applying would destroy whatever is there now.
-                conflicted.append(str(target))
-                continue
-
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if _is_reparse_point(target.parent):
-                    failed.append(str(target))
-                    continue
-                # Write beside the target, then rename: a direct write truncates the
-                # destination first and leaves a half-written file if it fails.
-                with tempfile.NamedTemporaryFile(
-                    dir=str(target.parent), delete=False, suffix=".flash-tmp"
-                ) as tmp:
-                    tmp.write(staged.read_bytes())
-                    tmp.flush()
-                    os.fsync(tmp.fileno())
-                    pending = tmp.name
-                os.replace(pending, target)
-                applied.append(str(target))
-            except OSError:
-                failed.append(str(target))
-
-    # A file present at copy time and gone from staging was deleted by the worker.
-    deleted = sorted(
-        str((source_root / key).resolve()) for key in baseline if key not in staged_keys
-    )
-
-    return {
-        "applied": sorted(applied),
-        "withheld_out_of_scope": sorted(withheld),
-        "conflicted_changed_underneath": sorted(conflicted),
-        "deleted_in_staging_not_applied": deleted,
-        "failed_to_apply": sorted(failed),
-    }
-
-
-def _containment_diff(
-    before: dict[str, str], after: dict[str, str], allowed: set[str]
-) -> dict[str, list[str]]:
-    changed = [p for p in after if p in before and after[p] != before[p]]
-    created = [p for p in after if p not in before]
-    deleted = [p for p in before if p not in after]
-    return {
-        "modified_out_of_scope": sorted(p for p in changed if p not in allowed),
-        "created_out_of_scope": sorted(p for p in created if p not in allowed),
-        "deleted_out_of_scope": sorted(p for p in deleted if p not in allowed),
-        "modified_in_scope": sorted(p for p in changed if p in allowed),
-        "created_in_scope": sorted(p for p in created if p in allowed),
-    }
+        first_time = not WORKER_LOG_DIR.exists()
+        WORKER_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        if first_time and os.name == "nt":
+            # Best effort: the stream can carry file content, so keep the
+            # directory readable only by its owner.
+            subprocess.run(
+                ["icacls", str(WORKER_LOG_DIR), "/inheritance:r",
+                 "/grant:r", f"{os.environ.get('USERNAME', '')}:(OI)(CI)F"],
+                capture_output=True, timeout=15, check=False,
+            )
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(package_id or "unknown"))[:60]
+        target = WORKER_LOG_DIR / f"{int(time.time())}-{safe_id}-{uuid.uuid4().hex[:8]}.log"
+        target.write_text(stderr, encoding="utf-8", errors="replace")
+        log_path = str(target)
+        _prune_worker_logs()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        log_path = None
+    return excerpt, log_path
 
 
 # Outcome taxonomy for a Flash dispatch. Only ONE value may ever earn delegation
@@ -8810,6 +8637,10 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "timeout_seconds": args.get("timeout_seconds"),
                 "work_package_id": args.get("work_package_id"),
                 "allowed_files": args.get("allowed_files"),
+                "allowed_writes": args.get("allowed_writes"),
+                "allowed_creates": args.get("allowed_creates"),
+                "read_context": args.get("read_context"),
+                "workspace_root": args.get("workspace_root"),
                 "acceptance_criteria": args.get("acceptance_criteria"),
                 "forbidden_actions": args.get("forbidden_actions"),
             },
@@ -8927,7 +8758,11 @@ TOOLS = [
                 "effort": {"type": "string", "description": "Antigravity reasoning effort: low|medium|high. Explicit effort selects the matching live model variant when available."},
                 "timeout_seconds": {"type": "integer", "minimum": 15, "maximum": 240},
                 "work_package_id": {"type": "string", "description": "Required for implementation. Exactly one stable package id; Flash may not continue to another package."},
-                "allowed_files": {"type": "array", "maxItems": 5, "items": {"type": "string"}, "description": "Required for implementation. Exact files Flash may edit."},
+                "allowed_files": {"type": "array", "maxItems": 5, "items": {"type": "string"}, "description": "Legacy alias for allowed_writes; refused if the two disagree."},
+                "allowed_writes": {"type": "array", "maxItems": 5, "items": {"type": "string"}, "description": "Existing files the worker may change. Absolute paths inside workspace_root."},
+                "allowed_creates": {"type": "array", "maxItems": 5, "items": {"type": "string"}, "description": "Paths the worker must CREATE; each must not already exist."},
+                "read_context": {"type": "array", "maxItems": 20, "items": {"type": "string"}, "description": "Read-only files copied in for the worker. Only the manifest is staged, so anything it must read belongs here."},
+                "workspace_root": {"type": "string", "description": "Root used to resolve manifest paths and lay out the disposable copy. Never walked. Defaults to the project root."},
                 "acceptance_criteria": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "Required for implementation. Deterministic pass/fail criteria for this package only."},
                 "forbidden_actions": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "Additional package-specific prohibitions; global no-production/no-next-package rules always apply."},
             },
@@ -9027,7 +8862,7 @@ TOOLS = [
     },
     {
         "name": "route_agent_task",
-        "description": "DEFAULT WORKHORSE LANE for one bounded package, and the required MCP entry point for routing to Antigravity, Codex, Claude, or Gemini. Prefer this over doing bounded reading/search/extraction/summary/drafting yourself or spending a native subagent on it: Gemini Flash High costs roughly a tenth of the same-vendor native workhorse and runs several times faster. Read-only call: {target_agent:'antigravity', surface:'cli', target_model:'gemini flash', effort:'high', mode:'plan', task_kind:'quick_check', work_package_id:'WP-...', prompt:'...'}. Implementation call: the same plus mode:'accept-edits', 1-5 allowed_files, and acceptance_criteria. Send exactly ONE package; never an entire plan, production SSH, credentials, migrations, or live deployment. Switchboard alone invokes agy, enforces --output-format json with --json-schema, rejects danger-full-access/malformed/contradictory completion and resolved-model mismatch, and returns brain_verification=pending with a ledger receipt (broker:<uuid>) you cite in the routing audit. A completed dispatch is evidence, never acceptance: check cited lines, the actual diff, and test output before accepting or sending the next package. When you use a native role instead for an eligible package, state the flash_skip reason. KEEP prompt SHORT.",
+        "description": "DEFAULT WORKHORSE LANE for one bounded package, and the required MCP entry point for routing to Antigravity, Codex, Claude, or Gemini. Prefer this over doing bounded reading/search/extraction/summary/drafting yourself or spending a native subagent on it: Gemini Flash High costs roughly a tenth of the same-vendor native workhorse and runs several times faster. Read-only call: {target_agent:'antigravity', surface:'cli', target_model:'gemini flash', effort:'high', mode:'plan', task_kind:'quick_check', work_package_id:'WP-...', prompt:'...'}. Implementation call: the same plus mode:'accept-edits', 1-5 allowed_writes (or allowed_creates for new files), and acceptance_criteria. SCOPE IS THE MANIFEST, NOT A DIRECTORY: only the files you declare are copied to the worker, so a big task does not make a big package — decompose it. Declare every file the worker must READ in read_context (up to 20); nothing else is staged, and undeclared reading is what makes workers wander. workspace_root is used only to resolve paths and is never walked. A refusal names the exact cap, the measurement and a rescope hint — act on that instead of retrying the same shape. Send exactly ONE package; never an entire plan, production SSH, credentials, migrations, or live deployment. Switchboard alone invokes agy, enforces --output-format json with --json-schema, rejects danger-full-access/malformed/contradictory completion and resolved-model mismatch, and returns brain_verification=pending with a ledger receipt (broker:<uuid>) you cite in the routing audit. A completed dispatch is evidence, never acceptance: check cited lines, the actual diff, and test output before accepting or sending the next package. When you use a native role instead for an eligible package, state the flash_skip reason. KEEP prompt SHORT.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -9078,7 +8913,11 @@ TOOLS = [
                 "mode": {"type": "string"},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
                 "work_package_id": {"type": "string", "description": "For Flash implementation, required stable id for exactly one bounded package."},
-                "allowed_files": {"type": "array", "maxItems": 5, "items": {"type": "string"}, "description": "For Flash implementation, required exact edit allowlist."},
+                "allowed_files": {"type": "array", "maxItems": 5, "items": {"type": "string"}, "description": "Legacy alias for allowed_writes; refused if the two disagree."},
+                "allowed_writes": {"type": "array", "maxItems": 5, "items": {"type": "string"}, "description": "Existing files the worker may change. Absolute paths inside workspace_root."},
+                "allowed_creates": {"type": "array", "maxItems": 5, "items": {"type": "string"}, "description": "Paths the worker must CREATE; each must not already exist."},
+                "read_context": {"type": "array", "maxItems": 20, "items": {"type": "string"}, "description": "Read-only files copied in for the worker. Only the manifest is staged, so anything it must read belongs here."},
+                "workspace_root": {"type": "string", "description": "Root used to resolve manifest paths and lay out the disposable copy. Never walked. Defaults to the project root."},
                 "acceptance_criteria": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "For Flash implementation, required deterministic criteria for this package."},
                 "forbidden_actions": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "Additional prohibitions; global Flash safety rules cannot be removed."},
                 "model_policy": {"type": "string", "description": "Explicit cost policy for Codex or Claude. 'cheap_read' selects Luna/low or Haiku (no effort); 'balanced'/'efficient'/'lower_effort' selects Terra/medium or Sonnet/medium. Omit for frontier/max consultation, audit, review, or debate."},
