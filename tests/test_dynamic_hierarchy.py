@@ -259,7 +259,7 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
             with mock.patch.object(broker, "load_config", return_value={}), \
                  mock.patch.object(broker, "discover_antigravity_cli", return_value="agy"), \
                  mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
-                 mock.patch.object(broker, "_prepare_staging", return_value=(staging, None)), \
+                 mock.patch.object(broker, "_prepare_staging", return_value=(staging, {}, None)), \
                  mock.patch.object(broker, "run_process", return_value=(0, stdout, "")) as run:
                 response = broker.consult_antigravity_cli(
                     "p", "bounded prompt", "accept-edits", "gemini-3.7-flash-high", "high", 60, package
@@ -302,6 +302,74 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
         cwd = broker.Path(str(run.call_args.args[1])).resolve()
         self.assertNotEqual(cwd, broker.Path(".").resolve())
         self.assertIn("flash-staging-", str(cwd))
+
+    def test_write_back_refuses_to_clobber_a_file_changed_underneath(self):
+        """The worker's edit must not overwrite someone else's concurrent edit.
+
+        A two-way staged-vs-live compare cannot tell "the worker changed this" from
+        "the real file moved on while the package ran", so it silently destroys the
+        newer content. This pins the three-way check that prevents it.
+        """
+        real = broker.Path(broker.tempfile.mkdtemp(prefix="flash-real-"))
+        staging = broker.Path(broker.tempfile.mkdtemp(prefix="flash-stage-"))
+        try:
+            target = real / "shared.py"
+            target.write_text("original\n", encoding="utf-8")
+            baseline = {"shared.py": broker._file_digest(target)}
+
+            # The worker edited its copy...
+            (staging / "shared.py").write_text("worker edit\n", encoding="utf-8")
+            # ...while someone else edited the real file during the run.
+            target.write_text("concurrent human edit\n", encoding="utf-8")
+
+            report = broker._apply_staged_changes(
+                staging, real, {str(target.resolve())}, baseline
+            )
+
+            self.assertEqual(report["applied"], [])
+            self.assertEqual(report["conflicted_changed_underneath"], [str(target.resolve())])
+            self.assertEqual(target.read_text(encoding="utf-8"), "concurrent human edit\n")
+        finally:
+            broker.shutil.rmtree(real, ignore_errors=True)
+            broker.shutil.rmtree(staging, ignore_errors=True)
+
+    def test_write_back_applies_a_clean_worker_edit(self):
+        real = broker.Path(broker.tempfile.mkdtemp(prefix="flash-real-"))
+        staging = broker.Path(broker.tempfile.mkdtemp(prefix="flash-stage-"))
+        try:
+            target = real / "shared.py"
+            target.write_text("original\n", encoding="utf-8")
+            baseline = {"shared.py": broker._file_digest(target)}
+            (staging / "shared.py").write_text("worker edit\n", encoding="utf-8")
+
+            report = broker._apply_staged_changes(
+                staging, real, {str(target.resolve())}, baseline
+            )
+
+            self.assertEqual(report["applied"], [str(target.resolve())])
+            self.assertEqual(target.read_text(encoding="utf-8"), "worker edit\n")
+        finally:
+            broker.shutil.rmtree(real, ignore_errors=True)
+            broker.shutil.rmtree(staging, ignore_errors=True)
+
+    def test_write_back_reports_a_deletion_instead_of_performing_it(self):
+        real = broker.Path(broker.tempfile.mkdtemp(prefix="flash-real-"))
+        staging = broker.Path(broker.tempfile.mkdtemp(prefix="flash-stage-"))
+        try:
+            target = real / "gone.py"
+            target.write_text("still here\n", encoding="utf-8")
+            baseline = {"gone.py": broker._file_digest(target)}
+            # staging is empty: the worker deleted it
+
+            report = broker._apply_staged_changes(
+                staging, real, {str(target.resolve())}, baseline
+            )
+
+            self.assertEqual(report["deleted_in_staging_not_applied"], [str(target.resolve())])
+            self.assertTrue(target.exists(), "a deletion must never be propagated")
+        finally:
+            broker.shutil.rmtree(real, ignore_errors=True)
+            broker.shutil.rmtree(staging, ignore_errors=True)
 
     def test_flash_danger_full_access_is_rejected_before_agy_starts(self):
         package = self._flash_package()

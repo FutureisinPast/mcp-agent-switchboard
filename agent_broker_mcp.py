@@ -16,6 +16,7 @@ import re
 import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -4675,7 +4676,7 @@ def consult_antigravity_cli(
         if implementation_mode and containment_root is not None
         else Path(project_info.root_path)
     )
-    staging_root, staging_error = _prepare_staging(source_root)
+    staging_root, staging_baseline, staging_error = _prepare_staging(source_root)
     if staging_error or staging_root is None:
         return f"Antigravity CLI structured-output validation failed: {staging_error}"
 
@@ -4688,7 +4689,9 @@ def consult_antigravity_cli(
             timeout=timeout,
         )
         if implementation_mode and code == 0:
-            apply_report = _apply_staged_changes(staging_root, source_root, allowed_resolved)
+            apply_report = _apply_staged_changes(
+                staging_root, source_root, allowed_resolved, staging_baseline
+            )
     finally:
         shutil.rmtree(staging_root, ignore_errors=True)
 
@@ -4822,24 +4825,62 @@ STAGING_MAX_FILES = 4000
 STAGING_MAX_BYTES = 200 * 1024 * 1024
 
 
-def _prepare_staging(source: Path) -> tuple[Path | None, str | None]:
-    """Copy `source` into a disposable tree; return (staging_root, refusal).
+def _is_reparse_point(path: Path) -> bool:
+    """True for symlinks, junctions and every other reparse point.
 
-    Flash runs with agy's permission checks disabled, because that is the only way
-    agy grants tool access at all in print mode: settings allow-rules are ignored
-    there, and there is no scoped read-only grant. That flag approves writes and
-    command execution too, so the worker must never be pointed at the real tree.
-    Copying first means a bad write, a delete, or a stray command damages a copy
-    that is thrown away, instead of the user's project.
+    These are never followed. `copytree(symlinks=False)` dereferences them, which
+    would copy data from OUTSIDE the package root into the staging tree and let a
+    write-back escape it. Anything that cannot be classified is treated as a
+    reparse point, because refusing an ordinary file is recoverable and following a
+    link out of the tree is not.
+    """
+    try:
+        st = path.lstat()
+    except OSError:
+        return True
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    attributes = getattr(st, "st_file_attributes", 0)
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
-    Refuses rather than truncating: a partial copy would make the worker report on
-    files that silently were not there, which reads as a finding rather than a
-    setup error.
+
+def _file_digest(path: Path) -> str | None:
+    """sha256 of a file, or None if it cannot be read."""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _prepare_staging(source: Path) -> tuple[Path | None, dict[str, str], str | None]:
+    """Copy `source` into a disposable tree; return (staging_root, baseline, refusal).
+
+    This is ISOLATION, not containment. The worker runs with permission checks
+    disabled -- the only way agy grants tool access in print mode -- so it can still
+    reach absolute paths, the user profile and the network. Working on a copy bounds
+    ACCIDENTAL damage (a stray relative write, a botched rewrite, a delete); it does
+    not bound a deliberate one. Do not describe it as a security boundary.
+
+    `baseline` maps each staged relative path to the sha256 it had AT COPY TIME. The
+    write-back needs it to tell "the worker changed this" from "someone else changed
+    the real file while the package ran" -- comparing staged bytes against the live
+    file cannot distinguish those and silently destroys the concurrent edit.
+
+    Refuses rather than truncating: a silently partial tree makes the worker report
+    on files that were never there, and that reads as a finding rather than a setup
+    error.
     """
     file_count = 0
     total_bytes = 0
     for dirpath, dirnames, filenames in os.walk(source):
-        dirnames[:] = [d for d in dirnames if d not in CONTAINMENT_SKIP_DIRS]
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in CONTAINMENT_SKIP_DIRS and not _is_reparse_point(Path(dirpath) / d)
+        ]
         for filename in filenames:
             file_count += 1
             try:
@@ -4847,7 +4888,7 @@ def _prepare_staging(source: Path) -> tuple[Path | None, str | None]:
             except OSError:
                 continue
             if file_count > STAGING_MAX_FILES or total_bytes > STAGING_MAX_BYTES:
-                return None, (
+                return None, {}, (
                     f"package root {source} is too large to stage safely "
                     f"({file_count}+ files, {total_bytes // (1024 * 1024)}+ MB; caps are "
                     f"{STAGING_MAX_FILES} files / {STAGING_MAX_BYTES // (1024 * 1024)} MB). "
@@ -4859,70 +4900,128 @@ def _prepare_staging(source: Path) -> tuple[Path | None, str | None]:
     # and deleted its parent, which would erase the whole temp directory the moment
     # anything returned a path from elsewhere.
     staging = Path(tempfile.mkdtemp(prefix="flash-staging-"))
+    baseline: dict[str, str] = {}
+    seen_casefold: set[str] = set()
     try:
-        shutil.copytree(
-            source,
-            staging,
-            ignore=shutil.ignore_patterns(*CONTAINMENT_SKIP_DIRS),
-            symlinks=False,
-            dirs_exist_ok=True,
-        )
+        for dirpath, dirnames, filenames in os.walk(source):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in CONTAINMENT_SKIP_DIRS and not _is_reparse_point(Path(dirpath) / d)
+            ]
+            for filename in filenames:
+                origin = Path(dirpath) / filename
+                if _is_reparse_point(origin):
+                    continue
+                key = origin.relative_to(source).as_posix()
+                # NTFS is case-insensitive, so two keys differing only by case would
+                # collide on write-back and silently apply the wrong file.
+                if key.casefold() in seen_casefold:
+                    shutil.rmtree(staging, ignore_errors=True)
+                    return None, {}, (
+                        f"package root {source} contains paths differing only by case "
+                        f"({key}); resolve the collision before staging."
+                    )
+                seen_casefold.add(key.casefold())
+
+                destination = staging / key
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(origin, destination)
+                digest = _file_digest(origin)
+                if digest is not None:
+                    baseline[key] = digest
     except (OSError, shutil.Error) as exc:
         shutil.rmtree(staging, ignore_errors=True)
-        return None, f"could not stage {source} for the worker: {exc}"
-    return staging, None
+        return None, {}, f"could not stage {source} for the worker: {exc}"
+    return staging, baseline, None
 
 
 def _apply_staged_changes(
-    staging_root: Path, source_root: Path, allowed: set[str]
+    staging_root: Path, source_root: Path, allowed: set[str], baseline: dict[str, str]
 ) -> dict[str, Any]:
-    """Copy the worker's edits from the staging copy back onto the real tree.
+    """Write the worker's edits back onto the real tree, or refuse to.
 
-    Only files the package explicitly allowed are applied. Anything else the worker
-    touched stays behind in the staging tree and is reported instead: an
-    out-of-scope change may be a genuine mistake or may be the worker exceeding its
-    package, and deciding which is the brain's call, not this function's.
+    Three-way, never two-way: baseline B (at copy time), staged S, real R. A file is
+    applied only when S differs from B (the worker actually changed it) AND R still
+    equals B (nobody else touched it meanwhile). A two-way staged-vs-real compare
+    cannot tell those apart and overwrites a concurrent edit with a stale snapshot.
+
+    Only allowlisted paths are applied. Deletions are never propagated -- a hash
+    cannot restore a file, so a deletion the worker wanted is reported for a human to
+    make. Everything else is reported rather than applied, because deciding whether
+    an out-of-scope change is a mistake or overreach is the brain's call.
     """
     applied: list[str] = []
     withheld: list[str] = []
+    conflicted: list[str] = []
     failed: list[str] = []
+    staged_keys: set[str] = set()
 
     for dirpath, dirnames, filenames in os.walk(staging_root):
-        dirnames[:] = [d for d in dirnames if d not in CONTAINMENT_SKIP_DIRS]
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in CONTAINMENT_SKIP_DIRS and not _is_reparse_point(Path(dirpath) / d)
+        ]
         for filename in filenames:
             staged = Path(dirpath) / filename
+            if _is_reparse_point(staged):
+                failed.append(str(staged))  # worker planted a link; never follow it
+                continue
             try:
                 relative = staged.relative_to(staging_root)
             except ValueError:
                 continue
-            target = (source_root / relative).resolve()
+            key = relative.as_posix()
+            staged_keys.add(key)
 
-            try:
-                staged_bytes = staged.read_bytes()
-            except OSError:
-                failed.append(str(target))
+            staged_digest = _file_digest(staged)
+            if staged_digest is None:
+                failed.append(str(staged))
                 continue
-            if target.exists():
-                try:
-                    if target.read_bytes() == staged_bytes:
-                        continue  # untouched by the worker
-                except OSError:
-                    failed.append(str(target))
-                    continue
+            before = baseline.get(key)
+            if staged_digest == before:
+                continue  # untouched by the worker
 
+            target = (source_root / relative).resolve()
             if str(target) not in allowed:
                 withheld.append(str(target))
                 continue
+
+            current = _file_digest(target) if target.exists() else None
+            if current != before:
+                # Either the file changed underneath us, or the worker created one
+                # that already exists. Applying would destroy whatever is there now.
+                conflicted.append(str(target))
+                continue
+
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(staged_bytes)
+                if _is_reparse_point(target.parent):
+                    failed.append(str(target))
+                    continue
+                # Write beside the target, then rename: a direct write truncates the
+                # destination first and leaves a half-written file if it fails.
+                with tempfile.NamedTemporaryFile(
+                    dir=str(target.parent), delete=False, suffix=".flash-tmp"
+                ) as tmp:
+                    tmp.write(staged.read_bytes())
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                    pending = tmp.name
+                os.replace(pending, target)
                 applied.append(str(target))
             except OSError:
                 failed.append(str(target))
 
+    # A file present at copy time and gone from staging was deleted by the worker.
+    deleted = sorted(
+        str((source_root / key).resolve()) for key in baseline if key not in staged_keys
+    )
+
     return {
         "applied": sorted(applied),
         "withheld_out_of_scope": sorted(withheld),
+        "conflicted_changed_underneath": sorted(conflicted),
+        "deleted_in_staging_not_applied": deleted,
         "failed_to_apply": sorted(failed),
     }
 
