@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.error
@@ -3948,8 +3949,52 @@ def _normalized_path_for_scope(value: str) -> str:
     return str(value or "").strip().replace("\\", "/").lstrip("./").lower()
 
 
+def _scope_key(value: str, roots: list[Path]) -> str:
+    """Reduce any spelling of a path to ONE scope vocabulary: manifest-relative.
+
+    The worker is told to work in a staged copy, so it reports paths under the
+    staging root, while the allowlist is written in workspace paths. Comparing
+    those two absolute spellings marks every obedient worker out of scope --
+    which is exactly what happened, and it discarded real declared output.
+
+    Roots are resolved first because %TEMP% frequently materialises as an 8.3
+    short path (RUNNER~1), so lowercase-and-flip-slashes alone still mismatches.
+    """
+    text = str(value or "").strip().strip(chr(34))
+    if not text:
+        return ""
+    try:
+        candidate = Path(os.path.normpath(text))
+        resolved = candidate.resolve() if candidate.is_absolute() else candidate
+    except (OSError, ValueError, RuntimeError):
+        return _normalized_path_for_scope(text)
+    for root in roots:
+        try:
+            return _normalized_path_for_scope(str(resolved.relative_to(root)))
+        except (ValueError, OSError):
+            continue
+    return _normalized_path_for_scope(str(resolved))
+
+
+def _scope_roots(staged: Any, package: dict[str, Any]) -> list[Path]:
+    """The roots a reported path may legitimately be expressed against."""
+    roots: list[Path] = []
+    for candidate in (
+        getattr(staged, "root", None),
+        getattr(staged, "workspace_root", None),
+        package.get("workspace_root"),
+    ):
+        if not candidate:
+            continue
+        try:
+            roots.append(Path(str(candidate)).resolve())
+        except (OSError, ValueError, RuntimeError):
+            continue
+    return roots
+
+
 def validate_flash_workhorse_result(
-    outer: Any, package: dict[str, Any]
+    outer: Any, package: dict[str, Any], staged: Any = None
 ) -> tuple[dict[str, Any] | None, list[str]]:
     errors: list[str] = []
     if not isinstance(outer, dict):
@@ -4003,12 +4048,18 @@ def validate_flash_workhorse_result(
         if field in structured and not isinstance(structured[field], list):
             errors.append(f"{field} must be an array")
 
-    allowed = {_normalized_path_for_scope(path) for path in package_writable_paths(package)}
+    # Both the allowlist and the worker's report are reduced to the SAME
+    # manifest-relative vocabulary before comparison. Comparing a staged absolute
+    # path against a workspace absolute path marked every obedient worker
+    # out-of-scope and threw away real declared output.
+    roots = _scope_roots(staged, package)
+    allowed = {_scope_key(path, roots) for path in package_writable_paths(package)}
+    allowed.discard("")
     for changed in structured.get("files_changed") or []:
         if not isinstance(changed, dict) or not str(changed.get("path") or "").strip():
             errors.append("every files_changed item requires path and change")
             continue
-        if allowed and _normalized_path_for_scope(changed["path"]) not in allowed:
+        if allowed and _scope_key(changed["path"], roots) not in allowed:
             errors.append(f"out-of-scope file reported: {changed['path']}")
 
     criteria = structured.get("acceptance_criteria") or []
@@ -4888,8 +4939,29 @@ def consult_antigravity_cli(
         # worth catching is a worker that created or rewrote something it never
         # mentioned. The tree is small by construction, so this walk is total.
         staging_changes = flash_manifest.collect_changes(staged)
+        # Validate BEFORE touching the real tree. Applying first and validating
+        # afterwards meant a dispatch could mutate the workspace and still report
+        # failure to the caller -- the exact opposite of "a failure applies
+        # nothing", and it made the outcome depend on which check tripped first.
         if implementation_mode and code == 0:
-            apply_report = flash_manifest.apply_changes(staged, staging_changes)
+            try:
+                pre_outer = json.loads(stdout or stderr or "null")
+            except json.JSONDecodeError:
+                pre_outer = None
+            if pre_outer is None:
+                pre_errors = ["agy returned no parseable output"]
+            else:
+                _, pre_errors = validate_flash_workhorse_result(pre_outer, package, staged)
+            if pre_errors:
+                apply_report = {
+                    "applied": [],
+                    "refused": True,
+                    "reasons": ["structured output failed validation; nothing was written back"]
+                    + pre_errors,
+                    "integrity": "verified",
+                }
+            else:
+                apply_report = flash_manifest.apply_changes(staged, staging_changes)
     finally:
         shutil.rmtree(staged.root, ignore_errors=True)
 
@@ -11941,6 +12013,134 @@ def handle_bridge_cli(argv: list[str]) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# stdio transport.
+#
+# stdout carries framed JSON-RPC and nothing else; every diagnostic goes to
+# log(). Three defects lived in the old inline loop, all of them fatal in the
+# same way -- a terminal result was computed and persisted, then never reached
+# the caller, who waited out its own timeout with no frame and no error:
+#
+#   * json.dumps() ran at the call site, outside the loop's except block, so a
+#     single non-serializable payload killed the server after the work was done.
+#   * `for raw_line in sys.stdin:` decoded with the platform locale codec
+#     (cp1252 on Windows), so UTF-8 bodies arrived as mojibake, and a decode
+#     error raised by the iterator itself was likewise outside the guard.
+#   * the failure path answered with id=null, which a caller cannot match to
+#     its pending request -- delivered, uncorrelatable, still a hang.
+# ---------------------------------------------------------------------------
+
+_EMIT_LOCK = threading.Lock()
+
+# Recovers `"id": 7` / `"id": "abc"` from a frame we could not fully parse.
+_RAW_ID_RE = re.compile(r'"id"\s*:\s*(?:"((?:[^"\\]|\\.){0,128})"|(-?\d{1,19}))')
+
+
+def _binary_stream(stream: Any) -> Any:
+    """The stream's underlying binary buffer, or the stream itself if it has none."""
+    return getattr(stream, "buffer", stream)
+
+
+def _recover_request_id(raw: str, message: Any) -> Any:
+    """Best-effort JSON-RPC id, so a failure can still be correlated by the caller.
+
+    A response carrying id=null is indistinguishable from an unsolicited
+    notification: the caller never matches it to the request it is blocked on
+    and starves until its own timeout, even though we did answer.
+    """
+    if isinstance(message, dict):
+        request_id = message.get("id")
+        if request_id is not None:
+            return request_id
+    match = _RAW_ID_RE.search(raw)
+    if not match:
+        return None
+    return match.group(1) if match.group(1) is not None else int(match.group(2))
+
+
+def _emit_response(response: dict[str, Any]) -> None:
+    """Serialize, write and flush exactly one JSON-RPC frame. Never raises.
+
+    Serialization happens HERE, inside the guard, so an unserializable payload
+    degrades to a JSON-RPC internal error the caller can act on instead of
+    taking the server down.
+    """
+    request_id = response.get("id") if isinstance(response, dict) else None
+    try:
+        # ensure_ascii keeps the frame pure ASCII, which is why the outbound leg
+        # survives hosts whose pipe is not UTF-8. Do not relax it before every
+        # leg is proven UTF-8 end to end.
+        data = json.dumps(response, ensure_ascii=True).encode("ascii") + b"\n"
+    except Exception as exc:  # noqa: BLE001
+        log(f"emit: serialization failed id={request_id!r}: {traceback.format_exc()}")
+        data = json.dumps(
+            error_response(
+                request_id,
+                -32603,
+                f"response serialization failed: {type(exc).__name__}: {exc}",
+            ),
+            ensure_ascii=True,
+        ).encode("ascii") + b"\n"
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    with _EMIT_LOCK:
+        try:
+            stream = _binary_stream(sys.stdout)
+            stream.write(data)
+            stream.flush()
+        except Exception:  # noqa: BLE001
+            log(f"emit: write failed id={request_id!r} bytes={len(data)}: {traceback.format_exc()}")
+            return
+    # Byte count and hash are what let the next incident be attributed to a
+    # side of the pipe instead of argued about. The id is caller-controlled and
+    # otherwise unbounded, so cap it -- a client could park a payload there and
+    # it would land verbatim in the log.
+    logged_id = repr(request_id)
+    if len(logged_id) > 64:
+        logged_id = logged_id[:64] + "...<truncated>"
+    log(f"emit: id={logged_id} bytes={len(data)} sha256={digest}")
+
+
+def _serve_stdio() -> int:
+    """Read framed JSON-RPC from stdin, answer on stdout, until stdin closes.
+
+    Frames are read as bytes and decoded strict UTF-8 one at a time. Strict is
+    deliberate: a bad frame is reported as a parse error and serving continues
+    -- bytes are never repaired with a replacement character, because that
+    silently converts a transport bug into wrong data.
+    """
+    stdin_bytes = _binary_stream(sys.stdin)
+    while True:
+        try:
+            raw_bytes = stdin_bytes.readline()
+        except Exception:  # noqa: BLE001
+            log(f"stdin: read failed, stopping: {traceback.format_exc()}")
+            return 1
+        if not raw_bytes:
+            return 0
+        try:
+            raw = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            log(f"stdin: strict utf-8 decode failed over {len(raw_bytes)} bytes: {exc}")
+            _emit_response(
+                error_response(None, -32700, f"parse error: frame is not valid UTF-8: {exc}")
+            )
+            continue
+        line = raw.strip()
+        if not line:
+            continue
+        message: Any = None
+        try:
+            message = json.loads(line)
+            response = handle_message(message)
+        except Exception as exc:  # noqa: BLE001
+            log(f"message handling failed: {traceback.format_exc()}")
+            response = error_response(
+                _recover_request_id(line, message), -32603, f"{type(exc).__name__}: {exc}"
+            )
+        if response is not None:
+            _emit_response(response)
+
+
 def main() -> int:
     if len(sys.argv) > 1:
         if sys.argv[1] != "bridge":
@@ -11954,21 +12154,9 @@ def main() -> int:
             return 2
     init_db()
     log("agent-broker MCP server started")
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            message = json.loads(line)
-            response = handle_message(message)
-        except Exception as exc:  # noqa: BLE001
-            log(f"message handling failed: {traceback.format_exc()}")
-            response = error_response(None, -32603, f"{type(exc).__name__}: {exc}")
-        if response is not None:
-            sys.stdout.write(json.dumps(response, ensure_ascii=True) + "\n")
-            sys.stdout.flush()
+    exit_code = _serve_stdio()
     log("agent-broker MCP server stopped")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

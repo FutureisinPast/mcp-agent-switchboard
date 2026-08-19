@@ -181,6 +181,20 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.37 (stdio transport reliability)
+- **Responses are now serialized and written under a single guarded path.** Every reply is serialized inside the request guard and emitted through one writer that encodes, writes, and flushes under a lock, logging the request id, byte count, and a hash digest. Previously a response that failed to serialize could take the server down after the work had already completed, leaving the caller to wait out its own timeout with nothing returned.
+- **Malformed frames no longer end the session.** Frames are read as raw bytes and decoded as strict UTF-8 one at a time, so a malformed frame is reported as a parse error instead of dropping the connection. UTF-8 request bodies are no longer mangled by the host's locale codec.
+- **Failures now answer with the request's own id instead of null**, so a caller can match an error reply to the call it made. Host registrations set `PYTHONUTF8=1`, and new end-to-end tests exercise the server as a real subprocess.
+
+### v1.0.36 (model resolution order)
+- Model resolution now consults the observed model catalog before probing the network, avoiding an unnecessary network round trip when the answer is already known locally.
+
+### v1.0.35 (manifest-scoped packages + safer staging)
+- **The package manifest is now the scope, not the containing directory.** A dispatch no longer walks the whole project tree looking for files to read, which previously caused every read package to be refused on large workspaces.
+- **The Flash worker gets real tool access, confined to a disposable copy.** Work happens against an isolated copy of the relevant files rather than the live tree.
+- **Staged write-back no longer destroys a concurrent edit.** Writing results back checks for a conflicting change instead of blindly overwriting.
+- **Consult children no longer inherit the whole environment.** Child processes get an allowlisted environment instead of a full copy of the parent's.
+
 ### v1.0.34 (Flash-first workhorse lane + gate repair)
 - **Stale MCP registrations are detected and repaired.** `refresh`/`hierarchy` now re-points any host still registered to an older broker binary at the canonical `agent-switchboard.exe`, and `status` prints a per-host registration health table with the version each registered command actually reports. This closes a silent failure mode in which the hooks ran the current build while every host's MCP *server* stayed on an old one — so schema, envelope, and validation changes shipped but never took effect. A running host keeps serving the process it launched, so a window reload is still required after a repair.
 - **Flash is now the default workhorse lane, with objective exceptions.** The managed hierarchy, the runtime routing rules, and the `route_agent_task` description all lead with the Flash package call instead of "native first". Choosing a native role for an eligible package now calls for a stated `flash_skip` reason (`host-tools:`, `unshared-state:`, `flash-failed:`, `flash-unavailable:`, `atomic-oversize:`). Every prior Flash prohibition is unchanged.

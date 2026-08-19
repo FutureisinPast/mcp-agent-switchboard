@@ -694,7 +694,11 @@ def detect() -> dict[str, dict]:
 
 # --- MCP registration writers (idempotent, backed up) ----------------------
 def _mcp_block(caller: str, command: str, args: list[str]) -> dict:
-    return {"type": "stdio", "command": command, "args": list(args), "env": {"AGENT_BROKER_CALLER": caller}}
+    # The host's stdio pipe is not guaranteed to be UTF-8 (Windows consoles
+    # default to the system codepage); force the interpreter's own side so
+    # the server always reads/writes UTF-8 regardless of host locale.
+    return {"type": "stdio", "command": command, "args": list(args),
+            "env": {"AGENT_BROKER_CALLER": caller, "PYTHONUTF8": "1"}}
 
 
 def register_codex(command: str, args: list[str], dry: bool) -> str:
