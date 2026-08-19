@@ -2489,30 +2489,146 @@ def local_port_open(port: int, timeout: float = 0.2) -> bool:
 
 # `agy models` is a network round-trip. 20s was too tight on this machine and timed
 # out repeatedly, which silently pinned every brain to the bundled static catalog.
+# Only reached when the persisted catalog is genuinely stale and the breaker is
+# closed, so this budget is now paid rarely instead of on every route. It stays
+# generous enough for a slow-but-working call: the failure mode it guards against
+# is a downgrade, and a short timeout on a healthy-but-slow network is how that
+# happened before.
 ANTIGRAVITY_MODEL_DISCOVERY_TIMEOUT = max(
-    20, int(os.environ.get("AGENT_BROKER_MODEL_DISCOVERY_TIMEOUT") or 75)
+    10, int(os.environ.get("AGENT_BROKER_MODEL_DISCOVERY_TIMEOUT") or 30)
 )
 ANTIGRAVITY_CATALOG_PATH = BROKER_DIR / "antigravity-models.json"
 
 
+# How long a previously observed catalog is trusted WITHOUT re-asking the network.
+# `agy models` is a network round trip, not a filesystem check: it knows nothing about
+# the caller's paths and its answer changes only when a new model ships. Re-asking on
+# every route bought nothing and cost the full timeout each time, because a hanging
+# call burns the whole budget rather than "up to" it.
+ANTIGRAVITY_CATALOG_SOFT_TTL_SECONDS = _env_int(
+    "AGENT_BROKER_ANTIGRAVITY_CATALOG_TTL_SECONDS", 6 * 3600
+)
+# After repeated failures, stop paying the timeout for a binary that is not answering.
+ANTIGRAVITY_DISCOVERY_BREAKER_THRESHOLD = 2
+ANTIGRAVITY_DISCOVERY_BREAKER_SECONDS = _env_int(
+    "AGENT_BROKER_ANTIGRAVITY_BREAKER_SECONDS", 900
+)
+
+
+def _read_antigravity_catalog_state() -> dict[str, Any]:
+    try:
+        data = json.loads(ANTIGRAVITY_CATALOG_PATH.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _catalog_age_seconds(state: dict[str, Any]) -> float | None:
+    """Seconds since the catalog was last confirmed by a live call, if known."""
+    stamp = str(state.get("observed_at") or "").strip()
+    if not stamp:
+        return None
+    try:
+        parsed = calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, TypeError):
+        return None
+    return max(0.0, time.time() - parsed)
+
+
 def _save_antigravity_catalog(slugs: list[str]) -> None:
-    """Remember the last catalog `agy` actually advertised."""
+    """Remember the last catalog `agy` actually advertised, and clear the breaker."""
     try:
         ANTIGRAVITY_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         ANTIGRAVITY_CATALOG_PATH.write_text(
-            json.dumps({"slugs": list(slugs), "observed_at": utc_now()}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {
+                    "slugs": list(slugs),
+                    "observed_at": utc_now(),
+                    "consecutive_failures": 0,
+                    "breaker_opened_at": None,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
     except Exception as exc:  # noqa: BLE001
         log(f"antigravity catalog save failed: {exc}")
 
 
-def _load_antigravity_catalog() -> list[str]:
+def _record_antigravity_discovery_failure() -> None:
+    """Count a failed live discovery so the breaker can open.
+
+    The slugs are preserved: a failed refresh does not make a previously observed
+    catalog wrong, and dropping it here is what would force the bundled static list
+    -- the silent model downgrade this whole mechanism exists to prevent.
+    """
+    state = _read_antigravity_catalog_state()
+    failures = int(state.get("consecutive_failures") or 0) + 1
+    state["consecutive_failures"] = failures
+    if failures >= ANTIGRAVITY_DISCOVERY_BREAKER_THRESHOLD and not state.get("breaker_opened_at"):
+        state["breaker_opened_at"] = utc_now()
+        log(
+            f"antigravity model discovery breaker OPEN after {failures} failures; "
+            f"using the last observed catalog for {ANTIGRAVITY_DISCOVERY_BREAKER_SECONDS}s"
+        )
     try:
-        data = json.loads(ANTIGRAVITY_CATALOG_PATH.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return []
-    slugs = data.get("slugs")
+        ANTIGRAVITY_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ANTIGRAVITY_CATALOG_PATH.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"antigravity catalog save failed: {exc}")
+
+
+def _antigravity_breaker_open(state: dict[str, Any]) -> bool:
+    opened = str(state.get("breaker_opened_at") or "").strip()
+    if not opened:
+        return False
+    try:
+        parsed = calendar.timegm(time.strptime(opened, "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, TypeError):
+        return False
+    return (time.time() - parsed) < ANTIGRAVITY_DISCOVERY_BREAKER_SECONDS
+
+
+def antigravity_catalog_status() -> dict[str, Any]:
+    """What the receipt must disclose about how the model list was obtained."""
+    state = _read_antigravity_catalog_state()
+    age = _catalog_age_seconds(state)
+    return {
+        "catalog_source": "disk_cache" if state.get("slugs") else "bundled_static",
+        "catalog_observed_at": state.get("observed_at"),
+        "catalog_age_seconds": None if age is None else int(age),
+        "catalog_fresh": age is not None and age < ANTIGRAVITY_CATALOG_SOFT_TTL_SECONDS,
+        "discovery_breaker_open": _antigravity_breaker_open(state),
+        "consecutive_discovery_failures": int(state.get("consecutive_failures") or 0),
+    }
+
+
+def _should_probe_antigravity_models() -> bool:
+    """Whether this route should pay for a live `agy models` call.
+
+    Ordering matters more than the timeout here. The previously observed catalog
+    was only consulted AFTER the probe failed, so the correct answer sat on disk
+    while every route waited out the full timeout -- and a hanging binary burns the
+    entire budget, not a fraction of it. Consult the cache first; probe only when
+    it is genuinely stale and the breaker is closed.
+    """
+    state = _read_antigravity_catalog_state()
+    if not state.get("slugs"):
+        return True  # nothing observed yet: the probe is the only source of truth
+    if _antigravity_breaker_open(state):
+        return False
+    age = _catalog_age_seconds(state)
+    if age is None:
+        return True
+    return age >= ANTIGRAVITY_CATALOG_SOFT_TTL_SECONDS
+
+
+def _load_antigravity_catalog() -> list[str]:
+    state = _read_antigravity_catalog_state()
+    slugs = state.get("slugs")
     return [str(s) for s in slugs] if isinstance(slugs, list) else []
 
 
@@ -2543,7 +2659,7 @@ def discover_antigravity_models() -> list[dict[str, Any]]:
 
     agy = discover_antigravity_cli(config)
     discovered_live = False
-    if agy:
+    if agy and _should_probe_antigravity_models():
         try:
             proc = subprocess.run(
                 [agy, "models"],
@@ -2567,6 +2683,7 @@ def discover_antigravity_models() -> list[dict[str, Any]]:
                 log(f"agy models exited {proc.returncode}: {proc.stderr[:500]}")
         except Exception as exc:  # noqa: BLE001
             log(f"agy model discovery failed: {exc}")
+            _record_antigravity_discovery_failure()
     if not discovered_live:
         # Live discovery is a network call and is genuinely slow sometimes. Falling
         # straight back to the bundled static list silently DOWNGRADES every brain to
