@@ -19,6 +19,7 @@ import calendar
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -28,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import agent_broker_mcp as broker  # noqa: E402
+import atomic_io  # noqa: E402
 
 
 def _stamp(epoch_seconds: float) -> str:
@@ -38,10 +40,17 @@ class AntigravityCatalogCacheTests(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
         self._orig_path = broker.ANTIGRAVITY_CATALOG_PATH
+        self._orig_lock_path = broker.ANTIGRAVITY_CATALOG_LOCK_PATH
+        self._orig_lock_timeout = broker.ANTIGRAVITY_CATALOG_LOCK_TIMEOUT_SECONDS
         broker.ANTIGRAVITY_CATALOG_PATH = Path(self._tmpdir.name) / "antigravity-models.json"
+        broker.ANTIGRAVITY_CATALOG_LOCK_PATH = broker.ANTIGRAVITY_CATALOG_PATH.with_suffix(".lock")
+        # Keep the timeout tiny so the lock-contention tests below stay fast.
+        broker.ANTIGRAVITY_CATALOG_LOCK_TIMEOUT_SECONDS = 0.3
 
     def tearDown(self):
         broker.ANTIGRAVITY_CATALOG_PATH = self._orig_path
+        broker.ANTIGRAVITY_CATALOG_LOCK_PATH = self._orig_lock_path
+        broker.ANTIGRAVITY_CATALOG_LOCK_TIMEOUT_SECONDS = self._orig_lock_timeout
         self._tmpdir.cleanup()
 
     def _write_state(self, state: dict) -> None:
@@ -190,6 +199,113 @@ class AntigravityCatalogCacheTests(unittest.TestCase):
         self.assertEqual(status["catalog_source"], "bundled_static")
         self.assertFalse(status["catalog_fresh"])
         self.assertFalse(status["discovery_breaker_open"])
+
+    # 10. Regression guard for the observed defect: many host server processes call
+    # `_record_antigravity_discovery_failure()` concurrently. Before the lock, each
+    # call did an unsynchronised read-modify-write, so concurrent increments raced
+    # and dropped updates (the live log showed the breaker opening/clearing
+    # spuriously right after a healthy save). With the lock held across the whole
+    # read-modify-write, N concurrent calls must land exactly N increments -- no
+    # lost updates.
+    def test_concurrent_failure_recording_loses_no_updates(self):
+        # This test is about correctness under real contention, not the timeout
+        # path (that is covered separately below) -- give the lock enough room
+        # that 25 threads queuing for a sub-millisecond critical section never
+        # time each other out.
+        broker.ANTIGRAVITY_CATALOG_LOCK_TIMEOUT_SECONDS = 5.0
+        call_count = 25
+        barrier = threading.Barrier(call_count)
+
+        def _record():
+            barrier.wait(timeout=5)
+            broker._record_antigravity_discovery_failure()
+
+        threads = [threading.Thread(target=_record) for _ in range(call_count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive(), "a recording thread did not finish in time")
+
+        state = broker._read_antigravity_catalog_state()
+        self.assertEqual(state.get("consecutive_failures"), call_count)
+
+    # 11. A save racing a failure record must never leave the catalog file
+    # truncated or invalid: whichever write lands last, the file on disk is
+    # always complete, parseable JSON with the documented schema.
+    def test_save_concurrent_with_failure_record_leaves_valid_json(self):
+        broker.ANTIGRAVITY_CATALOG_LOCK_TIMEOUT_SECONDS = 5.0
+        broker._save_antigravity_catalog(["antigravity-flash-3.7"])
+        iterations = 20
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def _saver():
+            try:
+                barrier.wait(timeout=5)
+                for _ in range(iterations):
+                    broker._save_antigravity_catalog(["antigravity-flash-3.7", "antigravity-pro-1.0"])
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def _failer():
+            try:
+                barrier.wait(timeout=5)
+                for _ in range(iterations):
+                    broker._record_antigravity_discovery_failure()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_saver), threading.Thread(target=_failer)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+            self.assertFalse(t.is_alive(), "a save/failure thread did not finish in time")
+
+        self.assertEqual(errors, [])
+        raw = broker.ANTIGRAVITY_CATALOG_PATH.read_text(encoding="utf-8")
+        state = json.loads(raw)  # must never raise: never truncated, never partial
+        self.assertIsInstance(state, dict)
+        self.assertIn("slugs", state)
+        self.assertIn("observed_at", state)
+        self.assertIn("consecutive_failures", state)
+        self.assertIn("breaker_opened_at", state)
+        self.assertIsInstance(state["slugs"], list)
+        self.assertIsInstance(state["consecutive_failures"], int)
+
+    # 12a. Lock-timeout path for the failure recorder: if another holder has the
+    # lock, the function must return quietly (no raise) and must not touch the
+    # existing state on disk.
+    def test_record_failure_returns_quietly_when_lock_unavailable(self):
+        broker._save_antigravity_catalog(["antigravity-flash-3.7"])
+        before = broker._read_antigravity_catalog_state()
+
+        holder = atomic_io.FileLock(broker.ANTIGRAVITY_CATALOG_LOCK_PATH, timeout=1)
+        self.assertTrue(holder.acquire())
+        try:
+            broker._record_antigravity_discovery_failure()  # must not raise
+        finally:
+            holder.release()
+
+        after = broker._read_antigravity_catalog_state()
+        self.assertEqual(after, before)
+
+    # 12b. Lock-timeout path for the catalog saver: same guarantee -- quietly
+    # skips the update rather than blocking or corrupting existing state.
+    def test_save_catalog_returns_quietly_when_lock_unavailable(self):
+        broker._save_antigravity_catalog(["antigravity-flash-3.7"])
+        before = broker._read_antigravity_catalog_state()
+
+        holder = atomic_io.FileLock(broker.ANTIGRAVITY_CATALOG_LOCK_PATH, timeout=1)
+        self.assertTrue(holder.acquire())
+        try:
+            broker._save_antigravity_catalog(["antigravity-pro-1.0"])  # must not raise
+        finally:
+            holder.release()
+
+        after = broker._read_antigravity_catalog_state()
+        self.assertEqual(after, before)
 
 
 if __name__ == "__main__":

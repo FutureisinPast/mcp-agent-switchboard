@@ -9,6 +9,7 @@ needed by Codex, Claude Code, and Antigravity over stdio JSON-RPC.
 from __future__ import annotations
 
 import calendar
+import errno
 import json
 import hashlib
 import os
@@ -31,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import atomic_io
 import flash_manifest
 import model_roles
 from switchboard_version import BROKER_VERSION
@@ -2499,6 +2501,9 @@ ANTIGRAVITY_MODEL_DISCOVERY_TIMEOUT = max(
     10, int(os.environ.get("AGENT_BROKER_MODEL_DISCOVERY_TIMEOUT") or 30)
 )
 ANTIGRAVITY_CATALOG_PATH = BROKER_DIR / "antigravity-models.json"
+ANTIGRAVITY_CATALOG_LOCK_PATH = ANTIGRAVITY_CATALOG_PATH.with_suffix(".lock")
+# Bounded: catalog bookkeeping must never stall a dispatch waiting on the lock.
+ANTIGRAVITY_CATALOG_LOCK_TIMEOUT_SECONDS = 3.0
 
 
 # How long a previously observed catalog is trusted WITHOUT re-asking the network.
@@ -2536,11 +2541,29 @@ def _catalog_age_seconds(state: dict[str, Any]) -> float | None:
     return max(0.0, time.time() - parsed)
 
 
+def _antigravity_catalog_lock() -> atomic_io.FileLock:
+    """Serialise read-modify-write of the shared catalog state file.
+
+    Many host server processes can call `_save_antigravity_catalog()` and
+    `_record_antigravity_discovery_failure()` concurrently; without a lock
+    their unsynchronised read-modify-write races and drops updates (a save
+    right after a failure can be clobbered by a stale failure count, or vice
+    versa). Timeout is short and bounded on purpose: losing one bookkeeping
+    update is strictly better than a dispatch stalling on this lock.
+    """
+    return atomic_io.FileLock(ANTIGRAVITY_CATALOG_LOCK_PATH, timeout=ANTIGRAVITY_CATALOG_LOCK_TIMEOUT_SECONDS)
+
+
 def _save_antigravity_catalog(slugs: list[str]) -> None:
     """Remember the last catalog `agy` actually advertised, and clear the breaker."""
+    lock = _antigravity_catalog_lock()
+    if not lock.acquire():
+        log("antigravity catalog save skipped: lock timed out")
+        return
     try:
         ANTIGRAVITY_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ANTIGRAVITY_CATALOG_PATH.write_text(
+        atomic_io.atomic_write_text(
+            ANTIGRAVITY_CATALOG_PATH,
             json.dumps(
                 {
                     "slugs": list(slugs),
@@ -2555,6 +2578,8 @@ def _save_antigravity_catalog(slugs: list[str]) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         log(f"antigravity catalog save failed: {exc}")
+    finally:
+        lock.release()
 
 
 def _record_antigravity_discovery_failure() -> None:
@@ -2564,22 +2589,30 @@ def _record_antigravity_discovery_failure() -> None:
     catalog wrong, and dropping it here is what would force the bundled static list
     -- the silent model downgrade this whole mechanism exists to prevent.
     """
-    state = _read_antigravity_catalog_state()
-    failures = int(state.get("consecutive_failures") or 0) + 1
-    state["consecutive_failures"] = failures
-    if failures >= ANTIGRAVITY_DISCOVERY_BREAKER_THRESHOLD and not state.get("breaker_opened_at"):
-        state["breaker_opened_at"] = utc_now()
-        log(
-            f"antigravity model discovery breaker OPEN after {failures} failures; "
-            f"using the last observed catalog for {ANTIGRAVITY_DISCOVERY_BREAKER_SECONDS}s"
-        )
+    lock = _antigravity_catalog_lock()
+    if not lock.acquire():
+        log("antigravity discovery failure record skipped: lock timed out")
+        return
     try:
+        state = _read_antigravity_catalog_state()
+        failures = int(state.get("consecutive_failures") or 0) + 1
+        state["consecutive_failures"] = failures
+        if failures >= ANTIGRAVITY_DISCOVERY_BREAKER_THRESHOLD and not state.get("breaker_opened_at"):
+            state["breaker_opened_at"] = utc_now()
+            log(
+                f"antigravity model discovery breaker OPEN after {failures} failures; "
+                f"using the last observed catalog for {ANTIGRAVITY_DISCOVERY_BREAKER_SECONDS}s"
+            )
         ANTIGRAVITY_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ANTIGRAVITY_CATALOG_PATH.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        atomic_io.atomic_write_text(
+            ANTIGRAVITY_CATALOG_PATH,
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
     except Exception as exc:  # noqa: BLE001
         log(f"antigravity catalog save failed: {exc}")
+    finally:
+        lock.release()
 
 
 def _antigravity_breaker_open(state: dict[str, Any]) -> bool:
@@ -12058,6 +12091,16 @@ def _recover_request_id(raw: str, message: Any) -> Any:
     return match.group(1) if match.group(1) is not None else int(match.group(2))
 
 
+def _short_id(request_id: Any) -> str:
+    """A log-safe rendering of a caller-controlled id.
+
+    The id is whatever the client sent and is otherwise unbounded, so cap it --
+    a client could park a payload there and it would land verbatim in the log.
+    """
+    text = repr(request_id)
+    return text if len(text) <= 64 else text[:64] + "...<truncated>"
+
+
 def _emit_response(response: dict[str, Any]) -> None:
     """Serialize, write and flush exactly one JSON-RPC frame. Never raises.
 
@@ -12087,17 +12130,28 @@ def _emit_response(response: dict[str, Any]) -> None:
             stream = _binary_stream(sys.stdout)
             stream.write(data)
             stream.flush()
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            # The peer hung up before reading. Routine -- a host that probes the
+            # server and disconnects does exactly this -- so record one quiet
+            # line instead of a traceback that reads like a defect.
+            log(f"emit: peer closed before id={_short_id(request_id)} was sent ({type(exc).__name__})")
+            return
+        except OSError as exc:
+            # Windows surfaces a dead pipe as EINVAL/EBADF rather than
+            # BrokenPipeError, so those mean the same thing here.
+            if exc.errno in (errno.EINVAL, errno.EBADF, errno.EPIPE):
+                log(f"emit: peer closed before id={_short_id(request_id)} was sent (errno {exc.errno})")
+            else:
+                log(f"emit: write failed id={_short_id(request_id)} bytes={len(data)}: {traceback.format_exc()}")
+            return
         except Exception:  # noqa: BLE001
-            log(f"emit: write failed id={request_id!r} bytes={len(data)}: {traceback.format_exc()}")
+            log(f"emit: write failed id={_short_id(request_id)} bytes={len(data)}: {traceback.format_exc()}")
             return
     # Byte count and hash are what let the next incident be attributed to a
     # side of the pipe instead of argued about. The id is caller-controlled and
     # otherwise unbounded, so cap it -- a client could park a payload there and
     # it would land verbatim in the log.
-    logged_id = repr(request_id)
-    if len(logged_id) > 64:
-        logged_id = logged_id[:64] + "...<truncated>"
-    log(f"emit: id={logged_id} bytes={len(data)} sha256={digest}")
+    log(f"emit: id={_short_id(request_id)} bytes={len(data)} sha256={digest}")
 
 
 def _serve_stdio() -> int:

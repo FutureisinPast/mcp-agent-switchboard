@@ -181,6 +181,10 @@ broker/bridge version drift and prints actionable next steps.
 
 ## Changelog
 
+### v1.0.38 (quiet disconnects + a steadier worker lane)
+- **A peer hanging up is no longer logged as an error.** When the other side of the connection closes without warning, the server now recognizes that as a normal disconnect (including the platform-specific way Windows reports it) and logs a single quiet line instead of a full error trace; a genuine write failure still gets the full trace. Request ids in these log lines are now length-capped so an oversized or malformed id can't blow up the log.
+- **Fixed a bug where the worker lane could go dark for no real reason.** The file that tracks model availability was being updated by many processes at once with no coordination, so failure counts could be lost or double-counted — occasionally tripping the circuit breaker that disables the worker lane even while model discovery was working fine. Updates to that file are now serialized and written atomically, so the file can never be left half-written, and an update that can't get a lock in time is skipped and logged rather than blocking a dispatch.
+
 ### v1.0.37 (stdio transport reliability)
 - **Responses are now serialized and written under a single guarded path.** Every reply is serialized inside the request guard and emitted through one writer that encodes, writes, and flushes under a lock, logging the request id, byte count, and a hash digest. Previously a response that failed to serialize could take the server down after the work had already completed, leaving the caller to wait out its own timeout with nothing returned.
 - **Malformed frames no longer end the session.** Frames are read as raw bytes and decoded as strict UTF-8 one at a time, so a malformed frame is reported as a parse error instead of dropping the connection. UTF-8 request bodies are no longer mangled by the host's locale codec.
