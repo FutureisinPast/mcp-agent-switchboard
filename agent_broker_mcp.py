@@ -4027,13 +4027,30 @@ def _scope_roots(staged: Any, package: dict[str, Any]) -> list[Path]:
 
 
 def validate_flash_workhorse_result(
-    outer: Any, package: dict[str, Any], staged: Any = None
+    outer: Any,
+    package: dict[str, Any],
+    staged: Any = None,
+    caveats_out: list[dict[str, str]] | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
+    """Validate a worker's structured payload. The structured payload is
+    PRIMARY: the CLI's own process/transport status (``outer["status"]``) is a
+    noisy signal (Windows + a frozen binary + host shells) that must never, on
+    its own, reject a dispatch whose structured payload is present,
+    schema-valid, and in scope. When that mismatch is the ONLY problem it is
+    recorded into ``caveats_out`` (if the caller passed a list) instead of
+    ``errors`` -- confirmed defect: a run with a fully valid, in-scope
+    structured payload was rejected purely because the CLI process status
+    disagreed with it. Genuine semantic failures (missing/unparseable
+    payload, schema violation, scope/allowlist violation, safety-rule
+    failure) are unchanged and still reject.
+    """
     errors: list[str] = []
+    caveats = caveats_out if caveats_out is not None else []
     if not isinstance(outer, dict):
         return None, ["agy JSON result is not an object"]
+    exit_status_mismatch = None
     if str(outer.get("status") or "").upper() != "SUCCESS":
-        errors.append(f"agy status was {outer.get('status') or 'missing'}")
+        exit_status_mismatch = f"agy status was {outer.get('status') or 'missing'}"
     structured = outer.get("structured_output")
     if isinstance(structured, str):
         try:
@@ -4054,12 +4071,17 @@ def validate_flash_workhorse_result(
                 shape.append(f"{key}:str[{len(value)}]")
             else:
                 shape.append(f"{key}:{type(value).__name__}")
-        return None, errors + [
+        missing_errors = errors + [
             "structured_output is missing or not an object; the backend returned "
             f"{{{', '.join(shape)}}}. The worker did not produce schema-conforming "
             "output for this package -- re-scope it into a smaller package or retain "
             "it, and do not treat the absence as a completed result"
         ]
+        # No structured payload to demote against -- the exit-status note is a
+        # genuine rejection reason here, not a caveat.
+        if exit_status_mismatch:
+            missing_errors.append(exit_status_mismatch)
+        return None, missing_errors
 
     required = set(flash_workhorse_output_schema(package)["required"])
     missing = sorted(required.difference(structured))
@@ -4126,6 +4148,26 @@ def validate_flash_workhorse_result(
             evidence = claim.get("evidence") or []
             if claim.get("basis") != "observed" or not evidence:
                 errors.append("intentional/by-design claim lacks observed primary evidence")
+
+    if exit_status_mismatch:
+        if errors:
+            # A genuine semantic failure already rejects this result on its own
+            # merits; keep the exit-status note as extra diagnostic context.
+            errors.append(exit_status_mismatch)
+        else:
+            # The structured payload is present, schema-valid, and in scope.
+            # Demote instead of rejecting: the CLI exit status is noise, not a
+            # verdict on the work.
+            caveats.append(
+                {
+                    "code": "cli_exit_status_mismatch",
+                    "detail": (
+                        exit_status_mismatch
+                        + "; the structured payload validated successfully, so the CLI "
+                        "process/transport status is treated as a noisy signal, not a rejection."
+                    ),
+                }
+            )
     return structured, errors
 
 
@@ -4976,6 +5018,8 @@ def consult_antigravity_cli(
         # afterwards meant a dispatch could mutate the workspace and still report
         # failure to the caller -- the exact opposite of "a failure applies
         # nothing", and it made the outcome depend on which check tripped first.
+        pre_outer_payload: dict[str, Any] | None = None
+        pre_validation_failures: list[str] = []
         if implementation_mode and code == 0:
             try:
                 pre_outer = json.loads(stdout or stderr or "null")
@@ -4984,8 +5028,10 @@ def consult_antigravity_cli(
             if pre_outer is None:
                 pre_errors = ["agy returned no parseable output"]
             else:
+                pre_outer_payload = pre_outer if isinstance(pre_outer, dict) else None
                 _, pre_errors = validate_flash_workhorse_result(pre_outer, package, staged)
             if pre_errors:
+                pre_validation_failures = pre_errors
                 apply_report = {
                     "applied": [],
                     "refused": True,
@@ -5005,11 +5051,17 @@ def consult_antigravity_cli(
         # Report and refuse; never "clean up". An unexpected file may belong to the
         # user or another process, and a deleted one cannot be restored from a hash.
         # The brain decides what happened here.
+        reasons = apply_report.get("reasons") or []
+        quarantine = _quarantine_rejected(
+            package.get("package_id"), stdout, stderr, pre_outer_payload,
+            pre_validation_failures or reasons,
+        )
         return (
             "Antigravity CLI structured-output validation failed: the package was refused "
             "and NOTHING was written back. "
-            + "; ".join(apply_report.get("reasons") or [])
+            + "; ".join(reasons)
             + f" | integrity: {containment_report['integrity']}"
+            + _quarantine_suffix(quarantine)
         )
 
     if code == 124:
@@ -5026,22 +5078,60 @@ def consult_antigravity_cli(
     if stderr_log:
         stderr_note += f" | full log: {stderr_log}"
     if not raw:
-        return "Antigravity CLI structured-output validation failed: agy returned no output." + stderr_note
+        quarantine = _quarantine_rejected(
+            package.get("package_id"), stdout, stderr, None, ["agy returned no output"]
+        )
+        return (
+            "Antigravity CLI structured-output validation failed: agy returned no output."
+            + stderr_note + _quarantine_suffix(quarantine)
+        )
     try:
         outer = json.loads(raw)
     except json.JSONDecodeError as exc:
-        return f"Antigravity CLI structured-output validation failed: invalid JSON ({exc})." + stderr_note
-    structured, validation_errors = validate_flash_workhorse_result(outer, package)
+        quarantine = _quarantine_rejected(
+            package.get("package_id"), stdout, stderr, None, [f"invalid JSON ({exc})"]
+        )
+        return (
+            f"Antigravity CLI structured-output validation failed: invalid JSON ({exc})."
+            + stderr_note + _quarantine_suffix(quarantine)
+        )
+    caveats: list[dict[str, str]] = []
+    structured, validation_errors = validate_flash_workhorse_result(outer, package, caveats_out=caveats)
     if validation_errors:
-        return "Antigravity CLI structured-output validation failed: " + "; ".join(validation_errors) + stderr_note
+        quarantine = _quarantine_rejected(
+            package.get("package_id"), stdout, stderr, outer, validation_errors
+        )
+        return (
+            "Antigravity CLI structured-output validation failed: " + "; ".join(validation_errors)
+            + stderr_note + _quarantine_suffix(quarantine)
+        )
     attested_model = outer.get("model") or outer.get("model_id") or None
     conflict = attested_model_conflict(model_name, attested_model)
     if conflict:
-        return "Antigravity CLI structured-output validation failed: " + conflict + stderr_note
+        quarantine = _quarantine_rejected(
+            package.get("package_id"), stdout, stderr, outer, [conflict]
+        )
+        return (
+            "Antigravity CLI structured-output validation failed: " + conflict
+            + stderr_note + _quarantine_suffix(quarantine)
+        )
+    worker_reported_status = structured.get("status") if structured else "failed"
+    demoted_worker_status = worker_reported_status
+    if caveats and worker_reported_status == "completed":
+        # completed_with_caveats is a broker-assigned envelope status ONLY --
+        # the worker itself never emits it. It records that the structured
+        # payload validated fully but the CLI's own exit/transport status did
+        # not match, so the caller should not treat this as an unqualified
+        # completion without reading the caveat.
+        demoted_worker_status = "completed_with_caveats"
     normalized = {
         "package_id": package["package_id"],
-        "worker_status": structured.get("status") if structured else "failed",
+        "worker_status": demoted_worker_status,
         "structured_output": structured,
+        "caveats": caveats,
+        # The broker's own acceptance verdict. Never infer acceptance from
+        # "a payload exists" or "a path is present" -- key on this field.
+        "disposition": "accepted_with_caveats" if caveats else "accepted",
         "cli": {
             "conversation_id": outer.get("conversation_id"),
             "duration_seconds": outer.get("duration_seconds"),
@@ -5128,6 +5218,168 @@ def persist_worker_stderr(package_id: str, stderr: str) -> tuple[str, str | None
     except (OSError, subprocess.SubprocessError, ValueError):
         log_path = None
     return excerpt, log_path
+
+
+# Quarantine: untrusted local storage the broker writes to BEFORE a rejection
+# verdict is finalised, so a genuine refusal (missing/unparseable payload,
+# schema violation, scope violation, safety-rule failure) is never a total
+# loss of the worker's raw output. This is NOT containment and NOT an OS
+# security boundary -- it is a forensic bundle nothing in it is accepted,
+# verified, or applied. A preflight refusal that never ran a worker (manifest
+# rejection, danger-full-access refusal, staging failure) has nothing to
+# quarantine and must not call this.
+QUARANTINE_ROOT = BROKER_DIR / "quarantine" / "rejected"
+QUARANTINE_LOCK_PATH = BROKER_DIR / "quarantine" / ".prune.lock"
+QUARANTINE_MAX_AGE_DAYS = 7
+QUARANTINE_MAX_BUNDLES = 500
+QUARANTINE_MAX_BUNDLE_BYTES = 100 * 1024 * 1024
+QUARANTINE_PRUNE_MIN_INTERVAL_SECONDS = 600
+
+# Process-local throttle: pruning walks the whole quarantine tree, so it is
+# gated to at most once per interval rather than once per rejection.
+_quarantine_last_prune_at = 0.0
+
+
+def _prune_quarantine(now: float | None = None) -> None:
+    """Keep quarantine under the day/bundle-count cap, oldest first."""
+    global _quarantine_last_prune_at
+    now = time.time() if now is None else now
+    if now - _quarantine_last_prune_at < QUARANTINE_PRUNE_MIN_INTERVAL_SECONDS:
+        return
+    lock = atomic_io.FileLock(QUARANTINE_LOCK_PATH, timeout=5.0)
+    if not lock.acquire():
+        return
+    try:
+        _quarantine_last_prune_at = now
+        if not QUARANTINE_ROOT.exists():
+            return
+        bundles: list[tuple[float, Path]] = []
+        for day_dir in QUARANTINE_ROOT.iterdir():
+            if not day_dir.is_dir():
+                continue
+            for bundle in day_dir.iterdir():
+                if not bundle.is_dir():
+                    continue
+                try:
+                    bundles.append((bundle.stat().st_mtime, bundle))
+                except OSError:
+                    continue
+        bundles.sort(key=lambda item: item[0])
+        cutoff = now - QUARANTINE_MAX_AGE_DAYS * 86400
+        keep: list[tuple[float, Path]] = []
+        for mtime, bundle in bundles:
+            if mtime < cutoff:
+                shutil.rmtree(bundle, ignore_errors=True)
+            else:
+                keep.append((mtime, bundle))
+        excess = len(keep) - QUARANTINE_MAX_BUNDLES
+        if excess > 0:
+            for _mtime, bundle in keep[:excess]:
+                shutil.rmtree(bundle, ignore_errors=True)
+        for day_dir in QUARANTINE_ROOT.iterdir():
+            if not day_dir.is_dir():
+                continue
+            try:
+                next(day_dir.iterdir())
+            except StopIteration:
+                try:
+                    day_dir.rmdir()
+                except OSError:
+                    pass
+            except OSError:
+                pass
+    except OSError as exc:
+        log(f"quarantine prune failed: {exc}")
+    finally:
+        lock.release()
+
+
+def _quarantine_rejected(
+    package_id: str,
+    stdout: str,
+    stderr: str,
+    payload: dict[str, Any] | None,
+    validation_failures: list[str],
+) -> dict[str, str] | None:
+    """Atomically write the raw worker stdout/stderr, the parsed payload (if
+    any), and a manifest with sha256+sizes to the quarantine bundle for one
+    rejected dispatch. Returns {"quarantine_path", "quarantine_sha256"} on
+    success, or None if the write itself failed (best-effort: losing the
+    forensic bundle must never block the rejection verdict from being
+    returned to the caller).
+    """
+    try:
+        _prune_quarantine()
+        request_id = uuid.uuid4().hex[:12]
+        day = time.strftime("%Y%m%d", time.gmtime())
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(package_id or "unknown"))[:60]
+        bundle_dir = QUARANTINE_ROOT / day / f"{safe_id}-{request_id}"
+        cap = QUARANTINE_MAX_BUNDLE_BYTES
+        files: dict[str, str] = {
+            "stdout.txt": stdout or "",
+            "stderr.txt": stderr or "",
+        }
+        if isinstance(payload, dict):
+            files["structured_output.json"] = json.dumps(payload, ensure_ascii=False, indent=2)
+        manifest_files: dict[str, Any] = {}
+        for name, text in files.items():
+            data = text.encode("utf-8", errors="replace")
+            was_truncated = len(data) > cap
+            if was_truncated:
+                data = data[:cap]
+            atomic_io.atomic_write_text(bundle_dir / name, data.decode("utf-8", errors="ignore"), encoding="utf-8")
+            manifest_files[name] = {
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "bytes": len(data),
+                "truncated": was_truncated,
+            }
+        manifest = {
+            "package_id": package_id,
+            "created_at": utc_now(),
+            "artifact_disposition": "quarantined_untrusted",
+            "validation_failures": list(validation_failures),
+            "note": (
+                "Quarantine is untrusted local storage kept for forensics only. Nothing "
+                "in this bundle was accepted, verified, or applied to the workspace. "
+                "This is NOT containment and NOT an OS security boundary."
+            ),
+            "files": manifest_files,
+        }
+        manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2)
+        atomic_io.atomic_write_text(bundle_dir / "manifest.json", manifest_text, encoding="utf-8")
+        manifest_sha256 = hashlib.sha256(manifest_text.encode("utf-8")).hexdigest()
+        return {"quarantine_path": str(bundle_dir), "quarantine_sha256": manifest_sha256}
+    except Exception as exc:  # noqa: BLE001
+        log(f"quarantine write failed: {exc}")
+        return None
+
+
+def _quarantine_suffix(quarantine: dict[str, str] | None) -> str:
+    if not quarantine:
+        return ""
+    return (
+        f" | quarantine_path: {quarantine['quarantine_path']}"
+        f" | quarantine_sha256: {quarantine['quarantine_sha256']}"
+        " | artifact_disposition: quarantined_untrusted"
+        " | quarantined artifacts were NOT accepted and NOT applied."
+    )
+
+
+_QUARANTINE_SUFFIX_RE = re.compile(
+    r"quarantine_path: (?P<path>.+?) \| quarantine_sha256: (?P<sha>[0-9a-f]{64})"
+)
+
+
+def _rejection_validation_failures(response: str) -> list[str]:
+    """Recover the semicolon-joined validation failure list from a rejection
+    message, for surfacing on the routing-layer receipt."""
+    marker = "Antigravity CLI structured-output validation failed: "
+    if not response.startswith(marker):
+        return []
+    body = response[len(marker):]
+    body = body.split(" | worker stderr:")[0]
+    body = body.split(" | quarantine_path:")[0]
+    return [part.strip() for part in body.split(";") if part.strip()]
 
 
 # Outcome taxonomy for a Flash dispatch. Only ONE value may ever earn delegation
@@ -5744,8 +5996,16 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             result["structured_output_enforced"] = True
             result["structured_output"] = antigravity_structured
             result["worker_status"] = (
-                antigravity_structured.get("status") if isinstance(antigravity_structured, dict) else None
+                antigravity_envelope.get("worker_status")
+                if isinstance(antigravity_envelope, dict) and antigravity_envelope.get("worker_status")
+                else (antigravity_structured.get("status") if isinstance(antigravity_structured, dict) else None)
             )
+            result["disposition"] = (
+                antigravity_envelope.get("disposition") if isinstance(antigravity_envelope, dict) else None
+            )
+            result["caveats"] = (
+                antigravity_envelope.get("caveats") if isinstance(antigravity_envelope, dict) else []
+            ) or []
             result["brain_verification"] = {
                 "required": True,
                 "status": "pending",
@@ -5775,6 +6035,21 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
                     "The worker's own output was rejected. Do NOT silently reroute this package: "
                     "inspect the rejection, then re-scope it or retain it in the brain."
                 )
+                result["disposition"] = "rejected"
+                result["validation_failures"] = _rejection_validation_failures(response)
+                quarantine_match = _QUARANTINE_SUFFIX_RE.search(response)
+                if quarantine_match:
+                    result["quarantine_path"] = quarantine_match.group("path")
+                    result["quarantine_sha256"] = quarantine_match.group("sha")
+                    result["artifact_disposition"] = "quarantined_untrusted"
+                    result["note_quarantine"] = (
+                        "Quarantined artifacts were NOT accepted and NOT applied. Quarantine is "
+                        "untrusted local storage kept for forensics only, not containment."
+                    )
+                else:
+                    result["quarantine_path"] = None
+                    result["quarantine_sha256"] = None
+                    result["artifact_disposition"] = None
         if model_policy:
             result["model_policy"] = model_policy
         if effort_policy:
