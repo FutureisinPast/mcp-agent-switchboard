@@ -870,7 +870,7 @@ def write_config(dry: bool) -> str:
         "app_autosubmit": False,
         "antigravity_cdp_port": 9000,
         "vscode_cdp_port": 9010,
-        "antigravity_cdp_autoselect": True,
+        "antigravity_cdp_autoselect": False,
     }
     if dry:
         return f"would write {cfg_path}"

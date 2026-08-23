@@ -35,6 +35,7 @@ from typing import Any
 import atomic_io
 import flash_manifest
 import model_roles
+import outbound_screen
 from switchboard_version import BROKER_VERSION
 
 
@@ -763,6 +764,7 @@ def init_db() -> None:
             ("worker_started_at", "ALTER TABLE codex_requests ADD COLUMN worker_started_at TEXT"),
             ("worker_completed_at", "ALTER TABLE codex_requests ADD COLUMN worker_completed_at TEXT"),
             ("mode", "ALTER TABLE codex_requests ADD COLUMN mode TEXT"),
+            ("outbound_reviewed", "ALTER TABLE codex_requests ADD COLUMN outbound_reviewed INTEGER DEFAULT 0"),
         ):
             if column_name not in codex_columns:
                 try:
@@ -2728,10 +2730,17 @@ def discover_antigravity_models() -> list[dict[str, Any]]:
             models.append(antigravity_model_entry_from_slug(slug))
 
     # Keep models visible only in the IDE picker as inbox choices too.
+    # OPT-IN, and deliberately default-off: cdp_list_models.mjs enumerates the
+    # picker by literally CLICKING it open over CDP (Input.dispatchMouseEvent), so
+    # every run steals focus and pops the model chooser in the user's face. This
+    # code is reached from resolve_model_request, which runs BEFORE the surface
+    # branch -- so a pure surface="cli" dispatch, which never touches the IDE,
+    # was still opening it. Only the extra IDE-only entries are lost when off;
+    # the live agy catalog and the static fallback are unaffected.
     helper = BROKER_DIR / "extensions" / "antigravity-agent-broker-bridge" / "cdp_list_models.mjs"
     node = config.get("node_path") or shutil.which("node")
     port = int(config.get("antigravity_cdp_port") or 9000)
-    if node and helper.exists() and local_port_open(port):
+    if config.get("antigravity_cdp_list_models", False) and node and helper.exists() and local_port_open(port):
         data = run_json_command([str(node), str(helper), "--port", str(port), "--timeout", "5000"], timeout=8)
         for item in (data or {}).get("models", []):
             if str(item).strip():
@@ -4717,6 +4726,7 @@ def consult_codex(
     model_name: str | None = None,
     effort: str | None = None,
     timeout: int = SYNC_CONSULT_TIMEOUT_SECONDS,
+    outbound_reviewed: bool = False,
 ) -> CodexConsultResult:
     config = load_config()
     codex = discover_codex(config)
@@ -4751,7 +4761,67 @@ def consult_codex(
         command[2:2] = ["-c", f"model_reasoning_effort={effort}"]
     if model_name:
         command[2:2] = ["--model", str(model_name)]
-    code, stdout, stderr = run_process(command, project_info.root_path, sanitize_prompt(prompt), timeout=timeout)
+    # Screen the FULLY ASSEMBLED outbound payload -- this is the single choke point every
+    # Codex dispatch path (direct consult, queued/async worker, route_agent_task) reduces
+    # to, and `prompt` here already carries any concatenated context pack / task contract /
+    # model guard text. See outbound_screen.py for why this exists and the ordering
+    # guarantee that makes substitution unable to launder a block/needs_owner_review verdict.
+    screen = outbound_screen.screen_outbound(prompt, target="codex")
+    if screen["classification"] == "block":
+        outbound_screen.log_outbound_screen(
+            BROKER_DIR, target="codex", classification=screen["classification"],
+            reasons=screen["reasons"], matched_terms=screen["matched_terms"],
+            substitutions=screen["substitutions"], original_payload=prompt,
+            action="blocked", final_payload=None,
+        )
+        return CodexConsultResult(
+            response=(
+                "Outbound screen blocked: this request has to change in substance, not "
+                "wording, before it can be dispatched to Codex.\n"
+                f"Reasons: {'; '.join(screen['reasons'])}\n"
+                f"Matched terms: {', '.join(screen['matched_terms']) or 'none'}"
+            ),
+            requested_model=model_name,
+            actual_model=None,
+            requested_effort=effort,
+            actual_effort=None,
+            model_attested=False,
+        )
+    if screen["classification"] == "needs_owner_review" and not outbound_reviewed:
+        outbound_screen.log_outbound_screen(
+            BROKER_DIR, target="codex", classification=screen["classification"],
+            reasons=screen["reasons"], matched_terms=screen["matched_terms"],
+            substitutions=screen["substitutions"], original_payload=prompt,
+            action="held_needs_owner_review", final_payload=None,
+        )
+        return CodexConsultResult(
+            response=(
+                "Outbound screen requires operator review: explicit operator approval is "
+                "required before this dispatches to Codex. Re-run with outbound_reviewed=true "
+                "once the operator has approved it.\n"
+                f"Reasons: {'; '.join(screen['reasons'])}\n"
+                f"Matched terms: {', '.join(screen['matched_terms']) or 'none'}"
+            ),
+            requested_model=model_name,
+            actual_model=None,
+            requested_effort=effort,
+            actual_effort=None,
+            model_attested=False,
+        )
+    outbound_prompt = screen["final_payload"] if screen["final_payload"] is not None else prompt
+    if screen["classification"] == "needs_owner_review":
+        dispatch_action = "dispatched_with_owner_review"
+    elif screen["classification"] == "reworded":
+        dispatch_action = "dispatched_reworded"
+    else:
+        dispatch_action = "dispatched"
+    outbound_screen.log_outbound_screen(
+        BROKER_DIR, target="codex", classification=screen["classification"],
+        reasons=screen["reasons"], matched_terms=screen["matched_terms"],
+        substitutions=screen["substitutions"], original_payload=prompt,
+        action=dispatch_action, final_payload=outbound_prompt,
+    )
+    code, stdout, stderr = run_process(command, project_info.root_path, sanitize_prompt(outbound_prompt), timeout=timeout)
     parsed = parse_codex_stream_output(stdout)
     actual_model: str | None = None
     actual_effort: str | None = None
@@ -5653,6 +5723,7 @@ def _run_codex_consult(
     topic_arg: str | None,
     task_kind: str,
     token_budget: int | None,
+    outbound_reviewed: bool = False,
 ) -> dict[str, Any]:
     """Run a Codex consult through the unified ledger+worker path instead of a blocking
     subprocess. Queues the request (which spawns the detached worker), then routes by effort:
@@ -5670,6 +5741,7 @@ def _run_codex_consult(
         effort,
         True,
         mode=mode,
+        outbound_reviewed=outbound_reviewed,
     )
     rid = queued.get("id")
     worker = queued.get("async_worker") or {}
@@ -5873,6 +5945,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             codex_outcome = _run_codex_consult(
                 project_info, prompt, mode, resolved_model, effort,
                 timeout_seconds, topic_arg, task_kind, token_budget,
+                outbound_reviewed=truthy(args.get("outbound_reviewed")),
             )
             if codex_outcome.get("pending"):
                 return codex_outcome["payload"]
@@ -6978,6 +7051,7 @@ def queue_codex_request(
     effort: str | None = None,
     autorun: Any = None,
     mode: str | None = None,
+    outbound_reviewed: Any = None,
 ) -> dict[str, Any]:
     init_db()
     if not prompt or not prompt.strip():
@@ -6989,6 +7063,7 @@ def queue_codex_request(
     clean_prompt = prompt.strip()
     model_label = (str(target_model).strip() or None) if target_model else None
     strict_flag = 1 if truthy(strict_model) else 0
+    outbound_reviewed_flag = 1 if truthy(outbound_reviewed) else 0
     normalized_task_kind = normalize_task_kind(task_kind)
     stored_token_budget = int(token_budget or 0) or None
     stored_effort = normalize_effort_token(effort) or (str(effort).strip().lower() if effort else None)
@@ -7006,7 +7081,7 @@ def queue_codex_request(
             """
             SELECT id, project, root_path, topic, status, created_by, created_at, notified_at,
                    completed_at, target_model, strict_model, task_kind, token_budget, effort,
-                   worker_pid, worker_started_at, worker_completed_at, mode
+                   worker_pid, worker_started_at, worker_completed_at, mode, outbound_reviewed
             FROM codex_requests
             WHERE (lower(project) = lower(?) OR root_path = ?)
               AND ((topic IS NULL AND ? IS NULL) OR topic = ?)
@@ -7029,8 +7104,8 @@ def queue_codex_request(
             """
             INSERT INTO codex_requests (
                 id, project, root_path, topic, prompt, status, created_by, created_at,
-                target_model, strict_model, task_kind, token_budget, effort, mode
-            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+                target_model, strict_model, task_kind, token_budget, effort, mode, outbound_reviewed
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request_id,
@@ -7046,6 +7121,7 @@ def queue_codex_request(
                 stored_token_budget,
                 stored_effort,
                 stored_mode,
+                outbound_reviewed_flag,
             ),
         )
         conn.execute(
@@ -7083,6 +7159,7 @@ def queue_codex_request(
         "token_budget": stored_token_budget,
         "effort": stored_effort,
         "mode": stored_mode,
+        "outbound_reviewed": bool(outbound_reviewed_flag),
         "status": "running" if (async_worker or {}).get("started") else "queued",
         "async_worker": async_worker,
     }
@@ -7136,6 +7213,8 @@ CONSULT_FAILURE_PREFIXES = (
     "Gemini CLI exited with code",
     "Gemini API returned HTTP",
     "Gemini API call failed",
+    "Outbound screen blocked:",
+    "Outbound screen requires operator review:",
 )
 
 
@@ -7298,6 +7377,7 @@ def run_codex_request_worker(request_id: str) -> dict[str, Any]:
         target_model,
         resolved_effort,
         CODEX_ASYNC_WORKER_TIMEOUT_SECONDS,
+        outbound_reviewed=bool(data.get("outbound_reviewed")),
     )
     response = codex_result.response
     status, error = _consult_status(response)
@@ -8936,6 +9016,25 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         model_selection = None
         if load_config().get("antigravity_cdp_autoselect", False):
             model_selection = cdp_select_antigravity_model(in_app_model)
+            # cdp_select_antigravity_model is best-effort and never raises: every
+            # failure path returns ok=False, including "target model click did not
+            # verify as selected". Queueing regardless let a failed selection run
+            # whatever the panel happened to have selected -- observed as Flash
+            # quietly becoming Claude Sonnet at ~10x the cost, with nothing logged.
+            # Fail closed and make the caller choose instead of substituting.
+            if not (model_selection.get("ok") and model_selection.get("verified")):
+                catalog = list_agent_models("antigravity", project, topic).get("catalogs", {}).get("antigravity", {})
+                return {
+                    "status": "needs_model_selection",
+                    "reason": "Antigravity could not be confirmed to be running %s: %s"
+                    % (in_app_model, model_selection.get("reason") or "selection not verified"),
+                    "selection": model_selection,
+                    "ask_user": "Select %s in the Antigravity panel, then run this package again." % in_app_model,
+                    "model_family": "antigravity",
+                    "target_agent": "antigravity",
+                    "choices": catalog.get("models") or [],
+                    "action": "Re-run route_agent_task once the requested model is selected.",
+                }
         queued = queue_antigravity_request(
             project,
             prompt,
@@ -8973,6 +9072,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
             task_kind,
             token_budget,
             model_resolution.get("effort"),
+            outbound_reviewed=args.get("outbound_reviewed"),
         )
         queued["route"] = "codex_inbox"
         queued["surface"] = surface
@@ -8996,6 +9096,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
             token_budget,
             model_resolution.get("effort"),
             autorun=False,
+            outbound_reviewed=args.get("outbound_reviewed"),
         )
         project_info = resolve_project(project)
         handoff = write_app_handoff_file("codex", project_info, queued["id"], wrapped_prompt, topic, target_model)
@@ -9202,6 +9303,7 @@ TOOLS = [
                 "native_unavailable_reason": {"type": "string", "description": "Required only when a Codex caller falls back to a Codex MCP session after the named native role failed to start or was unavailable."},
                 "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'gpt-5.5', 'gpt-5.4-mini'."},
                 "effort": {"type": "string", "description": "Single-agent reasoning effort: minimal|low|medium|high|xhigh|max. Omit for max (default); Ultra is an orchestration/delegation mode rather than a deeper single-agent consult tier."},
+                "outbound_reviewed": {"type": "boolean", "description": "Explicit operator opt-in that lets a payload the outbound screen classified needs_owner_review proceed. Never overrides a block verdict."},
             },
             "required": ["prompt"],
         },
@@ -9419,6 +9521,7 @@ TOOLS = [
                 "forbidden_actions": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "Additional prohibitions; global Flash safety rules cannot be removed."},
                 "model_policy": {"type": "string", "description": "Explicit cost policy for Codex or Claude. 'cheap_read' selects Luna/low or Haiku (no effort); 'balanced'/'efficient'/'lower_effort' selects Terra/medium or Sonnet/medium. Omit for frontier/max consultation, audit, review, or debate."},
                 "native_unavailable_reason": {"type": "string", "description": "Required for same-vendor Codex/Claude MCP fallback after native subagent startup/access failure."},
+                "outbound_reviewed": {"type": "boolean", "description": "For a Codex target, explicit operator opt-in that lets a payload the outbound screen classified needs_owner_review proceed. Never overrides a block verdict."},
                 "prompt": {"type": "string"},
             },
             "required": ["prompt"],
@@ -9707,6 +9810,7 @@ TOOLS = [
                 "effort": {"type": "string"},
                 "autorun": {"type": "boolean"},
                 "mode": {"type": "string"},
+                "outbound_reviewed": {"type": "boolean", "description": "Explicit operator opt-in that lets a payload the outbound screen classified needs_owner_review proceed once the async worker actually dispatches it. Never overrides a block verdict."},
                 "native_unavailable_reason": {"type": "string", "minLength": 12},
             },
             "required": ["prompt"],
@@ -11526,6 +11630,7 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             args.get("effort"),
             args.get("autorun"),
             args.get("mode"),
+            outbound_reviewed=args.get("outbound_reviewed"),
         ))
     if name == "get_codex_requests":
         return text_content(get_codex_requests(args.get("project"), int(args.get("limit") or 20)))

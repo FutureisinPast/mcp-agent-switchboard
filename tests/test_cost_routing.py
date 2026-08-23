@@ -10,6 +10,7 @@ home is redirected to a TemporaryDirectory for the duration of each test.
 """
 from __future__ import annotations
 
+import contextlib
 import inspect
 import io
 import json
@@ -477,6 +478,118 @@ class NativeFirstBrokerGuardTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "native subagents first"):
                 broker.route_agent_task(args)
+
+
+class AntigravitySelectionFailClosedTests(unittest.TestCase):
+    """The in-app Antigravity surface drives the IDE model chooser over CDP.
+
+    cdp_select_antigravity_model is best-effort and never raises: it reports
+    ok=False on every failure, including "target model click did not verify as
+    selected". The caller used to queue the prompt regardless, so a failed
+    selection silently ran whatever model the panel had selected -- observed in
+    the field as Gemini Flash quietly becoming Claude Sonnet at ~10x the cost,
+    with nothing logged and nothing attested. Route must fail closed instead.
+    """
+
+    def _route(self, selection):
+        resolved = {
+            "status": "resolved",
+            "target_agent": "antigravity",
+            "target_model": "Gemini 3.7 Flash (High)",
+            "effort": "high",
+            "source": "explicit_request",
+        }
+        args = {
+            "prompt": "bounded read package",
+            "target_agent": "antigravity",
+            "surface": "extension",
+            "target_model": "Gemini 3.7 Flash (High)",
+            "task_kind": "quick_check",
+        }
+        queue = mock.MagicMock(return_value={"queued": True, "request_id": "x"})
+        with mock.patch.object(broker, "_MCP_CLIENT_NAME", "claude-code"),              mock.patch.object(broker, "resolve_model_request", return_value=resolved),              mock.patch.object(broker, "load_config", return_value={"antigravity_cdp_autoselect": True}),              mock.patch.object(broker, "cdp_select_antigravity_model", return_value=selection),              mock.patch.object(broker, "launch_ide_host", return_value={"ok": True}),              mock.patch.object(broker, "queue_antigravity_request", queue):
+            result = broker.route_agent_task(args)
+        return result, queue
+
+    def test_unverified_selection_returns_instead_of_queueing(self):
+        result, queue = self._route(
+            {"ok": False, "reason": "target model click did not verify as selected",
+             "current": "Claude Sonnet 4.6", "model": "Gemini 3.7 Flash (High)"}
+        )
+        self.assertEqual(result.get("status"), "needs_model_selection")
+        self.assertIn("did not verify", str(result.get("reason", "")))
+        queue.assert_not_called()
+
+    def test_ok_without_verified_still_fails_closed(self):
+        result, queue = self._route({"ok": True, "model": "Gemini 3.7 Flash (High)"})
+        self.assertEqual(result.get("status"), "needs_model_selection")
+        queue.assert_not_called()
+
+    def test_verified_selection_still_dispatches(self):
+        result, queue = self._route(
+            {"ok": True, "verified": True, "current": "Gemini 3.7 Flash (High)"}
+        )
+        self.assertNotEqual(result.get("status"), "needs_model_selection")
+        queue.assert_called_once()
+
+
+class AntigravityCdpListModelsOptInTests(unittest.TestCase):
+    """Model discovery must not touch the running IDE unless explicitly asked.
+
+    cdp_list_models.mjs enumerates the Antigravity model picker by CLICKING it
+    open over CDP (Input.dispatchMouseEvent). discover_antigravity_models runs
+    from resolve_model_request, which executes BEFORE the surface branch -- so a
+    surface="cli" dispatch, which never uses the IDE, was still popping the model
+    chooser into the user's face on every cache miss. It is now opt-in.
+    """
+
+    def _discover(self, config):
+        # The production gate is four conditions: config flag AND node AND
+        # helper.exists() AND local_port_open(port). Besides the config flag
+        # and node (mocked below), the gate also depends on two real
+        # environment facts -- a helper .mjs file on disk and a live TCP
+        # check against the IDE debug port. Both are made deterministic here
+        # (a real file under a throwaway BROKER_DIR, and a patched port
+        # check) so this test does not depend on whether the IDE happens to
+        # be running with that port open.
+        with tempfile.TemporaryDirectory() as tmp_home:
+            tmp_broker_dir = Path(tmp_home)
+            helper_dir = tmp_broker_dir / "extensions" / "antigravity-agent-broker-bridge"
+            helper_dir.mkdir(parents=True, exist_ok=True)
+            (helper_dir / "cdp_list_models.mjs").write_text("// test stub\n", encoding="utf-8")
+
+            patches = [
+                mock.patch.object(broker, "_ANTIGRAVITY_MODEL_CACHE", None),
+                mock.patch.object(broker, "_ANTIGRAVITY_MODEL_CACHE_AT", 0.0),
+                mock.patch.object(broker, "load_config", return_value=config),
+                mock.patch.object(broker, "discover_antigravity_cli", return_value=None),
+                mock.patch.object(broker, "local_port_open", return_value=True),
+                mock.patch.object(broker, "BROKER_DIR", tmp_broker_dir),
+            ]
+            with contextlib.ExitStack() as stack:
+                for patcher in patches:
+                    stack.enter_context(patcher)
+                shutil_mod = stack.enter_context(mock.patch.object(broker, "shutil"))
+                shutil_mod.which.return_value = "/usr/bin/node"
+                runner = stack.enter_context(
+                    mock.patch.object(broker, "run_json_command",
+                                      return_value={"models": ["Ghost Model"]})
+                )
+                broker.discover_antigravity_models()
+        cdp_calls = [
+            c for c in runner.call_args_list
+            if any("cdp_list_models" in str(a) for a in (c.args[0] if c.args else []))
+        ]
+        return cdp_calls
+
+    def test_cdp_listing_is_off_by_default(self):
+        self.assertEqual(self._discover({}), [], "IDE must not be contacted by default")
+
+    def test_cdp_listing_stays_off_when_explicitly_false(self):
+        self.assertEqual(self._discover({"antigravity_cdp_list_models": False}), [])
+
+    def test_cdp_listing_runs_when_opted_in(self):
+        self.assertTrue(self._discover({"antigravity_cdp_list_models": True}))
 
 
 if __name__ == "__main__":
