@@ -60,6 +60,22 @@ class RoutingGateTests(unittest.TestCase):
         payload.update(extra)
         return payload
 
+    @staticmethod
+    def claude_post_payload(
+        response,
+        session_id: str = "session-1",
+        tool_name: str = "mcp__agent_switchboard__consult_claude",
+        tool_input: dict | None = None,
+    ):
+        return {
+            "session_id": session_id,
+            "tool_use_id": f"claude-{session_id}",
+            "tool_name": tool_name,
+            "tool_input": tool_input or {"target_model": "fable"},
+            "tool_response": response,
+            "_switchboard_host": "claude",
+        }
+
     def test_no_mutation_allows(self):
         self.assertEqual(routing_gate.stop(self.payload()), {})
 
@@ -636,6 +652,229 @@ class RoutingGateTests(unittest.TestCase):
         self.assertEqual(output["permissionDecision"], "deny")
         self.assertIn("MCP route_agent_task", output["permissionDecisionReason"])
         self.assertIn('surface="cli"', output["permissionDecisionReason"])
+
+    def test_claude_unavailable_recognizes_common_response_wrappers(self):
+        failure = {
+            "status": "error",
+            "response": "You've hit your usage limit; it resets later.",
+        }
+        wrappers = (
+            failure,
+            {"result": failure},
+            {"content": [{"type": "text", "text": json.dumps(failure)}]},
+            [{"type": "text", "text": json.dumps(failure)}],
+            json.dumps(failure),
+        )
+        for index, wrapper in enumerate(wrappers):
+            session_id = f"wrapper-{index}"
+            with self.subTest(wrapper=index):
+                result = routing_gate.post_tool_use(
+                    self.claude_post_payload(wrapper, session_id=session_id)
+                )
+                self.assertEqual(
+                    routing_gate._read_state(session_id).get("claude_unavailable"),
+                    "quota",
+                )
+                self.assertIn("Do not retry Claude", json.dumps(result))
+
+    def test_claude_unavailable_recognizes_only_terminal_availability_classes(self):
+        cases = {
+            "quota": "Claude quota was exhausted for this billing period.",
+            "subscription_disabled": "The Claude subscription is disabled for this account.",
+            "organization_disabled": "This organization has been suspended for Claude access.",
+            "cli_missing": "Claude Code CLI was not found. Install Claude Code.",
+            "family_access_unavailable": "No Claude models are available for this account.",
+            "provider_unavailable": "The Claude provider is unavailable.",
+        }
+        for index, (expected, message) in enumerate(cases.items()):
+            session_id = f"reason-{index}"
+            with self.subTest(reason=expected):
+                routing_gate.post_tool_use(
+                    self.claude_post_payload(
+                        {"status": "error", "error": message},
+                        session_id=session_id,
+                    )
+                )
+                self.assertEqual(
+                    routing_gate._read_state(session_id).get("claude_unavailable"),
+                    expected,
+                )
+
+    def test_claude_unavailable_rejects_false_positives(self):
+        responses = (
+            {"status": "ok", "response": "Quota exceeded was the old issue; answer follows."},
+            {"status": "success", "response": "The usage limit warning is only documentation."},
+            {
+                "isError": True,
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "status": "ok",
+                        "response": "Quota exceeded was the old issue; answer follows.",
+                    }),
+                }],
+            },
+            {"status": "error", "error": "Claude timed out after 30 seconds."},
+            {"status": "error", "error": "Network connection failed while reaching Claude."},
+            {"status": "error", "error": "HTTP 429"},
+            {"status": "error", "error": "HTTP 503"},
+            {"status": "error", "error": "Requested model fable is unavailable; try opus."},
+            {"status": "blocked", "error": "Permission denied for this repository."},
+        )
+        for index, response in enumerate(responses):
+            session_id = f"false-positive-{index}"
+            with self.subTest(response=response):
+                routing_gate.post_tool_use(
+                    self.claude_post_payload(response, session_id=session_id)
+                )
+                self.assertNotIn(
+                    "claude_unavailable", routing_gate._read_state(session_id)
+                )
+
+    def test_claude_unavailable_requires_structured_claude_route_not_prompt_text(self):
+        failure = {"status": "error", "error": "Claude quota exceeded."}
+        alternatives = (
+            ("mcp__agent_switchboard__route_agent_task", {"target_agent": "antigravity", "target_model": "gemini flash", "prompt": "ask Claude"}),
+            ("mcp__agent_switchboard__route_agent_task", {"target_agent": "codex", "target_model": "gpt-5.6-sol", "prompt": "ask Claude"}),
+            ("mcp__other__consult", {"target_agent": "claude", "prompt": "ask Claude"}),
+        )
+        for index, (tool_name, tool_input) in enumerate(alternatives):
+            session_id = f"alternative-{index}"
+            with self.subTest(tool_name=tool_name, tool_input=tool_input):
+                routing_gate.post_tool_use(
+                    self.claude_post_payload(
+                        failure,
+                        session_id=session_id,
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                    )
+                )
+                self.assertNotIn(
+                    "claude_unavailable", routing_gate._read_state(session_id)
+                )
+
+    def test_claude_unavailable_persists_across_turn_reset_but_not_sessions(self):
+        secret = "private provider quota diagnostic"
+        marked = routing_gate.post_tool_use(
+            self.claude_post_payload(
+                {"status": "error", "error": f"Claude quota exceeded: {secret}"}
+            )
+        )
+        self.assertNotIn(secret, json.dumps(marked))
+        state_before_reset = routing_gate._read_state("session-1")
+        self.assertEqual(state_before_reset.get("claude_unavailable"), "quota")
+        self.assertEqual(set(state_before_reset), {"claude_unavailable", "updated_at"})
+
+        prompt_result = routing_gate.user_prompt_submit({"session_id": "session-1"})
+        state = routing_gate._read_state("session-1")
+        self.assertEqual(state.get("claude_unavailable"), "quota")
+        self.assertNotIn("mutated", state)
+        self.assertIn(
+            "degraded, non-authoritative fallback",
+            prompt_result["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertIn("task_kind='research'", prompt_result["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("beyond the first match", prompt_result["hookSpecificOutput"]["additionalContext"])
+
+        same_session = self.pre_payload(
+            "retry-claude", tool_name="mcp__agent_switchboard__consult_claude"
+        )
+        denied = routing_gate.pre_tool_use(same_session)
+        self.assertEqual(
+            denied["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
+        other_session = dict(same_session, session_id="session-2", tool_use_id="new-session")
+        self.assertEqual(routing_gate.pre_tool_use(other_session), {})
+
+    def test_claude_circuit_matches_hyphenated_names_and_structured_model(self):
+        failure = {"status": "failed", "message": "Claude quota exceeded."}
+        routes = (
+            (
+                "mcp__agent-switchboard__consult_claude",
+                {"target_model": "fable"},
+            ),
+            (
+                "mcp__agent_switchboard__route-agent-task",
+                {"target_model": "Claude Opus", "surface": "cli"},
+            ),
+            (
+                "mcp__agent-switchboard__queue_claude_request",
+                {"target_model": "fable"},
+            ),
+        )
+        for index, (tool_name, tool_input) in enumerate(routes):
+            session_id = f"hyphen-{index}"
+            with self.subTest(tool_name=tool_name):
+                routing_gate.post_tool_use(
+                    self.claude_post_payload(
+                        failure,
+                        session_id=session_id,
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                    )
+                )
+                retry = self.pre_payload(
+                    f"retry-{index}", tool_name=tool_name
+                )
+                retry["session_id"] = session_id
+                retry["tool_input"] = tool_input
+                self.assertEqual(
+                    routing_gate.pre_tool_use(retry)["hookSpecificOutput"]["permissionDecision"],
+                    "deny",
+                )
+
+    def test_claude_circuit_hard_denies_in_warn_mode_but_allows_alternatives(self):
+        routing_gate.post_tool_use(
+            self.claude_post_payload(
+                {"status": "error", "error": "Claude quota exceeded."}
+            )
+        )
+        claude_retry = self.pre_payload(
+            "warn-retry", tool_name="mcp__agent_switchboard__route_agent_task"
+        )
+        claude_retry["tool_input"] = {"target_agent": "claude", "target_model": "fable"}
+        with mock.patch.dict(os.environ, {routing_gate.GATE_MODE_ENV: "warn"}):
+            denied = routing_gate.pre_tool_use(claude_retry)
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        for index, (tool_name, tool_input) in enumerate(
+            (
+                ("mcp__agent_switchboard__route_agent_task", {"target_agent": "antigravity", "target_model": "gemini flash"}),
+                ("mcp__agent_switchboard__route_agent_task", {"target_agent": "codex", "target_model": "gpt-5.6-sol"}),
+                ("spawn_agent", {"agent_type": "explorer"}),
+            )
+        ):
+            payload = self.pre_payload(f"allowed-{index}", tool_name=tool_name)
+            payload["tool_input"] = tool_input
+            self.assertEqual(routing_gate.pre_tool_use(payload), {})
+
+    def test_claude_circuit_feedback_merges_with_context_ingress_without_raw_injection(self):
+        secret = "SECRET-RAW-PROVIDER-DIAGNOSTIC-" * 20
+        response = {"status": "error", "error": f"Claude quota exceeded. {secret}"}
+        payload = self.claude_post_payload(response)
+        with mock.patch.object(routing_gate, "CONTEXT_INGRESS_MAX_CHARS", 100):
+            result = routing_gate.post_tool_use(payload)
+
+        output = result["hookSpecificOutput"]
+        self.assertIn("updatedToolOutput", output)
+        self.assertIn("quarantined", output["updatedToolOutput"])
+        self.assertIn("Do not retry Claude", output["additionalContext"])
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertEqual(
+            routing_gate._read_state("session-1").get("claude_unavailable"), "quota"
+        )
+        self.assertNotIn(secret, json.dumps(routing_gate._read_state("session-1")))
+        log_text = routing_gate._session_log_path("session-1").read_text(encoding="utf-8")
+        self.assertNotIn(secret, log_text)
+
+        codex_payload = self.claude_post_payload(response, session_id="codex-session")
+        codex_payload["_switchboard_host"] = "codex"
+        with mock.patch.object(routing_gate, "CONTEXT_INGRESS_MAX_CHARS", 100):
+            codex_result = routing_gate.post_tool_use(codex_payload)
+        self.assertEqual(codex_result.get("decision"), "block")
+        self.assertIn("quarantined", codex_result.get("reason", ""))
+        self.assertIn("Do not retry Claude", codex_result.get("reason", ""))
+        self.assertNotIn(secret, json.dumps(codex_result))
 
     def test_oversized_mcp_is_counted_once_by_pretool_before_posttool(self):
         payload = self.pre_payload("large-mcp", tool_name="mcp__market__research")

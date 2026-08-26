@@ -52,6 +52,7 @@ def _flash_output(package_id: str, **overrides) -> dict:
         "claims": [
             {"statement": "Guard is present.", "basis": "observed", "evidence": ["src/worker.py:12"]}
         ],
+        "research_coverage": [],
         "ambiguities": [],
         "risks": [],
         "next_action": "Brain verifies diff and test output.",

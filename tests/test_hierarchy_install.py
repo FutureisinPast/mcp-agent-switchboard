@@ -307,6 +307,8 @@ class HierarchyInstallTests(unittest.TestCase):
         self.assertIn("only the switchboard backend may start `agy`", hierarchy_lower)
         self.assertIn("target_agent=\"antigravity\"", hierarchy_lower)
         self.assertIn("surface=\"cli\"", hierarchy_lower)
+        self.assertIn("in-app/extension surface is retired", hierarchy_lower)
+        self.assertIn("needs_model_selection", hierarchy_lower)
         self.assertIn("every flash call is exactly one bounded work package", hierarchy_lower)
         self.assertIn("work_package_id", hierarchy_lower)
         self.assertIn("mandatory `--output-format json --json-schema` contract", hierarchy_lower)
@@ -526,6 +528,37 @@ class HierarchyInstallTests(unittest.TestCase):
         ):
             self.assertIn(phrase, body, phrase)
 
+    def test_body_latches_explicit_claude_unavailability_for_the_session(self):
+        body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
+        for phrase in (
+            "Claude availability is session-scoped and fail-closed",
+            "first explicit Claude quota, reachability, entitlement, subscription, access",
+            "mark Claude unavailable for the rest of that session",
+            "Do not retry Fable, Opus, or any other Claude model",
+            "do not automatically retry after a delay",
+            "only when a new main session begins",
+            "degraded non-authoritative second opinion",
+            "retain final judgment",
+        ):
+            self.assertIn(phrase, body, phrase)
+
+    def test_body_forces_depth_contract_on_every_flash_research_request(self):
+        body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
+        for phrase in (
+            'task_kind="research"',
+            "`research_questions` containing 1-3 exact questions",
+            "Repeat this mandatory coverage/depth contract in every request",
+            "full declared scope",
+            "continue beyond the first match",
+            "do not return a surface summary",
+            "test a competing explanation when relevant",
+            "compact primary evidence",
+            "`NOT FOUND` with the searched boundary and remaining gaps",
+            "block rather than infer",
+            "brain independently verifies factual truth",
+        ):
+            self.assertIn(phrase, body, phrase)
+
     def test_body_has_no_pinned_flash_version(self):
         body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
         self.assertNotIn("3.6", body)
@@ -630,6 +663,26 @@ class HierarchyInstallTests(unittest.TestCase):
             bodies[name] = parts[2]
         self.assertEqual(bodies["codex"], bodies["claude"])
         self.assertEqual(bodies["claude"], bodies["gemini"])
+
+    def test_all_three_globals_install_new_contract_and_refresh_idempotently(self):
+        global_files = {
+            "Codex global hierarchy": self.paths.codex_agents_md,
+            "Claude global hierarchy": self.paths.claude_md,
+            "Gemini global hierarchy": self.paths.gemini_md,
+        }
+        first = self.refresh()
+        for result_key in global_files:
+            self.assertEqual(first[result_key], "updated", result_key)
+
+        second = self.refresh()
+        for result_key, path in global_files.items():
+            self.assertEqual(second[result_key], "unchanged", result_key)
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(text.count("agent-switchboard:cost-routing:begin"), 1)
+            self.assertIn("Both Codex and Claude use it first", text)
+            self.assertIn("Do not retry Fable, Opus, or any other Claude model", text)
+            self.assertIn('task_kind="research"', text)
+            self.assertIn("Repeat this mandatory coverage/depth contract in every request", text)
 
 
 if __name__ == "__main__":

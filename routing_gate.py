@@ -122,6 +122,42 @@ SWITCHBOARD_CONTROL_SUFFIXES = {
     "queue_codex_request", "queue_claude_request", "request_status",
     "request_result", "route_agent_task",
 }
+CLAUDE_UNAVAILABLE_REASONS = {
+    "quota",
+    "subscription_disabled",
+    "organization_disabled",
+    "cli_missing",
+    "family_access_unavailable",
+    "provider_unavailable",
+}
+CLAUDE_CONSULT_TOOL_NAMES = {
+    "mcp__agent_switchboard__consult_claude",
+    "mcp__agent_switchboard__consult-claude",
+    "mcp__agent_switchboard__queue_claude_request",
+    "mcp__agent_switchboard__queue-claude-request",
+}
+ROUTE_AGENT_TASK_TOOL_NAMES = {
+    "mcp__agent_switchboard__route_agent_task",
+    "mcp__agent_switchboard__route-agent-task",
+}
+CLAUDE_AGENT_NAMES = {
+    "claude",
+    "claude_code",
+    "claude-code",
+    "claude_cli",
+    "claude-cli",
+    "claude_ext",
+    "claude-ext",
+    "claude_app",
+    "claude-app",
+}
+CLAUDE_MODEL_ALIASES = {"fable", "opus", "sonnet", "haiku"}
+CLAUDE_CIRCUIT_CONTEXT = (
+    "Claude consultation is unavailable for this session. Do not retry Claude in this "
+    "session. If a second opinion is still useful, route one bounded package to the newest "
+    "live Gemini Flash High through Switchboard and treat it as a degraded, non-authoritative "
+    "fallback; the brain retains judgment and independently verifies its evidence."
+)
 ROUTING_OVERRIDE_COMMAND_RE = re.compile(
     r"^\s*(?:&\s*)?(?:"
     r"(?:\"[^\"\r\n]*agent-switchboard(?:\.exe)?\"|\S*agent-switchboard(?:\.exe)?)"
@@ -365,7 +401,16 @@ def reset_turn_state(session_id: str) -> None:
     from a prior turn so they never leak into the new turn's Stop decision."""
     if not session_id:
         return
-    _update_state(session_id, lambda state: state.clear())
+    def update(state: dict) -> None:
+        # Provider availability is session-scoped, not turn-scoped. Preserve only the
+        # validated enum marker while clearing all ordinary turn state. A different host
+        # session has a different state file and therefore starts with a closed circuit.
+        claude_unavailable = state.get("claude_unavailable")
+        state.clear()
+        if claude_unavailable in CLAUDE_UNAVAILABLE_REASONS:
+            state["claude_unavailable"] = claude_unavailable
+
+    _update_state(session_id, update)
 
 
 def mark_mutated(session_id: str) -> dict | None:
@@ -617,6 +662,36 @@ def _is_direct_agy_shell_invocation(tool_name: object, tool_input: object) -> bo
     )
 
 
+def _is_claude_consult_route(tool_name: object, tool_input: object) -> bool:
+    """Identify only structured Switchboard routes that actually target Claude.
+
+    Prompt prose is intentionally ignored. A user may mention Claude while routing a
+    Flash package, and allowing that text to steer a hard circuit breaker would create
+    an easy false positive. An explicit non-Claude target agent also wins over a model
+    field because Antigravity can itself host Claude-branded models.
+    """
+    name = normalize_tool_name(tool_name)
+    if name in CLAUDE_CONSULT_TOOL_NAMES:
+        return True
+    if name not in ROUTE_AGENT_TASK_TOOL_NAMES or not isinstance(tool_input, dict):
+        return False
+    agent = str(tool_input.get("target_agent") or tool_input.get("agent") or "").strip().lower()
+    if agent:
+        return agent in CLAUDE_AGENT_NAMES
+    model = str(tool_input.get("target_model") or tool_input.get("model") or "").strip().lower()
+    if not model:
+        return False
+    normalized_model = re.sub(r"[^a-z0-9]+", " ", model).strip()
+    return "claude" in normalized_model.split() or any(
+        alias in normalized_model.split() for alias in CLAUDE_MODEL_ALIASES
+    )
+
+
+def _claude_unavailable_reason(session_id: str) -> str | None:
+    reason = _read_state(session_id).get("claude_unavailable") if session_id else None
+    return reason if reason in CLAUDE_UNAVAILABLE_REASONS else None
+
+
 def _direct_labour_category(tool_name: object, tool_input: object) -> str | None:
     name = normalize_tool_name(tool_name)
     if not name or name in DELEGATION_TOOL_NAMES:
@@ -678,7 +753,13 @@ def _standing_policy_context(session_id: str) -> str:
         mode = "warn" if gate_mode() == "warn" else "enforce"
         used = 0
         if session_id:
-            used = int(_read_state(session_id).get("direct_labour_since_relief") or 0)
+            session_state = _read_state(session_id)
+            used = int(session_state.get("direct_labour_since_relief") or 0)
+            claude_circuit_open = (
+                session_state.get("claude_unavailable") in CLAUDE_UNAVAILABLE_REASONS
+            )
+        else:
+            claude_circuit_open = False
         remaining = max(0, limit - used)
         version = str(BROKER_VERSION)
         if not re.fullmatch(r"\d+\.\d+\.\d+", version):
@@ -704,8 +785,12 @@ def _standing_policy_context(session_id: str) -> str:
             "bounded package to the Flash workhorse (route_agent_task, target_agent='antigravity', "
             "surface='cli', target_model='gemini flash', effort='high') or to a managed native "
             "subagent is pre-authorized and does not need fresh permission this turn. Flash is the "
-            "default lane for bounded reading, search, extraction, summarising and drafting; use a "
-            "native role when the package needs host-only tools or session state, and say why."
+            "default lane for bounded reading, search, extraction, summarising and drafting/writing; "
+            "use a native role when the package needs host-only tools or session state, and say why. "
+            "For factual investigation, route task_kind='research' with 1-3 exact research_questions; "
+            "every request must demand full-scope coverage beyond the first match, primary evidence, "
+            "a competing-explanation check, and NOT FOUND with searched boundaries instead of inference."
+            + (f" {CLAUDE_CIRCUIT_CONTEXT}" if claude_circuit_open else "")
         )
     except Exception:  # noqa: BLE001
         return ""
@@ -987,6 +1072,28 @@ def pre_tool_use(payload: dict) -> dict:
     host = str(payload.get("_switchboard_host") or "").strip().lower()
     session_id = str(payload.get("session_id") or "").strip()
     normalized_tool = normalize_tool_name(payload.get("tool_name"))
+    claude_unavailable = _claude_unavailable_reason(session_id)
+    if claude_unavailable and _is_claude_consult_route(
+        payload.get("tool_name"), payload.get("tool_input") or {}
+    ):
+        # Availability failures are session-scoped. This is a hard circuit breaker,
+        # deliberately independent of warn/shadow mode, so an unavailable expensive
+        # provider is not retried every turn. Only the enum is surfaced or logged.
+        log_gate_decision(
+            session_id,
+            "PreToolUse",
+            normalized_tool,
+            None,
+            "deny",
+            extra={"reason": "claude_session_unavailable", "kind": claude_unavailable},
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": CLAUDE_CIRCUIT_CONTEXT,
+            }
+        }
     # Host-independent on purpose. This used to require host in {codex, claude}, which
     # meant a hook invoked without its host argument silently stopped enforcing a
     # security boundary. Nothing legitimate needs the SENDER to run agy itself: the
@@ -1090,6 +1197,213 @@ def _is_mcp_tool(tool_name: object) -> bool:
     return str(tool_name or "").strip().lower().startswith("mcp__")
 
 
+def _json_container(value: object) -> object | None:
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text.startswith(("{", "[")):
+        return None
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, (dict, list)) else None
+
+
+def _unwrap_switchboard_response(value: object, depth: int = 0) -> dict | None:
+    """Return a structured result through common MCP response wrappers."""
+    if depth > 5:
+        return None
+    parsed = _json_container(value)
+    if parsed is None:
+        return None
+    if isinstance(parsed, list):
+        for item in parsed:
+            candidate = _unwrap_switchboard_response(item, depth + 1)
+            if candidate is not None:
+                return candidate
+        return None
+    if any(key in parsed for key in ("status", "outcome", "error")):
+        return parsed
+    for key in ("result", "data", "output", "content", "text"):
+        if key in parsed:
+            candidate = _unwrap_switchboard_response(parsed.get(key), depth + 1)
+            if candidate is not None:
+                return candidate
+    if any(key in parsed for key in ("isError", "ok", "success")):
+        return parsed
+    return None
+
+
+def _failure_text(result: dict) -> str:
+    """Extract provider failure fields for classification, with a strict size cap."""
+    pieces: list[str] = []
+
+    def collect(value: object, depth: int = 0) -> None:
+        if depth > 4 or sum(len(item) for item in pieces) >= 32_000:
+            return
+        if isinstance(value, str):
+            pieces.append(value[:8_000])
+        elif isinstance(value, list):
+            for item in value[:20]:
+                collect(item, depth + 1)
+        elif isinstance(value, dict):
+            for key in (
+                "error", "message", "reason", "response", "detail", "details",
+                "stderr", "note", "content", "text",
+            ):
+                if key in value:
+                    collect(value.get(key), depth + 1)
+
+    collect(result)
+    normalized = " ".join(" ".join(pieces).lower().split())
+    return re.sub(r"[_-]+", " ", normalized)[:32_000]
+
+
+def _claude_failure_reason(payload: dict) -> str | None:
+    """Classify explicit, session-terminal Claude availability failures.
+
+    The returned value is a fixed enum. Provider text is examined transiently but is
+    never copied into state, logs, hook feedback, or standing context.
+    """
+    if not _is_claude_consult_route(
+        payload.get("tool_name"), payload.get("tool_input") or {}
+    ):
+        return None
+    result = _unwrap_switchboard_response(payload.get("tool_response"))
+    if not isinstance(result, dict):
+        return None
+    status = str(result.get("status") or result.get("outcome") or "").strip().lower()
+    if status in {"ok", "success", "succeeded", "completed", "queued", "pending"}:
+        return None
+    explicit_failure = (
+        status in {"error", "failed", "failure", "unavailable", "not_available", "disabled"}
+        or result.get("isError") is True
+        or result.get("ok") is False
+        or result.get("success") is False
+        or bool(result.get("error"))
+    )
+    if not explicit_failure:
+        return None
+    text = _failure_text(result)
+    if not text:
+        return None
+
+    if re.search(
+        r"\bclaude(?:\s+code)?\s+cli\s+(?:was\s+|is\s+)?not\s+found\b|"
+        r"\bclaude\s+(?:cli\s+)?executable\s+(?:was\s+|is\s+)?not\s+found\b|"
+        r"\bcannot\s+find\b.{0,40}\bclaude(?:\s+code)?\s+cli\b",
+        text,
+    ):
+        return "cli_missing"
+    if re.search(
+        r"\b(?:quota|usage\s+limit)\b.{0,50}\b(?:exceeded|exhausted|depleted|reached|hit|used\s+up)\b|"
+        r"\b(?:exceeded|exhausted|depleted|reached|hit)\b.{0,35}\b(?:quota|usage\s+limit)\b|"
+        r"\byou(?:'ve|\s+have)\s+hit\s+your\s+(?:usage\s+)?limit\b|"
+        r"\b(?:daily|weekly|monthly)\s+(?:usage\s+)?limit\s+(?:was\s+|is\s+)?(?:reached|exceeded)\b",
+        text,
+    ):
+        return "quota"
+    if re.search(
+        r"\bsubscription\b.{0,50}\b(?:disabled|inactive|suspended|deactivated|cancelled|"
+        r"not\s+active|not\s+enabled|required)\b|"
+        r"\b(?:disabled|inactive|suspended|deactivated|cancelled)\b.{0,35}\bsubscription\b",
+        text,
+    ):
+        return "subscription_disabled"
+    if re.search(
+        r"\b(?:organization|organisation|org)\b.{0,50}\b(?:disabled|suspended|deactivated|"
+        r"not\s+active|not\s+enabled)\b|"
+        r"\b(?:disabled|suspended|deactivated)\b.{0,35}\b(?:organization|organisation|org)\b",
+        text,
+    ):
+        return "organization_disabled"
+    if re.search(
+        r"\b(?:claude|provider|service)\b.{0,50}\b(?:unavailable|not\s+available|unreachable)\b|"
+        r"\b(?:unavailable|not\s+available|unreachable)\b.{0,50}\b(?:claude|provider|service)\b",
+        text,
+    ):
+        return "provider_unavailable"
+
+    explicit_family_access = bool(
+        re.search(
+            r"\bno\s+(?:available\s+)?claude\s+models?\b|"
+            r"\ball\s+claude\s+models?\b.{0,40}\b(?:unavailable|not\s+available|inaccessible)\b|"
+            r"\b(?:account|organization|organisation|org|workspace|user|team|plan)\b.{0,80}"
+            r"\b(?:not\s+entitled|does\s+not\s+have|has\s+no|lacks)\b.{0,80}\b(?:claude|models?)\b|"
+            r"\b(?:not\s+entitled|no\s+access|access\s+(?:is\s+)?(?:denied|disabled))\b"
+            r".{0,80}\bclaude\b|"
+            r"\bclaude\b.{0,80}\b(?:not\s+available|unavailable|disabled|not\s+enabled)\b"
+            r".{0,50}\b(?:account|organization|organisation|org|workspace|subscription|plan)\b",
+            text,
+        )
+    )
+    attempted = result.get("attempted_models")
+    attempted_family = isinstance(attempted, list) and len(
+        {str(item).strip().lower() for item in attempted if str(item).strip()}
+    ) >= 2
+    entitlement_failure = bool(
+        re.search(
+            r"\b(?:not\s+entitled|no\s+access|access\s+(?:denied|disabled)|"
+            r"not\s+available\s+for\s+(?:your|this)\s+(?:account|organization|organisation|org|plan|subscription))\b",
+            text,
+        )
+    )
+    if explicit_family_access or (attempted_family and entitlement_failure):
+        return "family_access_unavailable"
+    return None
+
+
+def _record_claude_unavailable(payload: dict) -> str | None:
+    session_id = str(payload.get("session_id") or "").strip()
+    reason = _claude_failure_reason(payload)
+    if not session_id or reason not in CLAUDE_UNAVAILABLE_REASONS:
+        return None
+
+    def update(state: dict) -> None:
+        state["claude_unavailable"] = reason
+
+    if _update_state(session_id, update) is None:
+        return None
+    log_gate_decision(
+        session_id,
+        "PostToolUse",
+        normalize_tool_name(payload.get("tool_name")),
+        None,
+        "claude-circuit-open",
+        extra={"kind": reason},
+    )
+    return reason
+
+
+def _merge_post_tool_context(result: dict | None, context: str | None) -> dict:
+    """Add sanitized guidance without replacing ingress/credit feedback."""
+    if not context:
+        return result or {}
+    if result is None:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": context,
+            }
+        }
+    output = result.get("hookSpecificOutput")
+    if isinstance(output, dict):
+        existing = str(output.get("additionalContext") or "").strip()
+        output["additionalContext"] = f"{existing} {context}".strip()
+    elif result.get("decision") == "block":
+        existing = str(result.get("reason") or "").strip()
+        result["reason"] = f"{existing} {context}".strip()
+    else:
+        result["hookSpecificOutput"] = {
+            "hookEventName": "PostToolUse",
+            "additionalContext": context,
+        }
+    return result
+
+
 def _store_context_evidence(payload: dict, serialized_response: str) -> Path | None:
     """Persist oversized evidence outside model context with its query/provenance.
 
@@ -1170,6 +1484,8 @@ def post_tool_use(payload: dict) -> dict:
     mutated = _is_mutating(payload.get("tool_name"), tool_input)
     if session_id and mutated and not _payload_is_cheap_native_call(payload):
         mark_mutated(session_id)
+    claude_failure = _record_claude_unavailable(payload)
+    claude_context = CLAUDE_CIRCUIT_CONTEXT if claude_failure else None
     ingress_feedback = _context_ingress_feedback(payload)
     log_gate_decision(
         session_id,
@@ -1180,10 +1496,10 @@ def post_tool_use(payload: dict) -> dict:
         extra={"mutated": bool(mutated)},
     )
     if ingress_feedback is not None:
-        return ingress_feedback
+        return _merge_post_tool_context(ingress_feedback, claude_context)
     credit = _credit_switchboard_dispatch(session_id, normalized_tool, payload)
     if credit is not None:
-        return credit
+        return _merge_post_tool_context(credit, claude_context)
     if session_id:
         notify = {"value": False}
 
@@ -1203,7 +1519,7 @@ def post_tool_use(payload: dict) -> dict:
 
         state = _update_state(session_id, update)
         if state and notify["value"]:
-            return {
+            checkpoint = {
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",
                     "additionalContext": (
@@ -1215,7 +1531,8 @@ def post_tool_use(payload: dict) -> dict:
                     ),
                 }
             }
-    return {}
+            return _merge_post_tool_context(checkpoint, claude_context)
+    return _merge_post_tool_context(None, claude_context)
 
 
 CREDITABLE_DISPATCH_TOOL = "mcp__agent_switchboard__route_agent_task"

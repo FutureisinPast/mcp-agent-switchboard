@@ -220,6 +220,7 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
             "claims": [
                 {"statement": "Guard is present.", "basis": "observed", "evidence": ["src/worker.py:12"]}
             ],
+            "research_coverage": [],
             "ambiguities": [],
             "risks": [],
             "next_action": "Brain verifies diff and test output.",
@@ -250,6 +251,217 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
                 "implementation",
                 "Implement everything.",
             )
+
+    @staticmethod
+    def _research_package(*questions: str) -> dict:
+        return broker.prepare_flash_work_package(
+            {"work_package_id": "WP-RESEARCH", "research_questions": list(questions)},
+            "research",
+            "Research only the declared questions.",
+        )
+
+    @staticmethod
+    def _research_evidence(source_kind: str = "code", *, primary: bool = True) -> dict:
+        if source_kind == "web":
+            return {
+                "source_kind": "web",
+                "location": "https://example.com/primary",
+                "locator": "Models section",
+                "observation": "The primary page states the relevant behavior.",
+                "primary": primary,
+            }
+        if source_kind == "document":
+            return {
+                "source_kind": "document",
+                "location": "docs/design.md",
+                "locator": "section 2.1",
+                "observation": "The design section documents the constraint.",
+                "primary": primary,
+            }
+        if source_kind == "command":
+            return {
+                "source_kind": "command",
+                "location": "pytest tests/test_worker.py",
+                "locator": "exit 0",
+                "observation": "The focused check passed.",
+                "primary": primary,
+            }
+        return {
+            "source_kind": "code",
+            "location": "src/worker.py",
+            "locator": "L12-L18",
+            "observation": "The implementation contains the relevant guard.",
+            "primary": primary,
+        }
+
+    def _research_outer(self, package: dict, coverage: list, **overrides) -> dict:
+        return self._flash_output(
+            package["package_id"],
+            acceptance_criteria=[],
+            files_changed=[],
+            checks=[],
+            research_coverage=coverage,
+            **overrides,
+        )
+
+    def test_research_requires_one_to_three_unique_bounded_questions(self):
+        with self.assertRaisesRegex(ValueError, "1-3 research_questions"):
+            self._research_package()
+        with self.assertRaisesRegex(ValueError, "1-3 research_questions"):
+            self._research_package("q1", "q2", "q3", "q4")
+        with self.assertRaisesRegex(ValueError, "unique"):
+            self._research_package("What changed?", " what changed? ")
+        with self.assertRaisesRegex(ValueError, "nonempty"):
+            self._research_package(" ")
+        with self.assertRaisesRegex(ValueError, "at most 500"):
+            self._research_package("x" * 501)
+
+    def test_search_alias_and_nonresearch_backward_compatibility(self):
+        self.assertEqual(broker.normalize_task_kind("search"), "research")
+        package = broker.prepare_flash_work_package(
+            {"research_questions": ["ignored for compatibility"]}, "quick_check", "Check one fact."
+        )
+        self.assertEqual(package["research_questions"], [])
+        schema = broker.flash_workhorse_output_schema(package)
+        coverage = schema["properties"]["research_coverage"]
+        self.assertEqual((coverage["minItems"], coverage["maxItems"]), (0, 0))
+        _, errors = broker.validate_flash_workhorse_result(
+            self._flash_output(package["package_id"]), package
+        )
+        self.assertEqual(errors, [])
+
+    def test_research_schema_prompt_and_tool_inputs_are_explicit(self):
+        questions = ["What does the code do?", "What evidence contradicts it?"]
+        package = self._research_package(*questions)
+        schema = broker.flash_workhorse_output_schema(package)
+        self.assertIn("research_coverage", schema["required"])
+        coverage = schema["properties"]["research_coverage"]
+        self.assertEqual((coverage["minItems"], coverage["maxItems"]), (2, 2))
+        prompt = broker.wrap_flash_workhorse_prompt("Investigate.", package)
+        self.assertIn("Never stop at the first plausible result", prompt)
+        self.assertIn("surface summary", prompt)
+        self.assertIn("competing explanation", prompt)
+        self.assertIn("Never invent line numbers for web sources", prompt)
+        self.assertIn("8,000 characters", prompt)
+        self.assertLess(prompt.index(questions[0]), prompt.index(questions[1]))
+        for name in ("consult_antigravity", "route_agent_task"):
+            tool = next(item for item in broker.TOOLS if item["name"] == name)
+            properties = tool["inputSchema"]["properties"]
+            self.assertIn("research", properties["task_kind"]["enum"])
+            self.assertIn("search", properties["task_kind"]["enum"])
+            self.assertEqual(properties["research_questions"]["maxItems"], 3)
+        rules = " ".join(broker.COST_AWARE_ROUTING_RULES)
+        self.assertIn("do not retry Fable or Opus in that session", rules)
+        self.assertIn("new main session", rules)
+        self.assertIn("Every factual investigation sent to Flash MUST use task_kind=research", rules)
+        self.assertIn("beyond the first match", rules)
+        self.assertIn("NOT FOUND with searched boundaries", rules)
+        self.assertIn("in-app/extension surface is retired", rules)
+        self.assertIn("needs_model_selection", rules)
+
+    def test_research_coverage_omission_reordering_and_substitution_reject(self):
+        package = self._research_package("Q1", "Q2")
+        missing = self._research_outer(package, [])
+        _, missing_errors = broker.validate_flash_workhorse_result(missing, package)
+        self.assertTrue(any("exactly match the dispatched order" in error for error in missing_errors))
+        base = {
+            "status": "blocked",
+            "answer": "",
+            "confidence": "low",
+            "evidence": [],
+            "competing_explanations_checked": [],
+            "gaps": ["Evidence unavailable."],
+        }
+        wrong = self._research_outer(
+            package,
+            [{"question": "Q2", **base}, {"question": "substitute", **base}],
+            status="blocked",
+        )
+        _, wrong_errors = broker.validate_flash_workhorse_result(wrong, package)
+        self.assertTrue(any("exactly match the dispatched order" in error for error in wrong_errors))
+
+    def test_completed_research_rejects_shallow_answer_variants(self):
+        package = self._research_package("Q1")
+        strong = {
+            "question": "Q1",
+            "status": "answered",
+            "answer": "The guard controls the behavior.",
+            "confidence": "high",
+            "evidence": [self._research_evidence(), self._research_evidence("command", primary=False)],
+            "competing_explanations_checked": ["Configuration was checked and ruled out."],
+            "gaps": [],
+        }
+        variants = {
+            "blocked": {**strong, "status": "blocked"},
+            "empty answer": {**strong, "answer": ""},
+            "low confidence": {**strong, "confidence": "low"},
+            "one probe": {**strong, "evidence": strong["evidence"][:1]},
+            "no competitor": {**strong, "competing_explanations_checked": []},
+            "no primary": {
+                **strong,
+                "evidence": [
+                    {**strong["evidence"][0], "primary": False},
+                    {**strong["evidence"][1], "primary": False},
+                ],
+            },
+        }
+        for name, coverage in variants.items():
+            with self.subTest(name=name):
+                _, errors = broker.validate_flash_workhorse_result(
+                    self._research_outer(package, [coverage]), package
+                )
+                self.assertTrue(errors)
+
+    def test_research_rejects_bad_web_and_code_document_citations(self):
+        package = self._research_package("Q1")
+        evidence = [
+            {**self._research_evidence("web"), "location": "example.com/no-scheme"},
+            {**self._research_evidence(), "locator": "somewhere nearby", "primary": False},
+            {**self._research_evidence("document"), "locator": "vague", "primary": False},
+        ]
+        coverage = [{
+            "question": "Q1", "status": "answered", "answer": "Answer", "confidence": "high",
+            "evidence": evidence, "competing_explanations_checked": ["Alternative checked."], "gaps": [],
+        }]
+        _, errors = broker.validate_flash_workhorse_result(
+            self._research_outer(package, coverage), package
+        )
+        joined = " | ".join(errors)
+        self.assertIn("web location must be an http(s) URL", joined)
+        self.assertIn("code locator is invalid", joined)
+        self.assertIn("document locator is invalid", joined)
+
+    def test_valid_code_web_and_well_supported_not_found_research(self):
+        questions = ("Code question", "Web question", "Missing question")
+        package = self._research_package(*questions)
+        coverage = [
+            {
+                "question": questions[0], "status": "answered", "answer": "The guard is active.",
+                "confidence": "high",
+                "evidence": [self._research_evidence(), self._research_evidence("command", primary=False)],
+                "competing_explanations_checked": ["Configuration override ruled out."], "gaps": [],
+            },
+            {
+                "question": questions[1], "status": "answered", "answer": "The primary page confirms it.",
+                "confidence": "medium",
+                "evidence": [self._research_evidence("web"), self._research_evidence("document", primary=False)],
+                "competing_explanations_checked": ["Cached documentation ruled out."], "gaps": [],
+            },
+            {
+                "question": questions[2], "status": "not_found", "answer": "",
+                "confidence": "low",
+                "evidence": [
+                    self._research_evidence("web", primary=False),
+                    {**self._research_evidence("web", primary=False), "location": "https://example.org/search"},
+                ],
+                "competing_explanations_checked": [],
+                "gaps": ["Searched both official indexes; no matching record."],
+            },
+        ]
+        _, errors = broker.validate_flash_workhorse_result(
+            self._research_outer(package, coverage), package
+        )
+        self.assertEqual(errors, [])
 
     # NOTE: staging/write-back coverage (agy schema+staging dispatch, plus the
     # three-way write-back apply/conflict/deletion tests that used to live

@@ -448,6 +448,7 @@ IDE_HOSTS = {"antigravity", "vscode", "vs_code", "code"}
 
 TASK_BUDGETS = {
     "quick_check": 1200,
+    "research": 3500,
     "implementation_plan": 5000,
     "co_audit": 3500,
     "debate": 4500,
@@ -464,6 +465,12 @@ TASK_CONTRACTS = {
         "Return the answer in at most 8 bullets.",
         "Do not read broad files or restate the context pack unless needed.",
         "Flag uncertainty instead of expanding scope.",
+    ],
+    "research": [
+        "Answer every declared research question across its full bounded scope.",
+        "Do not stop at the first plausible answer or return a surface summary; check competing explanations and primary evidence.",
+        "For anything not found, state the searched boundary and remaining gaps instead of inferring an answer.",
+        "Keep the structured report compact and within 8,000 characters where possible.",
     ],
     "implementation_plan": [
         "Produce an exact implementation plan, not code edits.",
@@ -562,12 +569,15 @@ COST_AWARE_ROUTING_RULES = [
     "The model selected for the main session is the brain; never rewrite that user choice. It owns requirements, architecture, planning, hard diagnosis, risk decisions, and final signoff.",
     "For non-trivial planning or a hard issue, obtain one opposite-vendor maximum-effort consultation: Codex brain -> moving Claude Fable alias (Opus only when Fable is explicitly unavailable); Claude brain -> the live Codex frontier at its highest single-agent effort.",
     "Capability tier outranks model version. Gemini Flash High is a useful, non-authoritative workhorse-level adviser; a higher version does not promote it above Sol/Fable or make its advice automatically authoritative. When Claude's Fable -> Opus chain is unavailable because of quota, reachability, entitlement, or another availability failure, a Codex brain should request a second opinion from the newest live Flash High, label it degraded advisory fallback, and retain final judgment.",
+    "After the first explicit Claude quota, subscription, access, provider-unavailable, or whole-family availability failure in the current main session, do not retry Fable or Opus in that session. Use the newest Flash High only as a degraded non-authoritative consultation fallback while retaining it as the default labour workhorse; reset this no-retry state only in a new main session.",
     "The owner has issued a STANDING REQUEST to delegate eligible labour: dispatching a bounded package to the Flash workhorse or to a managed native subagent is pre-authorized work, not an optional extra that needs fresh permission each turn.",
-    "DEFAULT WORKHORSE = the newest live Antigravity Gemini Flash High through Agent Switchboard. For a bounded package -- reading, search, extraction, summaries, drafting, independent parallel read-only packages, and (once containment is enabled) light implementation and tests from an approved plan -- the default lane is route_agent_task with target_agent=antigravity, surface=cli, target_model=gemini flash, effort=high, a work_package_id, the correct task_kind, and mode=plan or mode=accept-edits with the implementation envelope. It is roughly a tenth the cost of the same-vendor native workhorse and several times faster.",
+    "DEFAULT WORKHORSE = the newest live Antigravity Gemini Flash High through Agent Switchboard. For a bounded package -- reading, search, extraction, summaries, drafting/writing, independent parallel read-only packages, and (once containment is enabled) light implementation and tests from an approved plan when isolated and low-risk -- the default lane is route_agent_task with target_agent=antigravity, surface=cli, target_model=gemini flash, effort=high, a work_package_id, the correct task_kind, and mode=plan or mode=accept-edits with the implementation envelope. It is roughly a tenth the cost of the same-vendor native workhorse and several times faster.",
     "Flash is the default with OBJECTIVE EXCEPTIONS, not an unconditional rule. A Flash-eligible package must end in exactly one of: a Switchboard dispatch, the small direct allowance for non-mutating micro-work, or a native/brain lane carrying a stated flash_skip reason with evidence -- host-tools:<tool-id> (the package needs host-only MCP tools, skills, or an IDE session), unshared-state:<evidence-id> (it depends on session state Flash cannot see), flash-failed:<broker-receipt>, flash-unavailable:<health-id>, or atomic-oversize:<plan-id> (an indivisible package over five files or past the input preflight). 'It felt easier to do myself' is not one of them.",
     "Native cheap roles (Codex explorer/worker; Claude Explore/economy-worker) remain the correct lane for those stated exceptions and for anything needing the host's own tools; they are the fallback, not the first choice. Flash is an external worker, never a native child agent, and never a frontier consultant: a higher Gemini version number does not promote it above Sol/Fable.",
     "Cross-vendor routing must enter through Agent Switchboard's MCP tools whenever Switchboard is registered. For Flash labour, the sender brain MUST call MCP route_agent_task; 'through CLI' means surface=cli on that MCP call. The brain MUST NOT shell out to agy or call consult_antigravity directly. Only the Switchboard backend may start agy; sender-side direct agy is prohibited.",
+    "The Antigravity in-app/extension surface is retired for Flash labour: always use surface=cli, never extension or app. If the named model cannot be selected and runtime-attested, return needs_model_selection; never continue on the IDE's current or a neighbouring model.",
     "Every Flash call is exactly one bounded work package. Never hand Flash an entire autonomous plan or let it select/continue to the next package. Implementation calls must name a package id, at most five allowed files, explicit acceptance criteria, and forbidden actions; Switchboard rejects an incomplete envelope.",
+    "Every factual investigation sent to Flash MUST use task_kind=research with 1-3 exact research_questions. Repeat the depth contract in every request: cover the full bounded scope beyond the first match, reject surface summaries, check a competing explanation, attach compact primary evidence to every answer, and return NOT FOUND with searched boundaries and gaps instead of inferring. The brain independently verifies factual truth.",
     "A Switchboard-launched Gemini Flash session is the non-authoritative worker for exactly its assigned envelope, never the brain or router. It must not dispatch agents, reinterpret the whole plan, or continue to another package.",
     "Switchboard's internal agy backend must use --output-format json with --json-schema. Missing/malformed fields, scope violations, contradictory completion, unsupported design-intent claims, ambiguity, or failed checks are failures to escalate -- never prose to accept. The sender brain independently inspects cited lines, the actual diff, and check output before dispatching another package.",
     "Flash never receives production SSH, live credentials, destructive operations, migrations, or danger-full-access. It may prepare bounded local changes and checks; the brain owns live deployment and approval.",
@@ -2141,6 +2151,7 @@ def normalize_task_kind(value: Any) -> str:
         "bughunt": "bug_hunt",
         "check": "sanity_check",
         "sanity": "sanity_check",
+        "search": "research",
     }
     kind = aliases.get(raw, raw)
     return kind if kind in TASK_CONTRACTS else "consult"
@@ -3792,8 +3803,34 @@ def _bounded_string_list(value: Any, field: str, maximum: int) -> list[str]:
     return items
 
 
+def _bounded_research_questions(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("Flash research requires research_questions as an array of 1-3 strings")
+    if not 1 <= len(value) <= 3:
+        raise ValueError("Flash research requires 1-3 research_questions")
+    questions: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("every research_questions item must be a nonempty string")
+        question = raw.strip()
+        if len(question) > 500:
+            raise ValueError("every research_questions item must be at most 500 characters")
+        key = question.casefold()
+        if key in seen:
+            raise ValueError("research_questions must be unique")
+        seen.add(key)
+        questions.append(question)
+    return questions
+
+
 def prepare_flash_work_package(args: dict[str, Any], task_kind: str, prompt: str) -> dict[str, Any]:
     kind = normalize_task_kind(task_kind)
+    research_questions = (
+        _bounded_research_questions(args.get("research_questions"))
+        if kind == "research"
+        else []
+    )
     package_id = str(args.get("work_package_id") or "").strip()
     if not package_id:
         if kind == "implementation":
@@ -3850,18 +3887,21 @@ def prepare_flash_work_package(args: dict[str, Any], task_kind: str, prompt: str
         "workspace_root": workspace_root,
         "acceptance_criteria": acceptance_criteria,
         "forbidden_actions": forbidden_actions,
+        "research_questions": research_questions,
     }
 
 
 def flash_workhorse_output_schema(package: dict[str, Any]) -> dict[str, Any]:
     criteria_min = 1 if package.get("task_kind") == "implementation" else 0
+    research_questions = package.get("research_questions") or []
+    research_count = len(research_questions)
     return {
         "type": "object",
         "additionalProperties": False,
         "required": [
             "package_id", "status", "summary", "acceptance_criteria", "files_changed",
             "checks", "evidence", "claims", "ambiguities", "risks", "next_action",
-            "brain_verification_required",
+            "brain_verification_required", "research_coverage",
         ],
         "properties": {
             "package_id": {"type": "string", "enum": [package["package_id"]]},
@@ -3931,6 +3971,50 @@ def flash_workhorse_output_schema(package: dict[str, Any]) -> dict[str, Any]:
                     },
                 },
             },
+            "research_coverage": {
+                "type": "array",
+                "minItems": research_count,
+                "maxItems": research_count,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "question", "status", "answer", "confidence", "evidence",
+                        "competing_explanations_checked", "gaps",
+                    ],
+                    "properties": {
+                        "question": {"type": "string", "enum": research_questions},
+                        "status": {"type": "string", "enum": ["answered", "not_found", "blocked"]},
+                        "answer": {"type": "string", "maxLength": 2000},
+                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "evidence": {
+                            "type": "array",
+                            "maxItems": 3,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": [
+                                    "source_kind", "location", "locator", "observation", "primary",
+                                ],
+                                "properties": {
+                                    "source_kind": {
+                                        "type": "string",
+                                        "enum": ["code", "web", "document", "command", "provided_context"],
+                                    },
+                                    "location": {"type": "string", "minLength": 1},
+                                    "locator": {"type": "string", "minLength": 1},
+                                    "observation": {"type": "string", "minLength": 1},
+                                    "primary": {"type": "boolean"},
+                                },
+                            },
+                        },
+                        "competing_explanations_checked": {
+                            "type": "array", "maxItems": 2, "items": {"type": "string"},
+                        },
+                        "gaps": {"type": "array", "maxItems": 2, "items": {"type": "string"}},
+                    },
+                },
+            },
             "ambiguities": {"type": "array", "items": {"type": "string"}},
             "risks": {"type": "array", "items": {"type": "string"}},
             "next_action": {"type": "string"},
@@ -3960,6 +4044,10 @@ def wrap_flash_workhorse_prompt(prompt: str, package: dict[str, Any]) -> str:
     context = "\n".join(f"- {item}" for item in (package.get("read_context") or [])) or "- None declared; everything you need is already in this prompt."
     criteria = "\n".join(f"- {item}" for item in package["acceptance_criteria"]) or "- Return the requested bounded evidence only."
     forbidden = "\n".join(f"- {item}" for item in package["forbidden_actions"])
+    questions = "\n".join(
+        f"{index}. {question}"
+        for index, question in enumerate(package.get("research_questions") or [], 1)
+    ) or "- None; research_coverage must be an empty array."
     return f"""<flash_workhorse_contract>
 You are a fast, non-authoritative workhorse. Execute exactly one bounded package and stop.
 Package ID: {package['package_id']}
@@ -3977,7 +4065,11 @@ Acceptance criteria:
 Forbidden actions:
 {forbidden}
 
+Research questions (preserve this exact order in research_coverage):
+{questions}
+
 Stop with status=blocked at the first ambiguity, plan mismatch, required out-of-scope change, or failed fix that needs diagnosis. Never continue to the next plan step/package. A failed check means status=failed unless the approved package explicitly expects that failure.
+Never stop at the first plausible result or provide only a surface summary. Cover the full declared scope and check a competing explanation when relevant. For research, answer every declared question with compact primary citations; use NOT FOUND only after reporting the searched boundary and gaps. Never invent line numbers for web sources. Block rather than infer when required evidence is unavailable. Keep the full report within 8,000 characters where possible.
 Separate observed facts from inference and assumptions. Any claim that behavior is intentional/by design must be basis=observed and cite an explicit spec, test, or code comment as file:line evidence; otherwise label it assumption and keep the investigation open.
 Your schema-enforced report is evidence for the sender brain, never approval. The brain will independently inspect cited lines, the actual diff, and check output before accepting this package or dispatching another.
 </flash_workhorse_contract>
@@ -4033,6 +4125,29 @@ def _scope_roots(staged: Any, package: dict[str, Any]) -> list[Path]:
         except (OSError, ValueError, RuntimeError):
             continue
     return roots
+
+
+def _valid_research_locator(source_kind: str, location: str, locator: str) -> bool:
+    if source_kind == "web":
+        parsed = urllib.parse.urlparse(location)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    if source_kind == "code":
+        return bool(
+            re.fullmatch(
+                r"(?:L|lines?\s*)?\d+(?:\s*[-:]\s*(?:L|lines?\s*)?\d+)?",
+                locator,
+                re.I,
+            )
+        )
+    if source_kind == "document":
+        return bool(
+            re.fullmatch(
+                r"(?:pages?|p\.?|sections?|sec\.?|chapters?|ch\.?|lines?)\s+[^\s]+(?:\s*[-:]\s*[^\s]+)?|#[\w.-]+",
+                locator,
+                re.I,
+            )
+        )
+    return True
 
 
 def validate_flash_workhorse_result(
@@ -4106,11 +4221,104 @@ def validate_flash_workhorse_result(
 
     list_fields = (
         "acceptance_criteria", "files_changed", "checks", "evidence", "claims",
-        "ambiguities", "risks",
+        "ambiguities", "risks", "research_coverage",
     )
     for field in list_fields:
         if field in structured and not isinstance(structured[field], list):
             errors.append(f"{field} must be an array")
+
+    research_questions = package.get("research_questions") or []
+    coverage = structured.get("research_coverage")
+    coverage_items = coverage if isinstance(coverage, list) else []
+    reported_questions = [
+        str(item.get("question") or "").strip() if isinstance(item, dict) else ""
+        for item in coverage_items
+    ]
+    if reported_questions != research_questions:
+        errors.append("research_coverage questions must exactly match the dispatched order")
+    if not research_questions and coverage_items:
+        errors.append("non-research packages require empty research_coverage")
+
+    allowed_source_kinds = {"code", "web", "document", "command", "provided_context"}
+    for index, item in enumerate(coverage_items, 1):
+        label = f"research_coverage[{index}]"
+        if not isinstance(item, dict):
+            errors.append(f"{label} must be an object")
+            continue
+        status = item.get("status")
+        answer = str(item.get("answer") or "").strip()
+        confidence = item.get("confidence")
+        item_evidence = item.get("evidence")
+        competitors = item.get("competing_explanations_checked")
+        gaps = item.get("gaps")
+        if status not in {"answered", "not_found", "blocked"}:
+            errors.append(f"{label} status is invalid")
+        if confidence not in {"high", "medium", "low"}:
+            errors.append(f"{label} confidence is invalid")
+        if not isinstance(item_evidence, list):
+            errors.append(f"{label} evidence must be an array")
+            item_evidence = []
+        if not isinstance(competitors, list):
+            errors.append(f"{label} competing_explanations_checked must be an array")
+            competitors = []
+        if not isinstance(gaps, list):
+            errors.append(f"{label} gaps must be an array")
+            gaps = []
+        if len(item_evidence) > 3:
+            errors.append(f"{label} evidence allows at most 3 probes")
+        if len(competitors) > 2:
+            errors.append(f"{label} competing_explanations_checked allows at most 2 items")
+        if len(gaps) > 2:
+            errors.append(f"{label} gaps allows at most 2 items")
+
+        evidence_keys: set[tuple[str, str, str, str]] = set()
+        has_primary = False
+        for evidence_index, evidence_item in enumerate(item_evidence, 1):
+            evidence_label = f"{label}.evidence[{evidence_index}]"
+            if not isinstance(evidence_item, dict):
+                errors.append(f"{evidence_label} must be an object")
+                continue
+            source_kind = str(evidence_item.get("source_kind") or "").strip()
+            location = str(evidence_item.get("location") or "").strip()
+            locator = str(evidence_item.get("locator") or "").strip()
+            observation = str(evidence_item.get("observation") or "").strip()
+            primary = evidence_item.get("primary")
+            if source_kind not in allowed_source_kinds:
+                errors.append(f"{evidence_label} source_kind is invalid")
+            if not location or not locator or not observation:
+                errors.append(f"{evidence_label} requires location, locator, and observation")
+            if not isinstance(primary, bool):
+                errors.append(f"{evidence_label} primary must be boolean")
+            elif primary:
+                has_primary = True
+            if source_kind in allowed_source_kinds and not _valid_research_locator(
+                source_kind, location, locator
+            ):
+                if source_kind == "web":
+                    errors.append(f"{evidence_label} web location must be an http(s) URL")
+                else:
+                    errors.append(f"{evidence_label} {source_kind} locator is invalid")
+            evidence_keys.add((source_kind, location, locator, observation))
+
+        if worker_status == "completed" and research_questions:
+            if status == "blocked":
+                errors.append(f"{label} cannot be blocked when worker status is completed")
+            elif status == "answered":
+                if not answer:
+                    errors.append(f"{label} answered status requires a compact answer")
+                if confidence == "low":
+                    errors.append(f"{label} answered status cannot use low confidence")
+                if len(evidence_keys) < 2:
+                    errors.append(f"{label} answered status requires at least 2 distinct evidence probes")
+                if not any(str(value or "").strip() for value in competitors):
+                    errors.append(f"{label} answered status requires a competing explanation check")
+                if not has_primary:
+                    errors.append(f"{label} answered status requires a primary citation")
+            elif status == "not_found":
+                if len(evidence_keys) < 2:
+                    errors.append(f"{label} not_found status requires at least 2 distinct search/evidence probes")
+                if not any(str(value or "").strip() for value in gaps):
+                    errors.append(f"{label} not_found status requires searched-boundary gaps")
 
     # Both the allowlist and the worker's report are reduced to the SAME
     # manifest-relative vocabulary before comparison. Comparing a staged absolute
@@ -9336,7 +9544,7 @@ TOOLS = [
     },
     {
         "name": "consult_antigravity",
-        "description": "Use the standalone agy CLI for exactly one bounded Gemini Flash High work package. Switchboard always enforces --json-schema and returns brain_verification=pending. Implementation requires work_package_id, 1-5 allowed_files, and acceptance_criteria; danger-full-access and live deployment are rejected. Flash is non-authoritative: independently verify cited lines, actual diff, and checks before accepting or dispatching another package. On malformed output, ambiguity, failure, quota, timeout, or missing agy, use the host native reader/workhorse and record fallback.",
+        "description": "Use the standalone agy CLI for exactly one bounded Gemini Flash High work package. Switchboard always enforces --json-schema and returns brain_verification=pending. Research requires 1-3 explicit research_questions and rejects shallow/surface coverage. Implementation requires work_package_id, 1-5 allowed_files, and acceptance_criteria; danger-full-access and live deployment are rejected. Flash is non-authoritative: independently verify cited lines, actual diff, and checks before accepting or dispatching another package. On malformed output, ambiguity, failure, quota, timeout, or missing agy, use the host native reader/workhorse and record fallback.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -9349,7 +9557,14 @@ TOOLS = [
                     "description": "plan is read-only/sandboxed; accept-edits permits only the bounded local package. Flash danger-full-access is prohibited.",
                 },
                 "include_context_pack": {"type": "boolean"},
-                "task_kind": {"type": "string"},
+                "task_kind": {
+                    "type": "string",
+                    "enum": [
+                        "quick_check", "research", "search", "implementation_plan", "implementation",
+                        "co_audit", "debate", "argue", "review", "bug_hunt",
+                        "sanity_check", "consult",
+                    ],
+                },
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
@@ -9364,6 +9579,7 @@ TOOLS = [
                 "workspace_root": {"type": "string", "description": "Root used to resolve manifest paths and lay out the disposable copy. Never walked. Defaults to the project root."},
                 "acceptance_criteria": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "Required for implementation. Deterministic pass/fail criteria for this package only."},
                 "forbidden_actions": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "Additional package-specific prohibitions; global no-production/no-next-package rules always apply."},
+                "research_questions": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "minLength": 1, "maxLength": 500}, "description": "Required when task_kind=research. Exact bounded questions, preserved in order; vague research without them is rejected."},
             },
             "required": ["prompt"],
         },
@@ -9496,6 +9712,8 @@ TOOLS = [
                     "type": "string",
                     "enum": [
                         "quick_check",
+                        "research",
+                        "search",
                         "implementation_plan",
                         "implementation",
                         "co_audit",
@@ -9519,6 +9737,7 @@ TOOLS = [
                 "workspace_root": {"type": "string", "description": "Root used to resolve manifest paths and lay out the disposable copy. Never walked. Defaults to the project root."},
                 "acceptance_criteria": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "For Flash implementation, required deterministic criteria for this package."},
                 "forbidden_actions": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "Additional prohibitions; global Flash safety rules cannot be removed."},
+                "research_questions": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "minLength": 1, "maxLength": 500}, "description": "Required when task_kind=research. Exact bounded questions, preserved in order; vague research without them is rejected."},
                 "model_policy": {"type": "string", "description": "Explicit cost policy for Codex or Claude. 'cheap_read' selects Luna/low or Haiku (no effort); 'balanced'/'efficient'/'lower_effort' selects Terra/medium or Sonnet/medium. Omit for frontier/max consultation, audit, review, or debate."},
                 "native_unavailable_reason": {"type": "string", "description": "Required for same-vendor Codex/Claude MCP fallback after native subagent startup/access failure."},
                 "outbound_reviewed": {"type": "boolean", "description": "For a Codex target, explicit operator opt-in that lets a payload the outbound screen classified needs_owner_review proceed. Never overrides a block verdict."},
@@ -10073,7 +10292,9 @@ TOOL_DESCRIPTION_OVERRIDES = {
         "brains should proactively consider external Antigravity "
         "Flash High for bounded cheap labour via target_agent='antigravity', surface='cli', "
         "target_model='gemini flash', effort='high'; plan is read-only and accept-edits requires an "
-        "approved isolated package. Flash is non-authoritative and not a native child. On failure, "
+        "approved isolated package. Research uses task_kind='research' plus 1-3 exact "
+        "research_questions; vague research and shallow/surface coverage are rejected. Flash is "
+        "non-authoritative and not a native child. On failure, "
         "use the host native reader/workhorse and record fallback. Parallelize only independent work. "
         "Call get_model_routing_guide/list_agent_models if unsure."
     ),
@@ -10082,9 +10303,9 @@ TOOL_DESCRIPTION_OVERRIDES = {
 COMPACT_TOOL_DESCRIPTIONS = {
     "consult_codex": "Cross-vendor Codex consultation; same-vendor fallback requires native_unavailable_reason.",
     "consult_claude": "Cross-vendor Claude consultation; same-vendor fallback requires native_unavailable_reason.",
-    "consult_antigravity": "Low-level compatibility/diagnostic route. For Flash labour, call route_agent_task with surface=cli; never invoke agy directly.",
+    "consult_antigravity": "Low-level compatibility/diagnostic route. Research requires 1-3 exact research_questions. For Flash labour, call route_agent_task with surface=cli; never invoke agy directly.",
     "consult_gemini": "Ask Gemini through the configured CLI/API. Long answers return an excerpt plus response_ref.",
-    "route_agent_task": "Required MCP entry for cross-vendor work, including Antigravity Flash packages; surface=cli selects the backend without direct agy invocation.",
+    "route_agent_task": "Required MCP entry for cross-vendor work, including Antigravity Flash packages; research requires 1-3 exact questions and rejects surface coverage.",
     "run_evidence_probe": "Read-only measurement the reader lane cannot do: file hashes, encoding/BOM, git state, file stat, bounded literal grep, filtered process list. Fixed catalog, no shell pass-through.",
     "queue_codex_request": "Queue Codex work; same-vendor callers require native_unavailable_reason after native subagents fail.",
     "get_codex_requests": "List recent queued/completed Codex extension requests.",
