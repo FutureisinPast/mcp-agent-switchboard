@@ -118,7 +118,7 @@ SEARCH_TOOL_NAMES = {"grep", "glob", "find", "search", "search_files"}
 WEB_RESEARCH_TOOL_NAMES = {"webfetch", "websearch"}
 DELEGATION_TOOL_NAMES = {"agent", "task", "spawn_agent"}
 SWITCHBOARD_CONTROL_SUFFIXES = {
-    "consult_codex", "consult_claude", "consult_gemini", "consult_antigravity",
+    "consult_decision", "consult_codex", "consult_claude", "consult_gemini", "consult_antigravity",
     "queue_codex_request", "queue_claude_request", "request_status",
     "request_result", "route_agent_task",
 }
@@ -1611,10 +1611,16 @@ def _receipt_resolves(receipt: str) -> bool:
     if not request_id:
         return False
     try:
-        with sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2.0) as conn:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        try:
             row = conn.execute(
                 "SELECT 1 FROM consultations WHERE request_id = ? LIMIT 1", (request_id,)
             ).fetchone()
+        finally:
+            # sqlite3.Connection's context manager commits/rolls back but does not
+            # close the handle.  An explicit close prevents persistent Windows file
+            # locks in short-lived hook processes and their in-process tests.
+            conn.close()
         return bool(row)
     except sqlite3.Error:
         return False

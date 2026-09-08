@@ -24,6 +24,43 @@ CLAUDE_PEER_ALIASES = {"frontier": "best", "workhorse": "sonnet", "reader": "hai
 # aliases maintained by Claude Code, so future concrete versions need no patch.
 CLAUDE_FRONTIER_FALLBACK_CHAIN = ("fable", "opus")
 
+# Static capability seed used only when the local Codex catalog has not learned about
+# Astra yet.  Priority 5 places it ahead of the current Sol entry (priority 6) while
+# still allowing a future live frontier with a lower priority number to replace it.
+# The CLI remains the source of truth for actual availability and runtime attestation.
+CODEX_FRONTIER_SEED = {
+    "id": "gpt-6-astra",
+    "display_name": "GPT-6 Astra",
+    "description": "Most capable model for the hardest end-to-end work.",
+    "priority": 5,
+    "visibility": "list",
+    "default_reasoning_level": "high",
+    "supported_reasoning_levels": [
+        {"effort": "low"},
+        {"effort": "medium"},
+        {"effort": "high"},
+        {"effort": "xhigh"},
+        {"effort": "max"},
+    ],
+}
+
+
+def seed_codex_frontier(models_json: dict) -> dict:
+    """Return a shallow catalog copy containing the current flagship seed.
+
+    Live entries win by id, and role selection still uses catalog priority rather
+    than lexical model versions.  This keeps older Codex CLIs progressive without
+    rewriting the user's selected main model.
+    """
+    source = models_json if isinstance(models_json, dict) else {}
+    result = dict(source)
+    models = list(source.get("models") or []) if isinstance(source.get("models"), list) else []
+    ids = {_entry_id(item).lower() for item in models if isinstance(item, dict)}
+    if CODEX_FRONTIER_SEED["id"].lower() not in ids:
+        models.append(dict(CODEX_FRONTIER_SEED))
+    result["models"] = models
+    return result
+
 
 def _as_float(value: Any) -> float:
     try:

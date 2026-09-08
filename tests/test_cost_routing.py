@@ -334,13 +334,11 @@ class RoutingContractStringsTests(unittest.TestCase):
     def test_global_rules_never_promote_flash_to_peer_brain(self):
         text = " ".join(broker.COST_AWARE_ROUTING_RULES).lower()
         self.assertIn("capability tier outranks model version", text)
-        self.assertIn("gemini flash high is a useful, non-authoritative workhorse-level adviser", text)
-        self.assertIn("does not promote it above sol/fable", text)
-        self.assertIn("quota, reachability, entitlement", text)
-        self.assertIn("codex brain should request a second opinion", text)
-        self.assertIn("newest live flash high", text)
-        self.assertIn("label it degraded advisory fallback", text)
-        self.assertIn("retain final judgment", text)
+        self.assertIn("newer gemini flash remains a non-authoritative labour workhorse", text)
+        self.assertIn("never becomes an astra/fable decision consultant", text)
+        self.assertIn("consult_decision", text)
+        self.assertIn("astra plus fable", text)
+        self.assertIn("never substitute flash for flagship judgment", text)
 
     def test_global_rules_define_proactive_external_flash_workhorse_lane(self):
         text = " ".join(broker.COST_AWARE_ROUTING_RULES).lower()

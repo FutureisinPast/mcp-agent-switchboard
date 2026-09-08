@@ -287,16 +287,13 @@ class HierarchyInstallTests(unittest.TestCase):
         self.assertIn("same-vendor", hierarchy_lower)
         self.assertIn("default workhorse", hierarchy_lower)
         self.assertIn("agent switchboard", hierarchy_lower)
-        self.assertIn("opposite-vendor", hierarchy_lower)
+        self.assertIn("consult_decision", hierarchy_lower)
         self.assertIn("fallback", hierarchy_lower)
         self.assertIn("capability tier outranks model version", hierarchy_lower)
-        self.assertIn("gemini flash high is a useful, non-authoritative workhorse-level adviser", hierarchy_lower)
-        self.assertIn("does not promote it above sol/fable", hierarchy_lower)
-        self.assertIn("quota, reachability, entitlement", hierarchy_lower)
-        self.assertIn("codex brain should request a second opinion", hierarchy_lower)
-        self.assertIn("newest live antigravity flash high", hierarchy_lower)
-        self.assertIn("label it degraded advisory fallback", hierarchy_lower)
-        self.assertIn("retain final judgment", hierarchy_lower)
+        self.assertIn("newer gemini flash remains a non-authoritative labour workhorse", hierarchy_lower)
+        self.assertIn("never becomes an astra/fable decision consultant", hierarchy_lower)
+        self.assertIn("astra plus fable", hierarchy_lower)
+        self.assertIn("never substitute flash for flagship judgment", hierarchy_lower)
         self.assertIn("external antigravity flash lane", hierarchy_lower)
         self.assertIn("not a native child agent", hierarchy_lower)
         self.assertIn("codex, claude, and gemini brains use the newest live antigravity gemini flash high", hierarchy_lower)
@@ -528,17 +525,14 @@ class HierarchyInstallTests(unittest.TestCase):
         ):
             self.assertIn(phrase, body, phrase)
 
-    def test_body_latches_explicit_claude_unavailability_for_the_session(self):
+    def test_body_latches_flagship_unavailability_for_the_session(self):
         body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
         for phrase in (
-            "Claude availability is session-scoped and fail-closed",
-            "first explicit Claude quota, reachability, entitlement, subscription, access",
-            "mark Claude unavailable for the rest of that session",
-            "Do not retry Fable, Opus, or any other Claude model",
-            "do not automatically retry after a delay",
-            "only when a new main session begins",
-            "degraded non-authoritative second opinion",
-            "retain final judgment",
+            "Flagship availability and quota failures are session-scoped and isolated",
+            "Continue with available targets",
+            "never substitute Flash for flagship judgment",
+            "include every returned `handoff_notices` item in the final response",
+            "Do not retry a latched provider in the same main session",
         ):
             self.assertIn(phrase, body, phrase)
 
@@ -680,7 +674,7 @@ class HierarchyInstallTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertEqual(text.count("agent-switchboard:cost-routing:begin"), 1)
             self.assertIn("Both Codex and Claude use it first", text)
-            self.assertIn("Do not retry Fable, Opus, or any other Claude model", text)
+            self.assertIn("Do not retry a latched provider in the same main session", text)
             self.assertIn('task_kind="research"', text)
             self.assertIn("Repeat this mandatory coverage/depth contract in every request", text)
 

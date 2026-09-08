@@ -555,6 +555,7 @@ class RoutingGateTests(unittest.TestCase):
 
     def test_switchboard_controls_are_exempt_but_research_mcp_counts(self):
         controls = (
+            "consult_decision",
             "consult_codex",
             "consult_claude",
             "queue_codex_request",

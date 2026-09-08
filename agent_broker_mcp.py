@@ -28,6 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -89,7 +90,7 @@ SYNC_CONSULT_TIMEOUT_SECONDS = min(
     _env_int("AGENT_BROKER_SYNC_CONSULT_TIMEOUT_SECONDS", 240),
     max(30, MCP_CLIENT_TIMEOUT_SECONDS - 30),
 )
-# 30 min: a max-effort Sol consult on a real design prompt commonly runs 5-15 minutes; the
+# 30 min: a maximum-effort Codex frontier consult can run well past the sync window; the
 # previous 900s cap risked killing legitimate long runs. The stale-expiry below tracks this.
 CODEX_ASYNC_WORKER_TIMEOUT_SECONDS = _env_int("AGENT_BROKER_CODEX_ASYNC_TIMEOUT_SECONDS", 1800)
 CODEX_STALE_REQUEST_SECONDS = _env_int(
@@ -128,6 +129,7 @@ CLAUDE_ASYNC_MIN_RESPONSE_CHARS = _env_int("AGENT_BROKER_CLAUDE_ASYNC_MIN_RESPON
 DEFAULT_BRIDGE_CLAIM_MAX_AGE_SECONDS = _env_int("AGENT_BROKER_CLAIM_MAX_AGE_SECONDS", 600)
 COMPACT_JSON_RESULTS = _env_bool("AGENT_BROKER_COMPACT_JSON_RESULTS", True)
 _MCP_CLIENT_NAME = ""
+_DECISION_INTERNAL_TOKEN = object()
 
 SECRET_NAMES = {
     ".env",
@@ -150,7 +152,8 @@ SECRET_WORDS = {
     "token",
 }
 
-CODEX_FLAGSHIP_MODEL = "gpt-5.6-sol"
+CODEX_FLAGSHIP_MODEL = "gpt-6-astra"
+CODEX_PREVIOUS_FRONTIER_MODEL = "gpt-5.6-sol"
 CODEX_BALANCED_MODEL = "gpt-5.6-terra"
 CODEX_CHEAP_MODEL = "gpt-5.6-luna"
 CLAUDE_FLAGSHIP_MODEL = "fable"
@@ -160,7 +163,8 @@ CLAUDE_CHEAP_MODEL = "haiku"
 # stable Gemini Flash High slug. Online defaults are selected numerically below.
 ANTIGRAVITY_DEFAULT_MODEL = "gemini-3.6-flash-high"
 CODEX_DEFAULT_EFFORT = "max"
-# Consults/plans default to the flagship (gpt-5.6-sol) at max — quality is the priority.
+# Direct consults/plans default to the current Codex flagship at max; consult_decision
+# is the bounded progressive exception that selects high/xhigh/max from complexity.
 # Because max routinely overruns SYNC_CONSULT_TIMEOUT_SECONDS, a max/xhigh consult does NOT
 # block the sync window and does NOT get its effort silently lowered: it returns a pending
 # request_id immediately while the detached worker (1800s cap) records the answer, collected
@@ -185,6 +189,25 @@ CODEX_SERIOUS_TASK_KINDS = {
     "implementation",
 }
 
+DECISION_POLICY_VERSION = "2026-09-08"
+DECISION_COMPLEXITY_EFFORT = {
+    "bounded": "high",
+    "architecture": "xhigh",
+    "critical": "max",
+}
+DECISION_CRITICAL_RISK_FLAGS = {
+    "security", "auth", "authentication", "payment", "data_loss", "data-loss",
+    "migration", "irreversible", "destructive", "hard_diagnosis", "hard-diagnosis",
+}
+DECISION_BRIEF_MAX_BYTES = 12_000
+DECISION_BRIEF_MAX_TOKENS = 3_000
+DECISION_EVIDENCE_EXCERPT_MAX_BYTES = 4_000
+DECISION_PROVIDER_PROMPT_MAX_BYTES = 14_000
+DECISION_PROVIDER_PROMPT_MAX_TOKENS = 3_500
+DECISION_ADVICE_MAX_CHARS = 3_000
+DECISION_COMBINED_MAX_BYTES = 8_000
+_FLAGSHIP_AVAILABILITY_LATCHES: dict[tuple[str, str], dict[str, str]] = {}
+
 MODEL_ALIASES = {
     "gemini 3.6 flash": "Gemini 3.6 Flash (High)",
     "gemini 3.6 flash high": "Gemini 3.6 Flash (High)",
@@ -205,12 +228,17 @@ MODEL_ALIASES = {
     "claude sonnet 4.6": "Claude Sonnet 4.6 (Thinking)",
     "gpt 5.5": "gpt-5.5",
     "gpt-5.5": "gpt-5.5",
-    "gpt 5.6": CODEX_FLAGSHIP_MODEL,
-    "gpt-5.6": CODEX_FLAGSHIP_MODEL,
-    "gpt 5.6 sol": CODEX_FLAGSHIP_MODEL,
-    "gpt-5.6-sol": CODEX_FLAGSHIP_MODEL,
-    "gpt 5.6 solar": CODEX_FLAGSHIP_MODEL,
-    "gpt-5.6-solar": CODEX_FLAGSHIP_MODEL,
+    "gpt 6": CODEX_FLAGSHIP_MODEL,
+    "gpt-6": CODEX_FLAGSHIP_MODEL,
+    "gpt 6 astra": CODEX_FLAGSHIP_MODEL,
+    "gpt-6-astra": CODEX_FLAGSHIP_MODEL,
+    "astra": CODEX_FLAGSHIP_MODEL,
+    "gpt 5.6": CODEX_PREVIOUS_FRONTIER_MODEL,
+    "gpt-5.6": CODEX_PREVIOUS_FRONTIER_MODEL,
+    "gpt 5.6 sol": CODEX_PREVIOUS_FRONTIER_MODEL,
+    "gpt-5.6-sol": CODEX_PREVIOUS_FRONTIER_MODEL,
+    "gpt 5.6 solar": CODEX_PREVIOUS_FRONTIER_MODEL,
+    "gpt-5.6-solar": CODEX_PREVIOUS_FRONTIER_MODEL,
     "gpt 5.6 terra": CODEX_BALANCED_MODEL,
     "gpt-5.6-terra": CODEX_BALANCED_MODEL,
     "gpt 5.6 luna": CODEX_CHEAP_MODEL,
@@ -380,7 +408,20 @@ STATIC_CLAUDE_MODELS = [
 STATIC_CODEX_MODELS = [
     {
         "id": CODEX_FLAGSHIP_MODEL,
-        "display": "GPT-5.6 Sol (flagship; default for consult/audit/debate)",
+        "display": "GPT-6 Astra (flagship decision consultant)",
+        "description": "Most capable model for the hardest end-to-end work.",
+        "priority": 5,
+        "visibility": "list",
+        "default_reasoning_level": "high",
+        "supported_reasoning_levels": [
+            {"effort": "low"}, {"effort": "medium"}, {"effort": "high"},
+            {"effort": "xhigh"}, {"effort": "max"},
+        ],
+        "aliases": ["gpt-6-astra", "gpt 6 astra", "gpt-6", "gpt 6", "astra"],
+    },
+    {
+        "id": CODEX_PREVIOUS_FRONTIER_MODEL,
+        "display": "GPT-5.6 Sol (main-session brain/workhorse)",
         "aliases": [
             "gpt-5.6", "gpt 5.6", "gpt-5.6-sol", "gpt 5.6 sol",
             "sol", "solar", "5.6 sol", "5.6 solar",
@@ -567,13 +608,15 @@ GENERIC_GROUND_RULES = [
 
 COST_AWARE_ROUTING_RULES = [
     "The model selected for the main session is the brain; never rewrite that user choice. It owns requirements, architecture, planning, hard diagnosis, risk decisions, and final signoff.",
-    "For non-trivial planning or a hard issue, obtain one opposite-vendor maximum-effort consultation: Codex brain -> moving Claude Fable alias (Opus only when Fable is explicitly unavailable); Claude brain -> the live Codex frontier at its highest single-agent effort.",
-    "Capability tier outranks model version. Gemini Flash High is a useful, non-authoritative workhorse-level adviser; a higher version does not promote it above Sol/Fable or make its advice automatically authoritative. When Claude's Fable -> Opus chain is unavailable because of quota, reachability, entitlement, or another availability failure, a Codex brain should request a second opinion from the newest live Flash High, label it degraded advisory fallback, and retain final judgment.",
-    "After the first explicit Claude quota, subscription, access, provider-unavailable, or whole-family availability failure in the current main session, do not retry Fable or Opus in that session. Use the newest Flash High only as a degraded non-authoritative consultation fallback while retaining it as the default labour workhorse; reset this no-retry state only in a new main session.",
+    "For important architecture, compatibility, or hard decisions, call consult_decision with one structured bounded brief. It progressively selects Astra and/or Fable from the host/model matrix and maps bounded/architecture/critical complexity to high/xhigh/max effort.",
+    "A Codex Sol-or-lower host consults Astra for bounded decisions and Astra plus Fable for architecture/critical work; an Astra host consults Fable. A Claude Opus-or-lower host consults Fable for bounded decisions and Fable plus Astra for architecture/critical work; a Fable host consults Astra. A Gemini host consults both Astra and Fable.",
+    "Decision briefs are hard-capped: one decision, at most three questions, four options, eight evidence refs, 4,000 excerpt bytes, 12,000 total UTF-8 bytes, and about 3,000 tokens. Send summaries, precise excerpts, and immutable refs -- never whole files, articles, logs, or chat histories.",
+    "Flagship availability and quota failures are isolated. Continue with available targets, never substitute Flash for flagship judgment, and include every consult_decision handoff_notices item in the final response.",
+    "Capability tier outranks model version: a newer Gemini Flash remains a non-authoritative labour workhorse and never becomes an Astra/Fable decision consultant.",
     "The owner has issued a STANDING REQUEST to delegate eligible labour: dispatching a bounded package to the Flash workhorse or to a managed native subagent is pre-authorized work, not an optional extra that needs fresh permission each turn.",
     "DEFAULT WORKHORSE = the newest live Antigravity Gemini Flash High through Agent Switchboard. For a bounded package -- reading, search, extraction, summaries, drafting/writing, independent parallel read-only packages, and (once containment is enabled) light implementation and tests from an approved plan when isolated and low-risk -- the default lane is route_agent_task with target_agent=antigravity, surface=cli, target_model=gemini flash, effort=high, a work_package_id, the correct task_kind, and mode=plan or mode=accept-edits with the implementation envelope. It is roughly a tenth the cost of the same-vendor native workhorse and several times faster.",
     "Flash is the default with OBJECTIVE EXCEPTIONS, not an unconditional rule. A Flash-eligible package must end in exactly one of: a Switchboard dispatch, the small direct allowance for non-mutating micro-work, or a native/brain lane carrying a stated flash_skip reason with evidence -- host-tools:<tool-id> (the package needs host-only MCP tools, skills, or an IDE session), unshared-state:<evidence-id> (it depends on session state Flash cannot see), flash-failed:<broker-receipt>, flash-unavailable:<health-id>, or atomic-oversize:<plan-id> (an indivisible package over five files or past the input preflight). 'It felt easier to do myself' is not one of them.",
-    "Native cheap roles (Codex explorer/worker; Claude Explore/economy-worker) remain the correct lane for those stated exceptions and for anything needing the host's own tools; they are the fallback, not the first choice. Flash is an external worker, never a native child agent, and never a frontier consultant: a higher Gemini version number does not promote it above Sol/Fable.",
+    "Native cheap roles (Codex explorer/worker; Claude Explore/economy-worker) remain the correct lane for those stated exceptions and for anything needing the host's own tools; they are the fallback, not the first choice. Flash is an external worker, never a native child agent, and never an Astra/Fable decision consultant.",
     "Cross-vendor routing must enter through Agent Switchboard's MCP tools whenever Switchboard is registered. For Flash labour, the sender brain MUST call MCP route_agent_task; 'through CLI' means surface=cli on that MCP call. The brain MUST NOT shell out to agy or call consult_antigravity directly. Only the Switchboard backend may start agy; sender-side direct agy is prohibited.",
     "The Antigravity in-app/extension surface is retired for Flash labour: always use surface=cli, never extension or app. If the named model cannot be selected and runtime-attested, return needs_model_selection; never continue on the IDE's current or a neighbouring model.",
     "Every Flash call is exactly one bounded work package. Never hand Flash an entire autonomous plan or let it select/continue to the next package. Implementation calls must name a package id, at most five allowed files, explicit acceptance criteria, and forbidden actions; Switchboard rejects an incomplete envelope.",
@@ -2272,7 +2315,7 @@ def discover_codex_models() -> list[dict[str, Any]]:
     codex = discover_codex(config)
     configured = config.get("codex_models") or []
     models: list[dict[str, Any]] = [
-        model_entry(item["id"], item["display"], item.get("aliases") or [], "static")
+        model_entry(item["id"], item["display"], item.get("aliases") or [], "static", item)
         for item in STATIC_CODEX_MODELS
     ]
     for item in configured:
@@ -2468,7 +2511,7 @@ def antigravity_roles_from_models(models: list[dict[str, Any]]) -> dict[str, Any
         "rule": (
             "Gemini Flash High is a useful, non-authoritative external workhorse for Codex/Claude "
             "brains to consider proactively; it is not a native child agent. A higher version does "
-            "not promote it above Sol/Fable. On agy/model absence, quota, timeout, mismatch, or "
+            "not make it an Astra/Fable decision consultant. On agy/model absence, quota, timeout, mismatch, or "
             "failure, use the host native cheap reader/workhorse and record the fallback. The main "
             "frontier brain reviews evidence/diffs and retains judgment."
         ),
@@ -2874,10 +2917,25 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
         "execution_precedence": [
             "Same-vendor bounded labour uses native subagents first: Codex explorer/worker or Claude Explore/economy-worker.",
             "Proactively consider the newest live Antigravity Gemini Flash High through Agent Switchboard/agy as a fast, cheap external workhorse; it is not a native child agent.",
-            "Use Agent Switchboard for opposite-vendor maximum-effort consultation.",
+            "Use consult_decision for bounded progressive flagship advice on important architecture and decisions; never send whole files or articles.",
             "Use a same-vendor broker worker only when the named native role is unavailable or failed to start, and record the fallback.",
         ],
         "defaults": {
+            "progressive_flagship_decision": {
+                "tool": "consult_decision",
+                "codex_flagship": codex_frontier,
+                "claude_flagship": CLAUDE_FLAGSHIP_MODEL,
+                "effort_by_complexity": dict(DECISION_COMPLEXITY_EFFORT),
+                "input_limits": {
+                    "brief_bytes": DECISION_BRIEF_MAX_BYTES,
+                    "brief_tokens": DECISION_BRIEF_MAX_TOKENS,
+                    "questions": 3,
+                    "options": 4,
+                    "evidence_refs": 8,
+                    "evidence_excerpt_bytes": DECISION_EVIDENCE_EXCERPT_MAX_BYTES,
+                },
+                "rule": "Codex Sol-or-lower and Claude Opus-or-lower hosts add their higher same-vendor flagship; architecture/critical work also uses the opposite-vendor flagship. Gemini hosts use Astra and Fable. Exact-host targets are removed, failures are isolated, and skips must be reported in the final handoff.",
+            },
             "consult_audit_review_debate": {
                 "target_agent": "codex",
                 "target_model": codex_frontier,
@@ -2943,6 +3001,22 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
             },
         },
         "caller_examples": {
+            "bounded_flagship_decision": {
+                "tool": "consult_decision",
+                "args": {
+                    "work_package_id": "WP-architecture-1",
+                    "host": {"vendor": "codex", "model": CODEX_PREVIOUS_FRONTIER_MODEL},
+                    "complexity": "architecture",
+                    "brief": {
+                        "decision": "Choose the compatibility-safe routing design.",
+                        "constraints": ["Preserve existing public tool signatures."],
+                        "options": [{"id": "A", "summary": "Add one bounded orchestrator."}],
+                        "questions": ["Which option best satisfies the constraints?"],
+                        "evidence": [{"ref": "src/router.py:120", "claim": "Current frontier is fixed."}],
+                    },
+                },
+                "broker_resolves_to": {"targets": [codex_frontier, CLAUDE_FLAGSHIP_MODEL], "effort": "xhigh"},
+            },
             "serious_consult": {
                 "tool": "route_agent_task",
                 "args": {
@@ -3029,7 +3103,7 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
             "Use target_model for the model slug only; put reasoning in effort.",
             "Antigravity CLI models are discovered live with `agy models`; newly released models become routable without changing the static catalog.",
             "The newest exact stable gemini-<numeric>-flash-high slug is the Antigravity workhorse; numeric version order never promotes previews or renamed/nonconforming SKUs.",
-            "Capability tier outranks version: Gemini Flash is useful non-authoritative workhorse-level advice, and a higher version does not promote it above Sol/Fable or make it automatically authoritative. If Claude's Fable -> Opus chain is unavailable because of quota, reachability, entitlement, or another availability failure, Codex should request a second opinion from the newest live Flash High, label it degraded advisory fallback, and retain final judgment.",
+            "Capability tier outranks version: Gemini Flash is a non-authoritative labour workhorse and never substitutes for Astra/Fable decision advice. If a flagship is unavailable, consult_decision records the skip for the final handoff and continues with any available target.",
             "Both Codex and Claude brains should proactively consider newest live Flash High for bounded external workhorse labour; this does not make Flash a native child agent.",
             "If agy/Flash is missing, quota-limited, times out, mismatches, or fails, use the host native explorer/worker or Explore/economy-worker and record the fallback.",
             "Flash and native workers may run concurrently only for independent stages/packages: parallel reads are allowed, while writes are serial unless demonstrably isolated; the brain reviews evidence/diffs and owns the final decision.",
@@ -3037,10 +3111,10 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
             "A Flash completion is never acceptance: the sender brain independently checks cited primary evidence, the actual diff, and command output. Unsupported intentional/by-design claims keep the investigation open.",
             "Flash may not use danger-full-access or receive production SSH, live credentials, destructive operations, migrations, or live deployment.",
             "An automatic Antigravity route falls back to the in-app bridge if agy is missing. An explicit surface='cli' reports a missing CLI instead of silently changing surfaces.",
-            "For a serious live-frontier Codex consult/audit/review/debate, a lower effort is allowed only when the caller explicitly marks the downshift with a cost policy or says lower effort is enough.",
+            "Direct serious Codex consult/audit/review/debate remains max by default. consult_decision is the explicit progressive exception and maps bounded/architecture/critical to high/xhigh/max.",
             "Claude family aliases move with Claude Code: Fable/max is the peer brain, Opus/max is the availability fallback, Haiku is the reader, and Sonnet/medium is the workhorse.",
             "Cost policies are explicit. The broker never guesses a cheap tier from prompt keywords.",
-            "Bare Codex/GPT requests resolve from live `codex debug models` role metadata; built-in ids are used only when live discovery is unavailable.",
+            "Bare Codex/GPT requests resolve from live `codex debug models` role metadata plus the Astra capability seed; a newer live frontier with higher catalog priority wins automatically.",
             "Use list_agent_models for the raw catalog; this guide adds the default-routing policy.",
         ],
         "catalog": catalog,
@@ -3491,6 +3565,9 @@ def is_codex_flagship_model(model: Any) -> bool:
     return normalize_lookup(model) in {
         normalize_lookup(current_codex_role_model("frontier")),
         normalize_lookup(CODEX_FLAGSHIP_MODEL),
+        "gpt 6",
+        "gpt-6",
+        "astra",
         "gpt 5.6",
         "gpt-5.6",
         "sol",
@@ -3507,7 +3584,7 @@ def is_serious_codex_task(task_kind: str, prompt: str) -> bool:
 
 
 def codex_lower_effort_allowed(args: dict[str, Any], prompt: str, model_policy: str | None = None) -> bool:
-    """A lower effort on serious Sol work is allowed only when the caller makes the
+    """A lower effort on serious Codex frontier work is allowed only when the caller makes the
     downshift explicit. This preserves best-advice defaults while still allowing
     deliberate medium/efficient requests."""
     policy = normalize_lookup(
@@ -3545,9 +3622,11 @@ def enforce_codex_effort_policy(
     effort: str | None,
     model_policy: str | None = None,
 ) -> tuple[str | None, str | None]:
-    """Agents sometimes pass medium out of habit. For serious Codex work on Sol,
+    """Agents sometimes pass medium out of habit. For serious Codex frontier work,
     enforce the intended max default unless the request is explicitly cheap-read or
     names a lower-tier model such as Luna/Terra."""
+    if args.get("_decision_internal_token") is _DECISION_INTERNAL_TOKEN:
+        return effort, "progressive_decision_effort"
     policy_text = normalize_lookup(model_policy or args.get("model_policy") or "")
     if policy_text in {"cheap read", "cheap_read", "cheap reader", "cheap"}:
         return effort, None
@@ -3557,7 +3636,7 @@ def enforce_codex_effort_policy(
         and effort != CODEX_DEFAULT_EFFORT
         and not codex_lower_effort_allowed(args, prompt, model_policy)
     ):
-        return CODEX_DEFAULT_EFFORT, "codex_sol_serious_max"
+        return CODEX_DEFAULT_EFFORT, "codex_frontier_serious_max"
     return effort, None
 
 
@@ -3787,12 +3866,43 @@ def wrap_task_prompt(prompt: str, task_kind: str, token_budget: int | None = Non
     return f"{task_contract_text(task_kind, token_budget)}\n\nRequest:\n\n{prompt.strip()}"
 
 
+def _array_values(value: Any, field: str, *, allow_single_string: bool) -> list[Any]:
+    """Normalize array-shaped MCP values at the compatibility boundary.
+
+    Ordinary JSON decoding returns ``list``.  Some MCP bridges expose a tuple,
+    iterable proxy, or a JSON-encoded array string; accepting those shapes here
+    keeps validation strict after normalization without treating mappings as
+    arrays or inferring missing values.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        if allow_single_string:
+            return [value]
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = None
+        if not isinstance(decoded, list):
+            raise ValueError(f"{field} must be an array of strings")
+        return decoded
+    root = getattr(value, "root", value)
+    if isinstance(root, Mapping) or isinstance(root, (bytes, bytearray)):
+        raise ValueError(f"{field} must be an array of strings")
+    if isinstance(root, (list, tuple, set, frozenset)):
+        return list(root)
+    if isinstance(root, Iterable):
+        try:
+            return list(root)
+        except TypeError:
+            pass
+    raise ValueError(f"{field} must be an array of strings")
+
+
 def _bounded_string_list(value: Any, field: str, maximum: int) -> list[str]:
     if value is None:
         return []
-    raw_items = [value] if isinstance(value, str) else value
-    if not isinstance(raw_items, (list, tuple)):
-        raise ValueError(f"{field} must be an array of strings")
+    raw_items = _array_values(value, field, allow_single_string=True)
     items: list[str] = []
     for raw in raw_items:
         item = str(raw or "").strip()
@@ -3804,13 +3914,17 @@ def _bounded_string_list(value: Any, field: str, maximum: int) -> list[str]:
 
 
 def _bounded_research_questions(value: Any) -> list[str]:
-    if not isinstance(value, (list, tuple)):
-        raise ValueError("Flash research requires research_questions as an array of 1-3 strings")
-    if not 1 <= len(value) <= 3:
+    try:
+        raw_items = _array_values(value, "research_questions", allow_single_string=False)
+    except ValueError as exc:
+        raise ValueError(
+            "Flash research requires research_questions as an array of 1-3 strings"
+        ) from exc
+    if not 1 <= len(raw_items) <= 3:
         raise ValueError("Flash research requires 1-3 research_questions")
     questions: list[str] = []
     seen: set[str] = set()
-    for raw in value:
+    for raw in raw_items:
         if not isinstance(raw, str) or not raw.strip():
             raise ValueError("every research_questions item must be a nonempty string")
         question = raw.strip()
@@ -4895,7 +5009,7 @@ def _codex_turn_context_model_effort(path: Path) -> tuple[str | None, str | None
 # Bare Codex CLI aliases: these family-match any concrete Codex model id that names the
 # same family (e.g. "sol" matches "gpt-5.6-sol"). Anything else -- especially a full model
 # id -- is treated as an explicit request and must match exactly.
-CODEX_MODEL_BARE_ALIASES = {"sol", "terra", "luna"}
+CODEX_MODEL_BARE_ALIASES = {"astra", "sol", "terra", "luna"}
 
 
 def codex_model_attested(requested_model: Any, actual_model: Any) -> bool:
@@ -5487,6 +5601,7 @@ def persist_worker_stderr(package_id: str, stderr: str) -> tuple[str, str | None
                 ["icacls", str(WORKER_LOG_DIR), "/inheritance:r",
                  "/grant:r", f"{os.environ.get('USERNAME', '')}:(OI)(CI)F"],
                 capture_output=True, timeout=15, check=False,
+                creationflags=WINDOWS_NO_WINDOW,
             )
         safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(package_id or "unknown"))[:60]
         target = WORKER_LOG_DIR / f"{int(time.time())}-{safe_id}-{uuid.uuid4().hex[:8]}.log"
@@ -5990,7 +6105,7 @@ def _run_codex_consult(
     else:
         note = (
             f"Routed async by effort: {effort} does not fit the {timeout_seconds}s sync window, so this returns a "
-            f"pending id up front instead of blocking. A {effort}-effort Sol consult TYPICALLY TAKES 5-15 MINUTES — "
+            f"pending id up front instead of blocking. A {effort}-effort Codex frontier consult can take several minutes — "
             f"'running' for several minutes is normal, not a hang. The detached worker "
             f"({CODEX_ASYNC_WORKER_TIMEOUT_SECONDS}s cap) records the answer; collect it with "
             f'request_result(request_id="{rid}", wait_seconds=180) and repeat until answered.'
@@ -6033,13 +6148,16 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     requested_model = args.get("target_model") or args.get("model_name") or args.get("model")
     requested_effort = args.get("effort") or args.get("reasoning_effort")
     model_policy = None
+    decision_orchestrated = args.get("_decision_internal_token") is _DECISION_INTERNAL_TOKEN
     if model == "codex":
-        enforce_native_first_broker_fallback(args, "codex")
+        if not decision_orchestrated:
+            enforce_native_first_broker_fallback(args, "codex")
         requested_model, requested_effort, model_policy = apply_codex_model_policy(
             args, prompt, task_kind, requested_model, requested_effort
         )
     elif model == "claude":
-        enforce_native_first_broker_fallback(args, "claude")
+        if not decision_orchestrated:
+            enforce_native_first_broker_fallback(args, "claude")
         requested_model, requested_effort, model_policy = apply_claude_model_policy(
             args, requested_model, requested_effort
         )
@@ -6053,7 +6171,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     )
     if model == "antigravity":
         resolved_model = antigravity_model_for_effort(resolved_model, effort)
-    # A serious consult/plan on Sol is forced to max — even if the caller fumbled and passed
+    # A direct serious Codex frontier consult/plan is forced to max — even if the caller passed
     # high/medium — unless it explicitly opted into a cheaper tier (model_policy=cheap_read /
     # balanced / lower_effort, or a Luna/Terra model). This is SAFE now: max no longer blocks
     # or times out; _run_codex_consult routes max/xhigh straight to the pending/worker path.
@@ -6349,6 +6467,405 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         error = f"{type(exc).__name__}: {exc}"
         store_consultation(project_info, model, mode, prompt, "", "error", error, started_at)
         raise
+
+
+def _decision_string_list(
+    value: Any, field: str, maximum: int, *, item_max_chars: int = 500
+) -> list[str]:
+    if value is None:
+        return []
+    raw_items = _array_values(value, field, allow_single_string=False)
+    if len(raw_items) > maximum:
+        raise ValueError(f"brief.{field} allows at most {maximum} items")
+    items: list[str] = []
+    for raw in raw_items:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError(f"every brief.{field} item must be a nonempty string")
+        item = raw.strip()
+        if len(item) > item_max_chars:
+            raise ValueError(f"every brief.{field} item must be at most {item_max_chars} characters")
+        items.append(item)
+    return items
+
+
+def _normalized_decision_brief(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("brief must be an object")
+    decision = str(value.get("decision") or "").strip()
+    if not decision:
+        raise ValueError("brief.decision is required")
+    if len(decision) > 2000:
+        raise ValueError("brief.decision must be at most 2000 characters")
+
+    raw_options = _array_values(value.get("options"), "brief.options", allow_single_string=False)
+    if len(raw_options) > 4:
+        raise ValueError("brief.options allows at most 4 items")
+    options: list[dict[str, str]] = []
+    for item in raw_options:
+        if not isinstance(item, Mapping):
+            raise ValueError("every brief.options item must be an object")
+        option_id = str(item.get("id") or "").strip()
+        summary = str(item.get("summary") or "").strip()
+        if not option_id or not summary:
+            raise ValueError("every brief.options item requires id and summary")
+        if len(option_id) > 80 or len(summary) > 1000:
+            raise ValueError("brief option ids are limited to 80 characters and summaries to 1000")
+        options.append({"id": option_id, "summary": summary})
+
+    raw_evidence = _array_values(value.get("evidence"), "brief.evidence", allow_single_string=False)
+    if len(raw_evidence) > 8:
+        raise ValueError("brief.evidence allows at most 8 items")
+    evidence: list[dict[str, str]] = []
+    excerpt_bytes = 0
+    for item in raw_evidence:
+        if not isinstance(item, Mapping):
+            raise ValueError("every brief.evidence item must be an object")
+        ref = str(item.get("ref") or "").strip()
+        claim = str(item.get("claim") or "").strip()
+        excerpt = str(item.get("excerpt") or "").strip()
+        if not ref or not claim:
+            raise ValueError("every brief.evidence item requires ref and claim")
+        if len(ref) > 500 or len(claim) > 500 or len(excerpt) > 1200:
+            raise ValueError("brief evidence ref/claim/excerpt exceeds its field limit")
+        excerpt_bytes += len(excerpt.encode("utf-8"))
+        evidence.append({"ref": ref, "claim": claim, "excerpt": excerpt})
+    if excerpt_bytes > DECISION_EVIDENCE_EXCERPT_MAX_BYTES:
+        raise ValueError(
+            f"brief evidence excerpts use {excerpt_bytes} UTF-8 bytes; "
+            f"maximum is {DECISION_EVIDENCE_EXCERPT_MAX_BYTES}"
+        )
+
+    brief = {
+        "decision": decision,
+        "constraints": _decision_string_list(value.get("constraints"), "constraints", 8),
+        "options": options,
+        "proposed_choice": str(value.get("proposed_choice") or "").strip()[:500],
+        "questions": _decision_string_list(value.get("questions"), "questions", 3),
+        "evidence": evidence,
+        "uncertainties": _decision_string_list(value.get("uncertainties"), "uncertainties", 6),
+    }
+    serialized = json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
+    byte_count = len(serialized.encode("utf-8"))
+    token_count = estimate_tokens(serialized)
+    if byte_count > DECISION_BRIEF_MAX_BYTES or token_count > DECISION_BRIEF_MAX_TOKENS:
+        raise ValueError(
+            "decision brief exceeds the preflight budget: "
+            f"{byte_count}/{DECISION_BRIEF_MAX_BYTES} UTF-8 bytes, "
+            f"~{token_count}/{DECISION_BRIEF_MAX_TOKENS} tokens"
+        )
+    return brief
+
+
+def _decision_host_family(args: dict[str, Any], host: Mapping[str, Any]) -> str:
+    supplied = normalize_lookup(host.get("vendor") or args.get("host_agent") or "")
+    supplied_family = model_family_for(supplied)
+    if supplied_family == "antigravity":
+        supplied_family = "gemini"
+    if supplied_family not in {"codex", "claude", "gemini"}:
+        raise ValueError("host.vendor must identify codex, claude, or gemini")
+
+    caller = normalize_lookup(f"{os.environ.get('AGENT_BROKER_CALLER') or ''} {_MCP_CLIENT_NAME}")
+    trusted = None
+    if re.search(r"\b(?:codex|openai)\b", caller):
+        trusted = "codex"
+    elif re.search(r"\bclaude\b", caller):
+        trusted = "claude"
+    elif re.search(r"\b(?:gemini|antigravity)\b", caller):
+        trusted = "gemini"
+    return trusted or supplied_family
+
+
+def _decision_same_model(host_family: str, host_model: str, family: str, model: str) -> bool:
+    if host_family != family:
+        return False
+    host_name, _ = split_model_and_effort(host_model)
+    if family == "codex":
+        return codex_model_attested(host_name, model) or codex_model_attested(model, host_name)
+    if family == "claude":
+        return claude_model_attested(host_name, model) or claude_model_attested(model, host_name)
+    return normalize_lookup(host_name) == normalize_lookup(model)
+
+
+def decision_consult_targets(host_family: str, host_model: str, complexity: str) -> list[dict[str, str]]:
+    codex = {"family": "codex", "model": current_codex_role_model("frontier")}
+    claude = {"family": "claude", "model": CLAUDE_FLAGSHIP_MODEL}
+    if host_family == "gemini":
+        candidates = [codex, claude]
+    elif complexity == "bounded":
+        same_vendor = codex if host_family == "codex" else claude
+        other_vendor = claude if host_family == "codex" else codex
+        candidates = [same_vendor, other_vendor]
+    else:
+        candidates = [codex, claude]
+
+    selected: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        key = (candidate["family"], normalize_lookup(candidate["model"]))
+        if key in seen or _decision_same_model(
+            host_family, host_model, candidate["family"], candidate["model"]
+        ):
+            continue
+        selected.append(candidate)
+        seen.add(key)
+        # A bounded Codex/Claude decision needs one higher-level opinion. Prefer
+        # the same-vendor upgrade; use the peer only when the host is already it.
+        if complexity == "bounded" and host_family != "gemini":
+            break
+    return selected
+
+
+def _decision_prompt(package_id: str, complexity: str, brief: dict[str, Any]) -> str:
+    prompt = (
+        "You are one bounded flagship decision adviser. This is consultation depth 1; "
+        "do not call tools, dispatch agents, read files, browse, or initiate another consultation. "
+        "Use only the decision brief. Do not repeat the brief. Return a compact JSON object with "
+        "recommendation (string), reasons (max 4 strings), risks (max 4 strings), "
+        "missing_evidence (max 3 strings), and evidence_refs (max 8 strings). "
+        "If the evidence is insufficient, say exactly what bounded evidence is missing. "
+        f"Lineage: {package_id}; complexity: {complexity}.\n\n"
+        "Decision brief:\n"
+        + json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
+    )
+    byte_count = len(prompt.encode("utf-8"))
+    token_count = estimate_tokens(prompt)
+    if byte_count > DECISION_PROVIDER_PROMPT_MAX_BYTES or token_count > DECISION_PROVIDER_PROMPT_MAX_TOKENS:
+        raise ValueError(
+            "assembled flagship request exceeds the provider budget: "
+            f"{byte_count}/{DECISION_PROVIDER_PROMPT_MAX_BYTES} UTF-8 bytes, "
+            f"~{token_count}/{DECISION_PROVIDER_PROMPT_MAX_TOKENS} tokens"
+        )
+    return prompt
+
+
+def _decision_failure(result: dict[str, Any]) -> tuple[str | None, bool]:
+    status = normalize_lookup(result.get("status"))
+    if status == "needs model selection":
+        return "needs_model_selection", False
+    text = normalize_lookup(json.dumps(result, ensure_ascii=False, default=str))
+    if re.search(r"\b(?:quota|usage limit|rate limit)\b.{0,80}\b(?:exceeded|exhausted|reached|limited|depleted)\b", text):
+        return "skipped_quota", True
+    model_specific = bool(re.search(r"\b(?:model|alias)\b.{0,80}\b(?:not found|unknown|unsupported|unavailable)\b", text))
+    if re.search(
+        r"\b(?:cli was not found|authentication failed|unauthorized|subscription|entitlement|"
+        r"access denied|provider unavailable|connection refused|network unreachable)\b",
+        text,
+    ):
+        return "skipped_unavailable", not model_specific
+    if status in {"error", "failed", "blocked"}:
+        return "failed", False
+    return None, False
+
+
+def _decision_session_key(args: dict[str, Any], host_family: str) -> str:
+    explicit = str(args.get("session_id") or "").strip()
+    if explicit:
+        return explicit[:200]
+    return ":".join(
+        (
+            str(os.getpid()),
+            normalize_lookup(_MCP_CLIENT_NAME) or host_family,
+            str(args.get("project") or "default")[:100],
+            str(args.get("topic") or "default")[:100],
+        )
+    )
+
+
+def _cap_decision_result(result: dict[str, Any]) -> None:
+    def size() -> int:
+        return len(json.dumps(result, ensure_ascii=False, default=str).encode("utf-8"))
+
+    if size() <= DECISION_COMBINED_MAX_BYTES:
+        return
+    for item in result.get("consultations") or []:
+        advice = item.get("advice")
+        if isinstance(advice, str) and len(advice) > 1000:
+            item["advice"] = advice[:985].rstrip() + " ... [truncated]"
+    if size() > DECISION_COMBINED_MAX_BYTES:
+        for item in result.get("consultations") or []:
+            error = item.get("error")
+            if isinstance(error, str) and len(error) > 300:
+                item["error"] = error[:285].rstrip() + " ... [truncated]"
+
+
+def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
+    """Consult the available flagship tier using one strictly bounded decision brief."""
+    if os.environ.get("AGENT_BROKER_CHILD") == "1":
+        raise RuntimeError("Nested flagship consultations are disabled to avoid recursive loops.")
+    package_id = str(args.get("work_package_id") or "").strip()
+    if not package_id or len(package_id) > 100:
+        raise ValueError("work_package_id is required and must be at most 100 characters")
+    host = args.get("host")
+    if not isinstance(host, Mapping):
+        raise ValueError("host must be an object with vendor and model")
+    host_model = str(host.get("model") or args.get("host_model") or "").strip()
+    if not host_model:
+        raise ValueError("host.model is required so the broker can prevent self-consultation")
+    host_family = _decision_host_family(args, host)
+
+    complexity = normalize_lookup(args.get("complexity") or "bounded").replace(" ", "_")
+    if complexity not in DECISION_COMPLEXITY_EFFORT:
+        raise ValueError("complexity must be bounded, architecture, or critical")
+    risk_flags = {
+        normalize_lookup(item).replace(" ", "_")
+        for item in _decision_string_list(args.get("risk_flags"), "risk_flags", 8, item_max_chars=80)
+    }
+    complexity_escalated = False
+    if risk_flags & {normalize_lookup(item).replace(" ", "_") for item in DECISION_CRITICAL_RISK_FLAGS}:
+        complexity_escalated = complexity != "critical"
+        complexity = "critical"
+    effort = DECISION_COMPLEXITY_EFFORT[complexity]
+    brief = _normalized_decision_brief(args.get("brief"))
+    prompt = _decision_prompt(package_id, complexity, brief)
+    try:
+        response_chars = int(args.get("max_response_chars") or 2400)
+    except (TypeError, ValueError):
+        response_chars = 2400
+    response_chars = max(800, min(response_chars, DECISION_ADVICE_MAX_CHARS))
+
+    session_key = _decision_session_key(args, host_family)
+    targets = decision_consult_targets(host_family, host_model, complexity)
+    consultations: list[dict[str, Any]] = []
+    notices: list[str] = []
+    for target in targets:
+        family = target["family"]
+        model = target["model"]
+        latch = _FLAGSHIP_AVAILABILITY_LATCHES.get((session_key, family))
+        if latch:
+            status = latch.get("status") or "skipped_unavailable"
+            notice = f"Skipped {family}:{model}: {latch.get('reason') or 'provider unavailable for this session'}."
+            consultations.append(
+                {
+                    "target": family,
+                    "resolved_model": model,
+                    "requested_effort": effort,
+                    "effective_effort": None,
+                    "attestation": "not_run",
+                    "status": status,
+                }
+            )
+            notices.append(notice)
+            continue
+        call_args: dict[str, Any] = {
+            "project": args.get("project"),
+            "topic": args.get("topic"),
+            "prompt": prompt,
+            "target_model": model,
+            "effort": effort,
+            "task_kind": "consult",
+            "token_budget": min(2000, max(500, DECISION_BRIEF_MAX_TOKENS)),
+            "include_context_pack": False,
+            "include_task_contract": False,
+            "max_response_chars": response_chars,
+            "_decision_internal_token": _DECISION_INTERNAL_TOKEN,
+        }
+        if family == "claude" and effort in {"xhigh", "max"}:
+            call_args["async"] = True
+            call_args["new_chat"] = True
+        if family == "codex" and truthy(args.get("outbound_reviewed")):
+            call_args["outbound_reviewed"] = True
+        try:
+            raw = consult(family, call_args)
+        except Exception as exc:  # noqa: BLE001
+            raw = {"status": "error", "response": f"{type(exc).__name__}: {exc}"}
+        failure, should_latch = _decision_failure(raw)
+        raw_status = normalize_lookup(raw.get("status"))
+        if failure:
+            status = failure
+        elif raw_status in {"pending", "queued", "running"} or raw.get("async"):
+            status = "pending"
+        else:
+            status = "completed"
+        actual_model = raw.get("actual_model") or raw.get("responder_model")
+        attested = raw.get("model_attested")
+        entry: dict[str, Any] = {
+            "target": family,
+            "resolved_model": model,
+            "requested_effort": effort,
+            "effective_effort": raw.get("actual_effort") or raw.get("effort"),
+            "attestation": "verified" if attested is True else ("unverified" if attested is False else "pending"),
+            "status": status,
+        }
+        if actual_model:
+            entry["actual_model"] = actual_model
+        request_id = raw.get("request_id") or raw.get("id")
+        if request_id:
+            entry["request_id"] = request_id
+        if status == "completed":
+            entry["advice"] = str(raw.get("response") or "")[:response_chars]
+        elif status == "pending":
+            entry["poll"] = raw.get("poll") or {
+                "tool": "request_result",
+                "request_id": request_id,
+                "wait_seconds": 180,
+            }
+        else:
+            error = str(raw.get("response") or raw.get("error") or status)
+            entry["error"] = error[:600]
+            notice = f"Skipped or failed {family}:{model} ({status}); include this in the final handoff."
+            notices.append(notice)
+            if should_latch:
+                _FLAGSHIP_AVAILABILITY_LATCHES[(session_key, family)] = {
+                    "status": status,
+                    "reason": error[:240],
+                    "created_at": utc_now(),
+                }
+        consultations.append(entry)
+
+    statuses = [item["status"] for item in consultations]
+    if statuses and all(status == "completed" for status in statuses):
+        overall = "complete"
+    elif "pending" in statuses:
+        overall = "pending"
+    elif "completed" in statuses:
+        overall = "partial"
+    elif statuses and all(status.startswith("skipped_") for status in statuses):
+        overall = "unavailable"
+    else:
+        overall = "failed"
+    result: dict[str, Any] = {
+        "status": overall,
+        "policy_version": DECISION_POLICY_VERSION,
+        "work_package_id": package_id,
+        "host": {"vendor": host_family, "model": host_model},
+        "complexity": complexity,
+        "complexity_escalated": complexity_escalated,
+        "consultations": consultations,
+        "handoff_notices": list(dict.fromkeys(notices)),
+        "completion_notice": (
+            "Report every handoff_notices item in the final response."
+            if notices
+            else "No flagship consultation was skipped."
+        ),
+        "authoritative": False,
+        "decision_owner": "host",
+    }
+    try:
+        event = record_agent_event(
+            args.get("project"),
+            args.get("topic"),
+            "agent-switchboard",
+            "flagship_consultation",
+            f"{package_id}: {overall} ({', '.join(statuses) or 'no targets'})",
+            json.dumps(
+                {
+                    "host": result["host"],
+                    "complexity": complexity,
+                    "targets": [
+                        {key: item.get(key) for key in ("target", "resolved_model", "status", "request_id")}
+                        for item in consultations
+                    ],
+                    "handoff_notices": result["handoff_notices"],
+                },
+                ensure_ascii=False,
+            ),
+        )
+        result["ledger_ref"] = f"event:{event.get('id')}"
+    except Exception as exc:  # noqa: BLE001
+        result["ledger_ref"] = None
+        result["ledger_warning"] = f"Could not record consultation event: {type(exc).__name__}"
+    _cap_decision_result(result)
+    return result
 
 
 def get_history(
@@ -8298,7 +8815,7 @@ def request_result(request_id: str, wait_seconds: Any = None) -> dict[str, Any]:
         )
         effort_label = str(row.get("effort") or "")
         if table == "codex_requests" and (effort_label in {"top", "max", "xhigh"} or "max" in str(row.get("target_model") or "")):
-            pending_note += "Max/xhigh-effort Sol consults typically take 5-15 minutes — this is normal, not a hang. "
+            pending_note += "Max/xhigh-effort Codex frontier consults can take several minutes — this is normal, not a hang. "
         pending_note += f'Call request_result(request_id="{rid}", wait_seconds=180) to wait for it.'
     return {
         "id": rid,
@@ -9449,6 +9966,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "workspace_root": args.get("workspace_root"),
                 "acceptance_criteria": args.get("acceptance_criteria"),
                 "forbidden_actions": args.get("forbidden_actions"),
+                "research_questions": args.get("research_questions"),
             },
         )
         result["route"] = "antigravity_cli"
@@ -9490,6 +10008,72 @@ TOOLS = [
                 "root_path": {"type": "string"},
             },
             "required": ["name", "root_path"],
+        },
+    },
+    {
+        "name": "consult_decision",
+        "description": "Send one bounded architecture/decision brief to the progressive flagship tier. Sol-or-lower Codex hosts use Astra plus Fable for architecture/critical work; Opus-or-lower Claude hosts use Fable plus Astra; Gemini hosts use both. Effort scales high/xhigh/max. Flash is never used as a decision substitute. Skips and quota/unavailability notices are returned for the final handoff.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "topic": {"type": "string"},
+                "session_id": {"type": "string", "description": "Optional main-session key for provider availability latches."},
+                "work_package_id": {"type": "string", "maxLength": 100},
+                "host": {
+                    "type": "object",
+                    "properties": {
+                        "vendor": {"type": "string", "enum": ["codex", "claude", "gemini", "antigravity"]},
+                        "model": {"type": "string"},
+                    },
+                    "required": ["vendor", "model"],
+                    "additionalProperties": False,
+                },
+                "complexity": {"type": "string", "enum": ["bounded", "architecture", "critical"]},
+                "risk_flags": {
+                    "type": "array",
+                    "maxItems": 8,
+                    "items": {"type": "string", "maxLength": 80},
+                    "description": "Security/auth/payment/data-loss/migration/irreversible flags raise the request to critical/max.",
+                },
+                "brief": {
+                    "type": "object",
+                    "properties": {
+                        "decision": {"type": "string", "maxLength": 2000},
+                        "constraints": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 500}},
+                        "options": {
+                            "type": "array", "maxItems": 4,
+                            "items": {
+                                "type": "object",
+                                "properties": {"id": {"type": "string", "maxLength": 80}, "summary": {"type": "string", "maxLength": 1000}},
+                                "required": ["id", "summary"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "proposed_choice": {"type": "string", "maxLength": 500},
+                        "questions": {"type": "array", "maxItems": 3, "items": {"type": "string", "maxLength": 500}},
+                        "evidence": {
+                            "type": "array", "maxItems": 8,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "ref": {"type": "string", "maxLength": 500},
+                                    "claim": {"type": "string", "maxLength": 500},
+                                    "excerpt": {"type": "string", "maxLength": 1200},
+                                },
+                                "required": ["ref", "claim"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "uncertainties": {"type": "array", "maxItems": 6, "items": {"type": "string", "maxLength": 500}},
+                    },
+                    "required": ["decision"],
+                    "additionalProperties": False,
+                },
+                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 3000},
+                "outbound_reviewed": {"type": "boolean"},
+            },
+            "required": ["work_package_id", "host", "complexity", "brief"],
         },
     },
     {
@@ -9684,7 +10268,7 @@ TOOLS = [
                 "project": {"type": "string"},
                 "topic": {"type": "string"},
                 "target_agent": {"type": "string"},
-                "target_model": {"type": "string", "description": "Model only (e.g. 'opus', 'gpt-5.6-sol', or 'gemini flash'). Bare Antigravity/'gemini flash' moves to the latest stable Flash High; a versioned agy slug pins exactly. Keep reasoning effort in the effort field."},
+                "target_model": {"type": "string", "description": "Model only (e.g. 'fable', 'gpt-6-astra', or 'gemini flash'). Bare Antigravity/'gemini flash' moves to the latest stable Flash High; a versioned agy slug pins exactly. Keep reasoning effort in the effort field."},
                 "effort": {"type": "string", "description": "Reasoning effort for CLI surfaces. Codex: minimal|low|medium|high|xhigh|max; Claude: low|medium|high|xhigh|max; Antigravity: low|medium|high."},
                 "target_host": {
                     "type": "string",
@@ -10232,6 +10816,7 @@ TOOLS = [
 
 
 CLAUDE_LITE_TOOL_NAMES = {
+    "consult_decision",
     "consult_codex",
     "consult_antigravity",
     "consult_gemini",
@@ -10301,6 +10886,7 @@ TOOL_DESCRIPTION_OVERRIDES = {
 }
 
 COMPACT_TOOL_DESCRIPTIONS = {
+    "consult_decision": "Bounded progressive flagship advice: Astra/Fable targets, high/xhigh/max effort, durable skip notices; Flash is excluded.",
     "consult_codex": "Cross-vendor Codex consultation; same-vendor fallback requires native_unavailable_reason.",
     "consult_claude": "Cross-vendor Claude consultation; same-vendor fallback requires native_unavailable_reason.",
     "consult_antigravity": "Low-level compatibility/diagnostic route. Research requires 1-3 exact research_questions. For Flash labour, call route_agent_task with surface=cli; never invoke agy directly.",
@@ -11681,6 +12267,8 @@ def latest_context_snapshots_section(project_info: "ProjectInfo", topic: str | N
 def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "register_project":
         return text_content(register_project(str(args.get("name") or ""), str(args.get("root_path") or "")))
+    if name == "consult_decision":
+        return text_content(consult_decision(args))
     if name == "consult_codex":
         return text_content(consult("codex", args))
     if name == "consult_claude":

@@ -480,6 +480,7 @@ Get-Process -ErrorAction SilentlyContinue |
             capture_output=True,
             timeout=8,
             check=False,
+            creationflags=WINDOWS_NO_WINDOW,
         )
     except Exception:  # noqa: BLE001
         return []
@@ -646,6 +647,7 @@ def claude_desktop_installed() -> bool:
                     [ps, "-NoProfile", "-Command",
                      "if (Get-AppxPackage -Name '*Claude*') { 'yes' } else { 'no' }"],
                     text=True, capture_output=True, timeout=8, check=False,
+                    creationflags=WINDOWS_NO_WINDOW,
                 )
                 if "yes" in (proc.stdout or "").lower():
                     return True
@@ -992,7 +994,8 @@ def install_bridge(host_cli: str, dry: bool) -> str:
         return f"would run {cli} --install-extension {vsix.name}"
     try:
         subprocess.run([cli, "--install-extension", str(vsix), "--force"],
-                       capture_output=True, text=True, timeout=120, check=False)
+                       capture_output=True, text=True, timeout=120, check=False,
+                       creationflags=WINDOWS_NO_WINDOW)
         return f"installed {vsix.name}"
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: {exc}"
@@ -1006,7 +1009,8 @@ def uninstall_bridge(host_cli: str, dry: bool) -> str:
         return f"would run {cli} --uninstall-extension {BRIDGE_EXTENSION_ID}"
     try:
         proc = subprocess.run([cli, "--uninstall-extension", BRIDGE_EXTENSION_ID],
-                              capture_output=True, text=True, timeout=120, check=False)
+                              capture_output=True, text=True, timeout=120, check=False,
+                              creationflags=WINDOWS_NO_WINDOW)
         out = (proc.stdout + proc.stderr).lower()
         if "not installed" in out or "is not installed" in out:
             return "not installed"
@@ -1029,9 +1033,10 @@ def _discover_hierarchy_roles() -> tuple[dict, dict]:
                 errors="replace",
                 timeout=25,
                 check=False,
+                creationflags=WINDOWS_NO_WINDOW,
             )
             data = json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout else {}
-            selected = model_roles.select_codex_roles(data)
+            selected = model_roles.select_codex_roles(model_roles.seed_codex_frontier(data))
             codex_roles = {
                 "frontier": selected.frontier,
                 "workhorse": selected.workhorse,
@@ -1325,7 +1330,8 @@ def setup_debug_port(dry: bool) -> str:
         return f"ERROR copying debug scripts to {BROKER_HOME}: {exc}"
     try:
         subprocess.run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(durable_enable)],
-                       capture_output=True, text=True, timeout=60, check=False)
+                       capture_output=True, text=True, timeout=60, check=False,
+                       creationflags=WINDOWS_NO_WINDOW)
         return "patched shortcuts (port 9000); debug scripts installed to ~/.agent-broker"
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: {exc}"

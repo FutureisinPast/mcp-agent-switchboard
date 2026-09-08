@@ -65,6 +65,18 @@ class DynamicCodexRoleTests(unittest.TestCase):
         self.assertEqual(cheap[:2], ("gpt-8-reader", broker.CODEX_CHEAP_EFFORT))
         self.assertEqual(balanced[:2], ("gpt-8-worker", "medium"))
 
+    def test_astra_seed_outranks_sol_but_future_live_frontier_wins(self):
+        seeded = broker.model_roles.seed_codex_frontier(
+            {"models": [{"id": "gpt-5.6-sol", "priority": 6, "visibility": "list"}]}
+        )
+        roles = broker.model_roles.select_codex_roles(seeded)
+        self.assertEqual(roles.frontier["id"], "gpt-6-astra")
+        seeded["models"].append(
+            {"id": "gpt-7-future", "priority": 4, "visibility": "list"}
+        )
+        roles = broker.model_roles.select_codex_roles(seeded)
+        self.assertEqual(roles.frontier["id"], "gpt-7-future")
+
 
 class DynamicAntigravityRoleTests(unittest.TestCase):
     @staticmethod
@@ -101,6 +113,8 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
              mock.patch.object(broker, "_ANTIGRAVITY_MODEL_CACHE_AT", 0.0), \
              mock.patch.object(broker, "load_config", return_value={}), \
              mock.patch.object(broker, "discover_antigravity_cli", return_value="agy"), \
+             mock.patch.object(broker, "_should_probe_antigravity_models", return_value=True), \
+             mock.patch.object(broker, "_load_antigravity_catalog", return_value=[]), \
              mock.patch.object(broker.subprocess, "run", return_value=proc), \
              mock.patch.object(broker.shutil, "which", return_value=None):
             models = broker.discover_antigravity_models()
@@ -316,6 +330,45 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at most 500"):
             self._research_package("x" * 501)
 
+    def test_research_accepts_mcp_iterable_proxy_and_json_array_string(self):
+        class ArrayProxy:
+            def __iter__(self):
+                return iter(["Q1", "Q2"])
+
+        proxied = broker.prepare_flash_work_package(
+            {"research_questions": ArrayProxy()}, "research", "Research."
+        )
+        encoded = broker.prepare_flash_work_package(
+            {"research_questions": '["Q1","Q2"]'}, "research", "Research."
+        )
+        self.assertEqual(proxied["research_questions"], ["Q1", "Q2"])
+        self.assertEqual(encoded["research_questions"], ["Q1", "Q2"])
+
+    def test_route_agent_task_forwards_research_questions_to_flash_consult(self):
+        resolved = {
+            "status": "resolved",
+            "target_agent": "antigravity_cli",
+            "target_model": "gemini-3.8-flash-high",
+            "effort": "high",
+            "source": "explicit_request",
+        }
+        args = {
+            "prompt": "Investigate the bounded questions.",
+            "target_agent": "antigravity",
+            "surface": "cli",
+            "target_model": "gemini flash",
+            "effort": "high",
+            "mode": "plan",
+            "task_kind": "research",
+            "research_questions": ["Q1", "Q2"],
+        }
+        with mock.patch.object(broker, "resolve_model_request", return_value=resolved), \
+             mock.patch.object(broker, "consult", return_value={"status": "ok"}) as consult, \
+             mock.patch.object(broker, "prompt_budget_notice", return_value=None):
+            broker.route_agent_task(args)
+        forwarded = consult.call_args.args[1]
+        self.assertEqual(forwarded["research_questions"], ["Q1", "Q2"])
+
     def test_search_alias_and_nonresearch_backward_compatibility(self):
         self.assertEqual(broker.normalize_task_kind("search"), "research")
         package = broker.prepare_flash_work_package(
@@ -351,13 +404,118 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
             self.assertIn("search", properties["task_kind"]["enum"])
             self.assertEqual(properties["research_questions"]["maxItems"], 3)
         rules = " ".join(broker.COST_AWARE_ROUTING_RULES)
-        self.assertIn("do not retry Fable or Opus in that session", rules)
-        self.assertIn("new main session", rules)
+        self.assertIn("call consult_decision with one structured bounded brief", rules)
+        self.assertIn("never substitute Flash for flagship judgment", rules)
         self.assertIn("Every factual investigation sent to Flash MUST use task_kind=research", rules)
         self.assertIn("beyond the first match", rules)
         self.assertIn("NOT FOUND with searched boundaries", rules)
         self.assertIn("in-app/extension surface is retired", rules)
         self.assertIn("needs_model_selection", rules)
+
+
+class ProgressiveDecisionConsultTests(unittest.TestCase):
+    _flash_package = staticmethod(DynamicAntigravityRoleTests._flash_package)
+    _flash_output = staticmethod(DynamicAntigravityRoleTests._flash_output)
+    _research_package = staticmethod(DynamicAntigravityRoleTests._research_package)
+    _research_evidence = staticmethod(DynamicAntigravityRoleTests._research_evidence)
+    _research_outer = DynamicAntigravityRoleTests._research_outer
+
+    def setUp(self):
+        broker._FLAGSHIP_AVAILABILITY_LATCHES.clear()
+
+    @staticmethod
+    def _args(vendor: str, model: str, complexity: str = "architecture", **extra):
+        return {
+            "project": "p",
+            "topic": "decision-tests",
+            "session_id": "session-1",
+            "work_package_id": "WP-DECISION-1",
+            "host": {"vendor": vendor, "model": model},
+            "complexity": complexity,
+            "brief": {
+                "decision": "Choose a routing design.",
+                "constraints": ["Preserve compatibility."],
+                "options": [{"id": "A", "summary": "Add one orchestrator."}],
+                "questions": ["Is A the safest option?"],
+                "evidence": [{"ref": "router.py:10", "claim": "The old route is fixed."}],
+            },
+            **extra,
+        }
+
+    @staticmethod
+    def _ok_consult(family, args):
+        actual = "gpt-6-astra" if family == "codex" else "claude-fable-5"
+        return {
+            "status": "ok",
+            "response": '{"recommendation":"A"}',
+            "effort": args["effort"],
+            "actual_effort": args["effort"],
+            "actual_model": actual,
+            "model_attested": True,
+        }
+
+    def _run(self, args, side_effect=None):
+        with mock.patch.object(broker, "_MCP_CLIENT_NAME", ""), \
+             mock.patch.object(broker, "current_codex_role_model", return_value="gpt-6-astra"), \
+             mock.patch.object(broker, "consult", side_effect=side_effect or self._ok_consult) as consult, \
+             mock.patch.object(broker, "record_agent_event", return_value={"id": 17}):
+            return broker.consult_decision(args), consult
+
+    def test_sol_architecture_uses_astra_and_fable_at_xhigh(self):
+        result, consult = self._run(self._args("codex", "gpt-5.6-sol"))
+        self.assertEqual([item["resolved_model"] for item in result["consultations"]], ["gpt-6-astra", "fable"])
+        self.assertEqual([call.args[0] for call in consult.call_args_list], ["codex", "claude"])
+        self.assertTrue(all(call.args[1]["effort"] == "xhigh" for call in consult.call_args_list))
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["ledger_ref"], "event:17")
+
+    def test_flagship_hosts_are_not_sent_to_themselves(self):
+        astra, astra_consult = self._run(self._args("codex", "gpt-6-astra"))
+        fable, fable_consult = self._run(self._args("claude", "claude-fable-5"))
+        self.assertEqual([call.args[0] for call in astra_consult.call_args_list], ["claude"])
+        self.assertEqual([call.args[0] for call in fable_consult.call_args_list], ["codex"])
+        self.assertEqual(astra["consultations"][0]["resolved_model"], "fable")
+        self.assertEqual(fable["consultations"][0]["resolved_model"], "gpt-6-astra")
+
+    def test_bounded_opus_uses_only_fable_and_gemini_uses_both(self):
+        _, opus_consult = self._run(self._args("claude", "opus", "bounded"))
+        _, gemini_consult = self._run(self._args("gemini", "gemini-3.8-flash-high", "bounded"))
+        self.assertEqual([call.args[0] for call in opus_consult.call_args_list], ["claude"])
+        self.assertEqual([call.args[0] for call in gemini_consult.call_args_list], ["codex", "claude"])
+
+    def test_risk_flag_raises_effort_to_max(self):
+        result, consult = self._run(
+            self._args("codex", "gpt-5.6-sol", "bounded", risk_flags=["migration"])
+        )
+        self.assertEqual(result["complexity"], "critical")
+        self.assertTrue(result["complexity_escalated"])
+        self.assertTrue(all(call.args[1]["effort"] == "max" for call in consult.call_args_list))
+
+    def test_quota_failure_is_latched_and_returned_as_handoff_notice(self):
+        calls = []
+
+        def outcome(family, args):
+            calls.append(family)
+            if family == "codex":
+                return {"status": "error", "response": "Usage quota exceeded"}
+            return self._ok_consult(family, args)
+
+        first, _ = self._run(self._args("gemini", "gemini-3.8-flash-high"), outcome)
+        second, _ = self._run(self._args("gemini", "gemini-3.8-flash-high"), outcome)
+        self.assertEqual(calls, ["codex", "claude", "claude"])
+        self.assertEqual(first["consultations"][0]["status"], "skipped_quota")
+        self.assertEqual(second["consultations"][0]["attestation"], "not_run")
+        self.assertTrue(first["handoff_notices"])
+
+    def test_unicode_excerpt_budget_is_enforced_before_dispatch(self):
+        args = self._args("codex", "gpt-5.6-sol")
+        args["brief"]["evidence"] = [
+            {"ref": f"r{i}", "claim": "c", "excerpt": "é" * 1100} for i in range(4)
+        ]
+        with mock.patch.object(broker, "consult") as consult:
+            with self.assertRaisesRegex(ValueError, "evidence excerpts use"):
+                broker.consult_decision(args)
+        consult.assert_not_called()
 
     def test_research_coverage_omission_reordering_and_substitution_reject(self):
         package = self._research_package("Q1", "Q2")
