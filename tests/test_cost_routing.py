@@ -197,6 +197,14 @@ class DiscoverCodexOrderTests(unittest.TestCase):
                 result = broker.discover_codex({"codex_path": str(configured)})
             self.assertEqual(result, str(configured))
 
+    def test_consult_codex_selects_cli_for_the_requested_model(self):
+        config = {"codex_path": "configured-codex.exe"}
+        with mock.patch.object(broker, "load_config", return_value=config), \
+             mock.patch.object(broker, "discover_codex", return_value=None) as discover:
+            result = broker.consult_codex(None, "bounded prompt", model_name="gpt-6-astra")
+        discover.assert_called_once_with(config, required_model="gpt-6-astra")
+        self.assertIn("Codex CLI was not found", result.response)
+
     def test_marker_wins_over_mocked_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -229,6 +237,57 @@ class DiscoverCodexOrderTests(unittest.TestCase):
                 os.environ.pop("CODEX_PATH", None)
                 result = broker.discover_codex({})
             self.assertEqual(result, str(path_codex))
+
+    def test_requested_model_selects_capable_path_cli_over_older_configured_cli(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            home = tmp / "home"
+            home.mkdir()
+            configured = tmp / "old-codex.exe"
+            path_codex = tmp / "new-codex.exe"
+            configured.write_text("stub", encoding="utf-8")
+            path_codex.write_text("stub", encoding="utf-8")
+
+            def models(command, **_kwargs):
+                slug = "gpt-5.6-sol" if command[0] == str(configured) else "gpt-6-astra"
+                return {"models": [{"slug": slug}]}
+
+            with mock.patch.object(Path, "home", return_value=home), \
+                 mock.patch.object(broker.shutil, "which", return_value=str(path_codex)), \
+                 mock.patch.object(broker, "run_json_command", side_effect=models) as debug_models, \
+                 mock.patch.dict(os.environ, {"LOCALAPPDATA": str(tmp / "local")}, clear=False):
+                os.environ.pop("CODEX_PATH", None)
+                result = broker.discover_codex(
+                    {"codex_path": str(configured)}, required_model="gpt-6-astra"
+                )
+            self.assertEqual(result, str(path_codex))
+            self.assertEqual(
+                [call.args[0][0] for call in debug_models.call_args_list],
+                [str(configured), str(path_codex)],
+            )
+
+    def test_requested_model_falls_back_deterministically_when_none_advertise_it(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            home = tmp / "home"
+            home.mkdir()
+            configured = tmp / "configured-codex.exe"
+            path_codex = tmp / "path-codex.exe"
+            configured.write_text("stub", encoding="utf-8")
+            path_codex.write_text("stub", encoding="utf-8")
+            with mock.patch.object(Path, "home", return_value=home), \
+                 mock.patch.object(broker.shutil, "which", return_value=str(path_codex)), \
+                 mock.patch.object(
+                     broker,
+                     "run_json_command",
+                     return_value={"models": [{"slug": "gpt-5.6-sol"}]},
+                 ), \
+                 mock.patch.dict(os.environ, {"LOCALAPPDATA": str(tmp / "local")}, clear=False):
+                os.environ.pop("CODEX_PATH", None)
+                result = broker.discover_codex(
+                    {"codex_path": str(configured)}, required_model="gpt-6-astra"
+                )
+            self.assertEqual(result, str(configured))
 
 
 class ResolveCodexPathTests(unittest.TestCase):
@@ -337,7 +396,9 @@ class RoutingContractStringsTests(unittest.TestCase):
         self.assertIn("newer gemini flash remains a non-authoritative labour workhorse", text)
         self.assertIn("never becomes an astra/fable decision consultant", text)
         self.assertIn("consult_decision", text)
-        self.assertIn("astra plus fable", text)
+        self.assertIn("codex uses native astra and claude uses native fable", text)
+        self.assertIn("architecture/critical work adds only the opposite-vendor adviser", text)
+        self.assertIn("must never replace this with a nested same-vendor cli call", text)
         self.assertIn("never substitute flash for flagship judgment", text)
 
     def test_global_rules_define_proactive_external_flash_workhorse_lane(self):

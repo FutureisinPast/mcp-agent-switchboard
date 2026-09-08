@@ -404,7 +404,9 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
             self.assertIn("search", properties["task_kind"]["enum"])
             self.assertEqual(properties["research_questions"]["maxItems"], 3)
         rules = " ".join(broker.COST_AWARE_ROUTING_RULES)
-        self.assertIn("call consult_decision with one structured bounded brief", rules)
+        self.assertIn("native child-agent mechanism", rules)
+        self.assertIn("compact native result to consult_decision", rules)
+        self.assertIn("must never replace this with a nested same-vendor CLI call", rules)
         self.assertIn("never substitute Flash for flagship judgment", rules)
         self.assertIn("Every factual investigation sent to Flash MUST use task_kind=research", rules)
         self.assertIn("beyond the first match", rules)
@@ -454,6 +456,17 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
             "model_attested": True,
         }
 
+    @staticmethod
+    def _native(family: str, status: str = "completed"):
+        return {
+            "family": family,
+            "model": "gpt-6-astra" if family == "codex" else "claude-fable-5",
+            "status": status,
+            "attestation": "verified",
+            "agent_id": "native-17",
+            "summary": "Use option A." if status == "completed" else "Native provider unavailable.",
+        }
+
     def _run(self, args, side_effect=None):
         with mock.patch.object(broker, "_MCP_CLIENT_NAME", ""), \
              mock.patch.object(broker, "current_codex_role_model", return_value="gpt-6-astra"), \
@@ -461,10 +474,30 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
              mock.patch.object(broker, "record_agent_event", return_value={"id": 17}):
             return broker.consult_decision(args), consult
 
-    def test_sol_architecture_uses_astra_and_fable_at_xhigh(self):
+    def test_missing_native_descriptor_returns_request_without_dispatch(self):
         result, consult = self._run(self._args("codex", "gpt-5.6-sol"))
+        self.assertEqual(result["status"], "needs_native_consultation")
+        self.assertEqual(result["native_request"]["model"], "gpt-6-astra")
+        self.assertEqual(result["native_request"]["effort"], "xhigh")
+        self.assertEqual(result["native_request"]["lane"], "native_same_vendor")
+        self.assertEqual(result["native_request"]["return_contract"]["family"], "codex")
+        self.assertIn("at most", result["native_request"]["return_contract"]["summary"])
+        consult.assert_not_called()
+
+    def test_sol_architecture_uses_native_astra_then_cross_vendor_fable(self):
+        result, consult = self._run(
+            self._args(
+                "codex",
+                "gpt-5.6-sol",
+                native_consultation=self._native("codex"),
+            )
+        )
         self.assertEqual([item["resolved_model"] for item in result["consultations"]], ["gpt-6-astra", "fable"])
-        self.assertEqual([call.args[0] for call in consult.call_args_list], ["codex", "claude"])
+        self.assertEqual(
+            [item["lane"] for item in result["consultations"]],
+            ["native_same_vendor", "switchboard_cross_vendor"],
+        )
+        self.assertEqual([call.args[0] for call in consult.call_args_list], ["claude"])
         self.assertTrue(all(call.args[1]["effort"] == "xhigh" for call in consult.call_args_list))
         self.assertEqual(result["status"], "complete")
         self.assertEqual(result["ledger_ref"], "event:17")
@@ -477,19 +510,89 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         self.assertEqual(astra["consultations"][0]["resolved_model"], "fable")
         self.assertEqual(fable["consultations"][0]["resolved_model"], "gpt-6-astra")
 
-    def test_bounded_opus_uses_only_fable_and_gemini_uses_both(self):
-        _, opus_consult = self._run(self._args("claude", "opus", "bounded"))
+    def test_bounded_opus_uses_only_native_fable_and_gemini_uses_both(self):
+        opus, opus_consult = self._run(
+            self._args(
+                "claude",
+                "opus",
+                "bounded",
+                native_consultation=self._native("claude"),
+            )
+        )
         _, gemini_consult = self._run(self._args("gemini", "gemini-3.8-flash-high", "bounded"))
-        self.assertEqual([call.args[0] for call in opus_consult.call_args_list], ["claude"])
+        opus_consult.assert_not_called()
+        self.assertEqual([item["lane"] for item in opus["consultations"]], ["native_same_vendor"])
         self.assertEqual([call.args[0] for call in gemini_consult.call_args_list], ["codex", "claude"])
 
     def test_risk_flag_raises_effort_to_max(self):
         result, consult = self._run(
-            self._args("codex", "gpt-5.6-sol", "bounded", risk_flags=["migration"])
+            self._args(
+                "codex",
+                "gpt-5.6-sol",
+                "bounded",
+                risk_flags=["migration"],
+                native_consultation=self._native("codex"),
+            )
         )
         self.assertEqual(result["complexity"], "critical")
         self.assertTrue(result["complexity_escalated"])
         self.assertTrue(all(call.args[1]["effort"] == "max" for call in consult.call_args_list))
+
+    def test_native_unavailable_is_not_retried_through_switchboard(self):
+        result, consult = self._run(
+            self._args(
+                "codex",
+                "gpt-5.6-sol",
+                "bounded",
+                native_consultation=self._native("codex", "unavailable"),
+            )
+        )
+        consult.assert_not_called()
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["consultations"][0]["lane"], "native_same_vendor")
+        self.assertTrue(result["handoff_notices"])
+
+    def test_native_failure_still_allows_only_opposite_vendor_architecture_consult(self):
+        result, consult = self._run(
+            self._args(
+                "codex",
+                "gpt-5.6-sol",
+                native_consultation=self._native("codex", "failed"),
+            )
+        )
+        self.assertEqual([call.args[0] for call in consult.call_args_list], ["claude"])
+        self.assertEqual(result["status"], "partial")
+        self.assertTrue(result["handoff_notices"])
+
+    def test_completed_native_descriptor_requires_bounded_summary(self):
+        native = self._native("codex")
+        native["summary"] = ""
+        with self.assertRaisesRegex(ValueError, "nonempty summary"):
+            self._run(
+                self._args(
+                    "codex",
+                    "gpt-5.6-sol",
+                    native_consultation=native,
+                )
+            )
+
+    def test_ledger_metadata_distinguishes_native_and_cross_vendor_lanes(self):
+        with mock.patch.object(broker, "_MCP_CLIENT_NAME", ""), \
+             mock.patch.object(broker, "current_codex_role_model", return_value="gpt-6-astra"), \
+             mock.patch.object(broker, "consult", side_effect=self._ok_consult), \
+             mock.patch.object(broker, "record_agent_event", return_value={"id": 18}) as record:
+            broker.consult_decision(
+                self._args(
+                    "codex",
+                    "gpt-5.6-sol",
+                    native_consultation=self._native("codex"),
+                )
+            )
+        metadata = json.loads(record.call_args.args[5])
+        self.assertEqual(
+            [item["lane"] for item in metadata["targets"]],
+            ["native_same_vendor", "switchboard_cross_vendor"],
+        )
 
     def test_quota_failure_is_latched_and_returned_as_handoff_notice(self):
         calls = []

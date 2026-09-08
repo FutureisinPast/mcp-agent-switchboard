@@ -189,7 +189,7 @@ CODEX_SERIOUS_TASK_KINDS = {
     "implementation",
 }
 
-DECISION_POLICY_VERSION = "2026-09-08"
+DECISION_POLICY_VERSION = "2026-09-08-native-v2"
 DECISION_COMPLEXITY_EFFORT = {
     "bounded": "high",
     "architecture": "xhigh",
@@ -608,8 +608,8 @@ GENERIC_GROUND_RULES = [
 
 COST_AWARE_ROUTING_RULES = [
     "The model selected for the main session is the brain; never rewrite that user choice. It owns requirements, architecture, planning, hard diagnosis, risk decisions, and final signoff.",
-    "For important architecture, compatibility, or hard decisions, call consult_decision with one structured bounded brief. It progressively selects Astra and/or Fable from the host/model matrix and maps bounded/architecture/critical complexity to high/xhigh/max effort.",
-    "A Codex Sol-or-lower host consults Astra for bounded decisions and Astra plus Fable for architecture/critical work; an Astra host consults Fable. A Claude Opus-or-lower host consults Fable for bounded decisions and Fable plus Astra for architecture/critical work; a Fable host consults Astra. A Gemini host consults both Astra and Fable.",
+    "For important architecture, compatibility, or hard decisions, the initiating Codex or Claude host first sends one structured bounded brief to its same-vendor flagship through its native child-agent mechanism. Codex uses native Astra and Claude uses native Fable; the Switchboard process must never replace this with a nested same-vendor CLI call.",
+    "Pass the compact native result to consult_decision as native_consultation. Bounded work ends after that native result; architecture/critical work adds only the opposite-vendor adviser through Switchboard. A missing native result returns needs_native_consultation without contacting a provider. Astra and Fable hosts consult the opposite vendor, while Gemini hosts consult both through Switchboard. Complexity maps to high/xhigh/max effort.",
     "Decision briefs are hard-capped: one decision, at most three questions, four options, eight evidence refs, 4,000 excerpt bytes, 12,000 total UTF-8 bytes, and about 3,000 tokens. Send summaries, precise excerpts, and immutable refs -- never whole files, articles, logs, or chat histories.",
     "Flagship availability and quota failures are isolated. Continue with available targets, never substitute Flash for flagship judgment, and include every consult_decision handoff_notices item in the final response.",
     "Capability tier outranks model version: a newer Gemini Flash remains a non-authoritative labour workhorse and never becomes an Astra/Fable decision consultant.",
@@ -1610,10 +1610,32 @@ def write_app_handoff_file(
     return {"files": files, "clipboard": copy_to_clipboard(body)}
 
 
-def discover_codex(config: dict[str, Any]) -> str | None:
+def discover_codex_candidates(config: dict[str, Any]) -> list[str]:
+    """Return eligible Codex CLIs in stable preference order, without duplicates."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(candidate: Any) -> None:
+        value = str(candidate or "").strip()
+        if not value:
+            return
+        path = Path(value)
+        try:
+            exists = path.is_file()
+        except OSError:
+            exists = False
+        if not exists:
+            return
+        try:
+            key = os.path.normcase(str(path.resolve()))
+        except OSError:
+            key = os.path.normcase(str(path.absolute()))
+        if key not in seen:
+            candidates.append(value)
+            seen.add(key)
+
     configured = config.get("codex_path") or os.environ.get("CODEX_PATH")
-    if configured and Path(str(configured)).exists():
-        return str(configured)
+    add(configured)
     codex_home = Path.home() / ".codex" / "config.toml"
     if codex_home.exists():
         text = codex_home.read_text(encoding="utf-8", errors="ignore")
@@ -1626,13 +1648,39 @@ def discover_codex(config: dict[str, Any]) -> str | None:
                 end = tail.find(quote, start + 1) if start >= 0 else -1
                 if start >= 0 and end > start:
                     candidate = tail[start + 1 : end]
-                    if Path(candidate).exists():
-                        return candidate
+                    add(candidate)
     for name in ("codex", "codex.exe"):
-        found = shutil.which(name)
-        if found:
-            return found
-    return None
+        add(shutil.which(name))
+    local_appdata = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    bundled_root = local_appdata / "OpenAI" / "Codex" / "bin"
+    try:
+        for candidate in sorted(bundled_root.glob("*/codex.exe"), reverse=True):
+            add(candidate)
+    except OSError:
+        pass
+    return candidates
+
+
+def _codex_cli_advertises_model(codex: str, required_model: str) -> bool:
+    data = run_json_command([codex, "debug", "models"], timeout=25)
+    models = data.get("models", []) if isinstance(data, Mapping) else []
+    requested = normalize_lookup(required_model)
+    return any(
+        normalize_lookup(item.get("slug") or item.get("id") or "") == requested
+        for item in models
+        if isinstance(item, Mapping)
+    )
+
+
+def discover_codex(config: dict[str, Any], required_model: str | None = None) -> str | None:
+    candidates = discover_codex_candidates(config)
+    if not candidates:
+        return None
+    if required_model:
+        for candidate in candidates:
+            if _codex_cli_advertises_model(candidate, required_model):
+                return candidate
+    return candidates[0]
 
 
 def discover_antigravity_cli(config: dict[str, Any]) -> str | None:
@@ -2917,7 +2965,7 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
         "execution_precedence": [
             "Same-vendor bounded labour uses native subagents first: Codex explorer/worker or Claude Explore/economy-worker.",
             "Proactively consider the newest live Antigravity Gemini Flash High through Agent Switchboard/agy as a fast, cheap external workhorse; it is not a native child agent.",
-            "Use consult_decision for bounded progressive flagship advice on important architecture and decisions; never send whole files or articles.",
+            "For flagship decisions, Codex/Claude first use their native same-vendor child agent with a bounded brief, then pass its compact descriptor to consult_decision for any required cross-vendor leg; never send whole files or articles.",
             "Use a same-vendor broker worker only when the named native role is unavailable or failed to start, and record the fallback.",
         ],
         "defaults": {
@@ -2934,7 +2982,7 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                     "evidence_refs": 8,
                     "evidence_excerpt_bytes": DECISION_EVIDENCE_EXCERPT_MAX_BYTES,
                 },
-                "rule": "Codex Sol-or-lower and Claude Opus-or-lower hosts add their higher same-vendor flagship; architecture/critical work also uses the opposite-vendor flagship. Gemini hosts use Astra and Fable. Exact-host targets are removed, failures are isolated, and skips must be reported in the final handoff.",
+                "rule": "Codex Sol-or-lower and Claude Opus-or-lower hosts use their native child-agent mechanism for the higher same-vendor flagship and pass only its bounded descriptor to consult_decision. Architecture/critical work then uses only the opposite-vendor flagship through Switchboard. Gemini hosts use Astra and Fable through Switchboard. Exact-host targets are removed, failures are isolated, and skips must be reported in the final handoff.",
             },
             "consult_audit_review_debate": {
                 "target_agent": "codex",
@@ -5051,7 +5099,7 @@ def consult_codex(
     outbound_reviewed: bool = False,
 ) -> CodexConsultResult:
     config = load_config()
-    codex = discover_codex(config)
+    codex = discover_codex(config, required_model=model_name)
     if not codex:
         return CodexConsultResult(
             response=(
@@ -6591,12 +6639,10 @@ def decision_consult_targets(host_family: str, host_model: str, complexity: str)
     claude = {"family": "claude", "model": CLAUDE_FLAGSHIP_MODEL}
     if host_family == "gemini":
         candidates = [codex, claude]
-    elif complexity == "bounded":
-        same_vendor = codex if host_family == "codex" else claude
-        other_vendor = claude if host_family == "codex" else codex
-        candidates = [same_vendor, other_vendor]
+    elif host_family == "codex":
+        candidates = [claude]
     else:
-        candidates = [codex, claude]
+        candidates = [codex]
 
     selected: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -6608,11 +6654,71 @@ def decision_consult_targets(host_family: str, host_model: str, complexity: str)
             continue
         selected.append(candidate)
         seen.add(key)
-        # A bounded Codex/Claude decision needs one higher-level opinion. Prefer
-        # the same-vendor upgrade; use the peer only when the host is already it.
-        if complexity == "bounded" and host_family != "gemini":
-            break
     return selected
+
+
+def _decision_native_requirement(host_family: str, host_model: str) -> dict[str, str] | None:
+    if host_family == "codex":
+        model = current_codex_role_model("frontier")
+    elif host_family == "claude":
+        model = CLAUDE_FLAGSHIP_MODEL
+    else:
+        return None
+    if _decision_same_model(host_family, host_model, host_family, model):
+        return None
+    return {"family": host_family, "model": model}
+
+
+def _normalized_native_consultation(
+    value: Any, expected: Mapping[str, str], effort: str
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("native_consultation must be an object")
+    family = normalize_lookup(value.get("family"))
+    model = str(value.get("model") or "").strip()
+    status = normalize_lookup(value.get("status")).replace(" ", "_")
+    attestation = str(value.get("attestation") or "").strip()
+    summary = str(value.get("summary") or "").strip()
+    agent_id = str(value.get("agent_id") or "").strip()
+    if status not in {"completed", "unavailable", "failed"}:
+        raise ValueError("native_consultation.status must be completed, unavailable, or failed")
+    if family != expected["family"]:
+        raise ValueError(f"native_consultation.family must be {expected['family']}")
+    model_matches = (
+        codex_model_attested(expected["model"], model)
+        if family == "codex"
+        else claude_model_attested(expected["model"], model)
+    )
+    if not model_matches:
+        raise ValueError(f"native_consultation.model must attest {expected['model']}")
+    if not attestation or len(attestation) > 80:
+        raise ValueError("native_consultation.attestation is required and must be at most 80 characters")
+    if len(summary) > DECISION_ADVICE_MAX_CHARS:
+        raise ValueError(
+            f"native_consultation.summary must be at most {DECISION_ADVICE_MAX_CHARS} characters"
+        )
+    if status == "completed" and not summary:
+        raise ValueError("completed native_consultation requires a nonempty summary")
+    if len(agent_id) > 200:
+        raise ValueError("native_consultation.agent_id must be at most 200 characters")
+    entry: dict[str, Any] = {
+        "target": family,
+        "lane": "native_same_vendor",
+        "resolved_model": expected["model"],
+        "actual_model": model,
+        "requested_effort": effort,
+        "effective_effort": None,
+        "attestation": attestation,
+        "native_status": status,
+        "status": "skipped_unavailable" if status == "unavailable" else status,
+    }
+    if agent_id:
+        entry["agent_id"] = agent_id
+    if status == "completed":
+        entry["advice"] = summary
+    elif summary:
+        entry["error"] = summary
+    return entry
 
 
 def _decision_prompt(package_id: str, complexity: str, brief: dict[str, Any]) -> str:
@@ -6688,6 +6794,46 @@ def _cap_decision_result(result: dict[str, Any]) -> None:
                 item["error"] = error[:285].rstrip() + " ... [truncated]"
 
 
+def _record_decision_result(
+    args: Mapping[str, Any], result: dict[str, Any], statuses: list[str]
+) -> None:
+    try:
+        event = record_agent_event(
+            args.get("project"),
+            args.get("topic"),
+            "agent-switchboard",
+            "flagship_consultation",
+            f"{result['work_package_id']}: {result['status']} ({', '.join(statuses) or 'no targets'})",
+            json.dumps(
+                {
+                    "host": result["host"],
+                    "complexity": result["complexity"],
+                    "targets": [
+                        {
+                            key: item.get(key)
+                            for key in (
+                                "target",
+                                "lane",
+                                "resolved_model",
+                                "status",
+                                "request_id",
+                                "agent_id",
+                            )
+                        }
+                        for item in result.get("consultations") or []
+                    ],
+                    "native_request": result.get("native_request"),
+                    "handoff_notices": result["handoff_notices"],
+                },
+                ensure_ascii=False,
+            ),
+        )
+        result["ledger_ref"] = f"event:{event.get('id')}"
+    except Exception as exc:  # noqa: BLE001
+        result["ledger_ref"] = None
+        result["ledger_warning"] = f"Could not record consultation event: {type(exc).__name__}"
+
+
 def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
     """Consult the available flagship tier using one strictly bounded decision brief."""
     if os.environ.get("AGENT_BROKER_CHILD") == "1":
@@ -6724,9 +6870,61 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
     response_chars = max(800, min(response_chars, DECISION_ADVICE_MAX_CHARS))
 
     session_key = _decision_session_key(args, host_family)
+    native_expected = _decision_native_requirement(host_family, host_model)
+    native_value = args.get("native_consultation")
+    if native_expected and native_value is None:
+        result = {
+            "status": "needs_native_consultation",
+            "policy_version": DECISION_POLICY_VERSION,
+            "work_package_id": package_id,
+            "host": {"vendor": host_family, "model": host_model},
+            "complexity": complexity,
+            "complexity_escalated": complexity_escalated,
+            "consultations": [],
+            "native_request": {
+                "lane": "native_same_vendor",
+                "mechanism": "host_native_subagent",
+                "family": native_expected["family"],
+                "model": native_expected["model"],
+                "effort": effort,
+                "work_package_id": package_id,
+                "max_summary_chars": DECISION_ADVICE_MAX_CHARS,
+                "return_contract": {
+                    "family": native_expected["family"],
+                    "model": native_expected["model"],
+                    "status": "completed | unavailable | failed",
+                    "attestation": "verified runtime identity, or not_run/unverified",
+                    "agent_id": "optional native child-agent id",
+                    "summary": f"compact decision advice, at most {DECISION_ADVICE_MAX_CHARS} characters",
+                },
+                "instruction": (
+                    "Consult the named same-vendor flagship using only the already supplied "
+                    "bounded brief, then call consult_decision again with native_consultation."
+                ),
+            },
+            "handoff_notices": [],
+            "completion_notice": "Native same-vendor flagship consultation is required before dispatch continues.",
+            "authoritative": False,
+            "decision_owner": "host",
+        }
+        _record_decision_result(args, result, ["needs_native_consultation"])
+        _cap_decision_result(result)
+        return result
+    if not native_expected and native_value is not None:
+        raise ValueError("native_consultation is not expected for this host model")
     targets = decision_consult_targets(host_family, host_model, complexity)
     consultations: list[dict[str, Any]] = []
     notices: list[str] = []
+    if native_expected:
+        native_entry = _normalized_native_consultation(native_value, native_expected, effort)
+        consultations.append(native_entry)
+        if native_entry["status"] != "completed":
+            notices.append(
+                f"Native {native_expected['family']}:{native_expected['model']} consultation "
+                f"was {native_entry['native_status']}; include this in the final handoff."
+            )
+    if native_expected and complexity == "bounded":
+        targets = []
     for target in targets:
         family = target["family"]
         model = target["model"]
@@ -6737,6 +6935,7 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
             consultations.append(
                 {
                     "target": family,
+                    "lane": "switchboard_cross_vendor",
                     "resolved_model": model,
                     "requested_effort": effort,
                     "effective_effort": None,
@@ -6780,6 +6979,7 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
         attested = raw.get("model_attested")
         entry: dict[str, Any] = {
             "target": family,
+            "lane": "switchboard_cross_vendor",
             "resolved_model": model,
             "requested_effort": effort,
             "effective_effort": raw.get("actual_effort") or raw.get("effort"),
@@ -6840,30 +7040,7 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
         "authoritative": False,
         "decision_owner": "host",
     }
-    try:
-        event = record_agent_event(
-            args.get("project"),
-            args.get("topic"),
-            "agent-switchboard",
-            "flagship_consultation",
-            f"{package_id}: {overall} ({', '.join(statuses) or 'no targets'})",
-            json.dumps(
-                {
-                    "host": result["host"],
-                    "complexity": complexity,
-                    "targets": [
-                        {key: item.get(key) for key in ("target", "resolved_model", "status", "request_id")}
-                        for item in consultations
-                    ],
-                    "handoff_notices": result["handoff_notices"],
-                },
-                ensure_ascii=False,
-            ),
-        )
-        result["ledger_ref"] = f"event:{event.get('id')}"
-    except Exception as exc:  # noqa: BLE001
-        result["ledger_ref"] = None
-        result["ledger_warning"] = f"Could not record consultation event: {type(exc).__name__}"
+    _record_decision_result(args, result, statuses)
     _cap_decision_result(result)
     return result
 
@@ -10012,7 +10189,7 @@ TOOLS = [
     },
     {
         "name": "consult_decision",
-        "description": "Send one bounded architecture/decision brief to the progressive flagship tier. Sol-or-lower Codex hosts use Astra plus Fable for architecture/critical work; Opus-or-lower Claude hosts use Fable plus Astra; Gemini hosts use both. Effort scales high/xhigh/max. Flash is never used as a decision substitute. Skips and quota/unavailability notices are returned for the final handoff.",
+        "description": "Coordinate one bounded flagship decision brief. Codex and Claude hosts first run their same-vendor flagship as a native subagent, then return its bounded native_consultation descriptor; Agent Switchboard dispatches only the opposite-vendor consultation needed for architecture/critical work. Gemini hosts use both cross-vendor flagships. Effort scales high/xhigh/max. Flash is never used as a decision substitute.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -10030,6 +10207,20 @@ TOOLS = [
                     "additionalProperties": False,
                 },
                 "complexity": {"type": "string", "enum": ["bounded", "architecture", "critical"]},
+                "native_consultation": {
+                    "type": "object",
+                    "description": "Bounded result from the host's same-vendor native flagship subagent. Omit on the first call; needs_native_consultation returns the exact native request.",
+                    "properties": {
+                        "family": {"type": "string", "enum": ["codex", "claude"]},
+                        "model": {"type": "string", "maxLength": 200},
+                        "status": {"type": "string", "enum": ["completed", "unavailable", "failed"]},
+                        "attestation": {"type": "string", "maxLength": 80},
+                        "agent_id": {"type": "string", "maxLength": 200},
+                        "summary": {"type": "string", "maxLength": 3000},
+                    },
+                    "required": ["family", "model", "status", "attestation"],
+                    "additionalProperties": False,
+                },
                 "risk_flags": {
                     "type": "array",
                     "maxItems": 8,
