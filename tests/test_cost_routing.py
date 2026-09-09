@@ -424,11 +424,11 @@ class RoutingContractStringsTests(unittest.TestCase):
         self.assertIn("entire autonomous plan", text)
         self.assertIn("flash never receives production ssh", text)
         self.assertIn("independently inspects cited lines, the actual diff, and check output", text)
-        for failure in ("missing", "quota-limited", "times out", "mismatches", "otherwise fails"):
+        for failure in ("missing", "quota-limited", "times out", "mismatches", "blocked", "rejected/failed structured output"):
             self.assertIn(failure, text)
         self.assertIn("codex explorer/worker", text)
         self.assertIn("claude explore/economy-worker", text)
-        self.assertIn("record the fallback", text)
+        self.assertIn("record the concrete package-specific flash_skip reason", text)
         self.assertIn("concurrently only on independent stages/packages", text)
         self.assertIn("writes run serially unless", text)
         self.assertIn("brain reviews evidence and actual diffs", text)
@@ -436,6 +436,12 @@ class RoutingContractStringsTests(unittest.TestCase):
             "agent switchboard is only for opposite-vendor consultation",
             text,
         )
+
+    def test_runtime_rules_exclude_gemini_from_automatic_downward_routing(self):
+        text = " ".join(broker.COST_AWARE_ROUTING_RULES).lower()
+        self.assertIn("for codex and claude brains, default workhorse", text)
+        self.assertIn("gemini, antigravity, and unknown hosts receive no automatic downward cost routing", text)
+        self.assertIn("gemini upward flagship consultation", text)
 
     def test_contracts_require_bounded_pretooluse_relief_and_return_cap(self):
         implementation = " ".join(broker.TASK_CONTRACTS["implementation"]).lower()
@@ -448,6 +454,104 @@ class RoutingContractStringsTests(unittest.TestCase):
         # four" (routing_gate.DIRECT_LABOUR_LIMIT_DEFAULT), not the old "ten direct".
         self.assertIn("default four", global_rules)
         self.assertIn("registered overrides must appear in the final audit", global_rules)
+
+
+class NativeLabourPolicyTests(unittest.TestCase):
+    def test_search_task_kind_selects_reader_without_prompt_guessing(self):
+        self.assertEqual(
+            broker.native_semantic_lane({"task_kind": "search", "prompt": "implement everything"}),
+            "reader",
+        )
+
+    def test_routing_guide_is_structurally_flash_first_for_codex_claude_only(self):
+        codex_roles = {
+            "frontier": {"id": "gpt-live-astra"},
+            "workhorse": {"id": "gpt-live-terra"},
+            "reader": {"id": "gpt-live-luna"},
+        }
+        catalog = {
+            "catalogs": {
+                "codex": {"roles": codex_roles},
+                "antigravity": {"roles": {"workhorse": {"id": "gemini-live-flash-high"}}},
+            },
+            "defaults": [],
+        }
+        with mock.patch.object(broker, "list_agent_models", return_value=catalog):
+            guide = broker.get_model_routing_guide()
+        policy = guide["automatic_downward_cost_routing"]
+        self.assertEqual(policy["eligible_host_families"], ["codex", "claude"])
+        self.assertEqual(policy["excluded_host_families"], ["gemini", "antigravity", "unknown"])
+        self.assertIn("Flash-first", policy["default"])
+        self.assertEqual(guide["native_semantic_lanes"]["reader"]["codex"]["model"], "gpt-live-luna")
+        self.assertEqual(guide["native_semantic_lanes"]["workhorse"]["codex"]["model"], "gpt-live-terra")
+        fallback = guide["defaults"]["antigravity_cli"]["failure_fallback"]
+        self.assertIsNone(fallback["gemini"])
+        self.assertFalse(fallback["auto_launch_native"])
+
+    def test_explicit_semantic_aliases_use_live_native_roles_without_prompt_guessing(self):
+        with mock.patch.object(broker, "current_codex_role_model", side_effect=lambda role: f"live-{role}"):
+            self.assertEqual(
+                broker.apply_codex_model_policy({"semantic_lane": "reader"}, "implement everything", "implementation", "", None),
+                ("live-reader", "low", "cheap_read"),
+            )
+            self.assertEqual(
+                broker.apply_codex_model_policy({"model_policy": "worker"}, "read one file", "quick_check", "", None),
+                ("live-workhorse", "medium", "balanced"),
+            )
+        with mock.patch.object(
+            broker.model_roles, "select_claude_roles", return_value={"frontier": ["best"], "reader": "live-haiku", "workhorse": "live-sonnet"}
+        ):
+            self.assertEqual(
+                broker.apply_claude_model_policy({"native_lane": "Explore"}, "", "max"),
+                ("live-haiku", None, "cheap_read"),
+            )
+            self.assertEqual(
+                broker.apply_claude_model_policy({"semantic_lane": "economy-worker"}, "", None),
+                ("live-sonnet", "medium", "balanced"),
+            )
+
+    def test_noncreditable_flash_outcomes_return_broker_backed_native_handoffs(self):
+        cases = {
+            "unavailable_pre_mutation": "flash-unavailable:broker:receipt-1",
+            "rejected": "flash-failed:broker:receipt-1",
+            "blocked": "flash-failed:broker:receipt-1",
+            "failed_pre_mutation": "flash-failed:broker:receipt-1",
+        }
+        for family, client, role, model in (
+            ("codex", "codex-vscode", "explorer", "live-reader"),
+            ("claude", "claude-code", "Explore", "live-haiku"),
+        ):
+            for outcome, reason in cases.items():
+                with self.subTest(family=family, outcome=outcome), \
+                     mock.patch.object(broker, "_MCP_CLIENT_NAME", client), \
+                     mock.patch.object(broker, "current_codex_role_model", return_value="live-reader"), \
+                     mock.patch.object(broker.model_roles, "select_claude_roles", return_value={"reader": "live-haiku", "workhorse": "live-sonnet"}):
+                    handoff = broker.native_handoff_for_flash_outcome(
+                        {"work_package_id": "WP-READ", "task_kind": "research"}, outcome, "broker:receipt-1"
+                    )
+                self.assertEqual(handoff["work_package_id"], "WP-READ")
+                self.assertEqual(handoff["semantic_lane"], "reader")
+                self.assertEqual(handoff["native"]["family"], family)
+                self.assertEqual(handoff["native"]["role"], role)
+                self.assertEqual(handoff["native"]["model"], model)
+                self.assertEqual(handoff["flash_skip_reason"], reason)
+                self.assertFalse(handoff["auto_launch"])
+                self.assertIn(reason, handoff["record_requirement"])
+                if outcome == "unavailable_pre_mutation":
+                    self.assertNotIn("brain_review", handoff)
+                else:
+                    self.assertTrue(handoff["brain_review"]["required"])
+
+    def test_gemini_antigravity_and_unknown_callers_get_no_native_handoff(self):
+        for client in ("antigravity-ide", "gemini-cli", "third-party-client", ""):
+            with self.subTest(client=client), mock.patch.object(broker, "_MCP_CLIENT_NAME", client), mock.patch.dict(
+                os.environ, {"AGENT_BROKER_CALLER": ""}, clear=False
+            ):
+                self.assertIsNone(
+                    broker.native_handoff_for_flash_outcome(
+                        {"work_package_id": "WP-1", "task_kind": "implementation"}, "rejected", "broker:r"
+                    )
+                )
 
 
 class EntryVersionTests(unittest.TestCase):

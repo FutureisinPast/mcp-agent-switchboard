@@ -614,9 +614,10 @@ COST_AWARE_ROUTING_RULES = [
     "Flagship availability and quota failures are isolated. Continue with available targets, never substitute Flash for flagship judgment, and include every consult_decision handoff_notices item in the final response.",
     "Capability tier outranks model version: a newer Gemini Flash remains a non-authoritative labour workhorse and never becomes an Astra/Fable decision consultant.",
     "The owner has issued a STANDING REQUEST to delegate eligible labour: dispatching a bounded package to the Flash workhorse or to a managed native subagent is pre-authorized work, not an optional extra that needs fresh permission each turn.",
-    "DEFAULT WORKHORSE = the newest live Antigravity Gemini Flash High through Agent Switchboard. For a bounded package -- reading, search, extraction, summaries, drafting/writing, independent parallel read-only packages, and (once containment is enabled) light implementation and tests from an approved plan when isolated and low-risk -- the default lane is route_agent_task with target_agent=antigravity, surface=cli, target_model=gemini flash, effort=high, a work_package_id, the correct task_kind, and mode=plan or mode=accept-edits with the implementation envelope. It is roughly a tenth the cost of the same-vendor native workhorse and several times faster.",
+    "For Codex and Claude brains, DEFAULT WORKHORSE = the newest live Antigravity Gemini Flash High through Agent Switchboard. For a bounded package -- reading, search, extraction, summaries, drafting/writing, independent parallel read-only packages, and (once containment is enabled) light implementation and tests from an approved plan when isolated and low-risk -- the default lane is route_agent_task with target_agent=antigravity, surface=cli, target_model=gemini flash, effort=high, a work_package_id, the correct task_kind, and mode=plan or mode=accept-edits with the implementation envelope. It is roughly a tenth the cost of the same-vendor native workhorse and several times faster.",
+    "Gemini, Antigravity, and unknown hosts receive no automatic downward cost routing. Their user-selected brain remains in place; explicit routing is still allowed, and Gemini upward flagship consultation through consult_decision is unchanged.",
     "Flash is the default with OBJECTIVE EXCEPTIONS, not an unconditional rule. A Flash-eligible package must end in exactly one of: a Switchboard dispatch, the small direct allowance for non-mutating micro-work, or a native/brain lane carrying a stated flash_skip reason with evidence -- host-tools:<tool-id> (the package needs host-only MCP tools, skills, or an IDE session), unshared-state:<evidence-id> (it depends on session state Flash cannot see), flash-failed:<broker-receipt>, flash-unavailable:<health-id>, or atomic-oversize:<plan-id> (an indivisible package over five files or past the input preflight). 'It felt easier to do myself' is not one of them.",
-    "Native cheap roles (Codex explorer/worker; Claude Explore/economy-worker) remain the correct lane for those stated exceptions and for anything needing the host's own tools; they are the fallback, not the first choice. Flash is an external worker, never a native child agent, and never an Astra/Fable decision consultant.",
+    "Native cheap roles (Codex explorer/worker; Claude Explore/economy-worker) remain the correct lane for package-specific native preference or Flash failure and for anything needing the host's own tools; they are the fallback, not the first choice. Record the concrete package-specific flash_skip reason. Flash is an external worker, never a native child agent, and never an Astra/Fable decision consultant.",
     "Cross-vendor routing must enter through Agent Switchboard's MCP tools whenever Switchboard is registered. For Flash labour, the sender brain MUST call MCP route_agent_task; 'through CLI' means surface=cli on that MCP call. The brain MUST NOT shell out to agy or call consult_antigravity directly. Only the Switchboard backend may start agy; sender-side direct agy is prohibited.",
     "The Antigravity in-app/extension surface is retired for Flash labour: always use surface=cli, never extension or app. If the named model cannot be selected and runtime-attested, return needs_model_selection; never continue on the IDE's current or a neighbouring model.",
     "Every Flash call is exactly one bounded work package. Never hand Flash an entire autonomous plan or let it select/continue to the next package. Implementation calls must name a package id, at most five allowed files, explicit acceptance criteria, and forbidden actions; Switchboard rejects an incomplete envelope.",
@@ -624,7 +625,7 @@ COST_AWARE_ROUTING_RULES = [
     "A Switchboard-launched Gemini Flash session is the non-authoritative worker for exactly its assigned envelope, never the brain or router. It must not dispatch agents, reinterpret the whole plan, or continue to another package.",
     "Switchboard's internal agy backend must use --output-format json with --json-schema. Missing/malformed fields, scope violations, contradictory completion, unsupported design-intent claims, ambiguity, or failed checks are failures to escalate -- never prose to accept. The sender brain independently inspects cited lines, the actual diff, and check output before dispatching another package.",
     "Flash never receives production SSH, live credentials, destructive operations, migrations, or danger-full-access. It may prepare bounded local changes and checks; the brain owns live deployment and approval.",
-    "If agy or Flash is missing, quota-limited, times out, mismatches the requested model, or otherwise fails, fall back to the host's native cheap roles (Codex explorer/worker; Claude Explore/economy-worker) and record the fallback.",
+    "If agy or Flash is missing, quota-limited, times out, mismatches the requested model, is blocked, or returns rejected/failed structured output, return a structured handoff to the Codex/Claude host's native cheap role and record the broker-backed flash-unavailable or flash-failed reason. Never auto-launch the native role.",
     "Classify risk and difficulty at every work-package boundary. Reader/low handles bounded reading, search, extraction, and formatting; workhorse/medium handles routine writing, light implementation, tests, scripts, and reversible deployment from an approved plan.",
     "Portable packages state Lane | mechanism | exact resolved model/effort | deliverable | verification | escalation. Imported foreign-vendor reader/workhorse routes are re-resolved to the executor's current same-vendor native role at execution start.",
     "A worker follows the resolved package. A retained package uses `override: brain - <WP-ID>: <specific reason>` in the Routing audit; bare/global overrides are invalid.",
@@ -1155,9 +1156,21 @@ def find_ide_executable(host: str, config: dict[str, Any]) -> str | None:
 
 
 def run_detached(command: list[str], cwd: str | None = None) -> dict[str, Any]:
+    """Launch an intentionally persistent external app/IDE and relinquish ownership.
+
+    This compatibility helper is not a package-worker launcher. Package workers must
+    use their managed start/run paths so PID, timeout, completion, and reconciliation
+    remain broker-owned. Persistent user-facing apps are deliberately not waited on
+    or terminated here because their lifecycle belongs to the user/application.
+    """
+    lifecycle = {
+        "lifecycle": "persistent_external_ui",
+        "managed": False,
+        "reconciliation": "external_application_owned; not waited or terminated",
+    }
     try:
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        subprocess.Popen(
+        proc = subprocess.Popen(
             command,
             cwd=cwd or str(Path.home()),
             stdout=subprocess.DEVNULL,
@@ -1165,9 +1178,9 @@ def run_detached(command: list[str], cwd: str | None = None) -> dict[str, Any]:
             stdin=subprocess.DEVNULL,
             creationflags=flags,
         )
-        return {"ok": True, "command": command}
+        return {"ok": True, "command": command, "pid": proc.pid, **lifecycle}
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "command": command, "error": str(exc)}
+        return {"ok": False, "command": command, "pid": None, "error": str(exc), **lifecycle}
 
 
 def powershell_executable() -> str | None:
@@ -2962,12 +2975,33 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
     )
     guide: dict[str, Any] = {
         "purpose": "Use this before routing if you are unsure which model/effort to request.",
+        "automatic_downward_cost_routing": {
+            "eligible_host_families": ["codex", "claude"],
+            "excluded_host_families": ["gemini", "antigravity", "unknown"],
+            "default": "Flash-first for eligible bounded labour only.",
+            "excluded_rule": "No automatic downward routing; explicit routing and upward consult_decision remain available.",
+        },
         "execution_precedence": [
-            "Same-vendor bounded labour uses native subagents first: Codex explorer/worker or Claude Explore/economy-worker.",
-            "Proactively consider the newest live Antigravity Gemini Flash High through Agent Switchboard/agy as a fast, cheap external workhorse; it is not a native child agent.",
+            "Codex/Claude eligible bounded labour uses the newest live Antigravity Gemini Flash High through Agent Switchboard first.",
+            "For one concrete package, use the matching same-vendor native reader/workhorse instead when a recorded native preference applies or Flash failed/unavailable; never auto-launch it.",
+            "Choose reader for quick_check/research/search and read-only extraction; choose workhorse for implementation, drafting/planning, tests, review, bug_hunt, sanity_check, and harder routine analysis.",
+            "Gemini/Antigravity and unknown hosts have no automatic downward cost route.",
             "For flagship decisions, Codex/Claude first use their native same-vendor child agent with a bounded brief, then pass its compact descriptor to consult_decision for any required cross-vendor leg; never send whole files or articles.",
             "Use a same-vendor broker worker only when the named native role is unavailable or failed to start, and record the fallback.",
         ],
+        "native_semantic_lanes": {
+            "reader": {
+                "task_kinds": ["quick_check", "research", "search", "read-only extraction"],
+                "codex": {"role": "explorer", "model": codex_reader, "effort": "low"},
+                "claude": {"role": "Explore", "model": model_roles.select_claude_roles()["reader"], "effort": None},
+            },
+            "workhorse": {
+                "task_kinds": ["implementation", "implementation_plan", "tests", "review", "bug_hunt", "sanity_check", "harder routine analysis"],
+                "codex": {"role": "worker", "model": codex_workhorse, "effort": "medium"},
+                "claude": {"role": "economy-worker", "model": model_roles.select_claude_roles()["workhorse"], "effort": "medium"},
+            },
+            "selection_rule": "Use the explicit reader/workhorse semantic alias when supplied; otherwise select from task_kind, never prompt guesses.",
+        },
         "defaults": {
             "progressive_flagship_decision": {
                 "tool": "consult_decision",
@@ -3043,9 +3077,13 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                 "failure_fallback": {
                     "codex": ["explorer", "worker"],
                     "claude": ["Explore", "economy-worker"],
+                    "gemini": None,
+                    "antigravity": None,
+                    "unknown": None,
                     "record_fallback": True,
+                    "auto_launch_native": False,
                 },
-                "rule": "Antigravity routes through agy using the newest stable numeric Gemini Flash High advertised live. Codex and Claude brains should proactively consider it as a fast, cheap external workhorse, not a native child agent. Every call is one bounded package with schema-enforced JSON; implementation requires a package id, 1-5 allowed files, and acceptance criteria. Never hand Flash a whole plan or production access. Flash remains non-authoritative: the brain reviews evidence/diffs and independently verifies cited lines, the actual diff, and checks before accepting or dispatching another package. If agy/Flash is missing, quota-limited, times out, mismatches, or fails -- including malformed/contradictory output or ambiguity -- use the host native reader/workhorse and record the fallback. Flash and native workers run concurrently only on independent packages; writes are serial unless demonstrably isolated.",
+                "rule": "Antigravity routes through agy using the newest stable numeric Gemini Flash High advertised live. It is the automatic external labour default only for Codex and Claude brains, not Gemini/Antigravity or unknown hosts. Every call is one bounded package with schema-enforced JSON; implementation requires a package id, 1-5 allowed files, and acceptance criteria. Never hand Flash a whole plan or production access. Flash remains non-authoritative: the brain reviews evidence/diffs and independently verifies cited lines, the actual diff, and checks before accepting or dispatching another package. Every non-creditable Flash outcome returns Codex/Claude callers a structured native reader/workhorse handoff with a broker-backed reason; it never auto-launches native work. Flash and native workers run concurrently only on independent packages; writes are serial unless demonstrably isolated.",
             },
         },
         "caller_examples": {
@@ -3564,10 +3602,10 @@ def apply_codex_model_policy(
     # prompt keywords — that silently mis-routed real consults (e.g. a destructive-deletion
     # review) to Luna/low and produced hedged, untrustworthy answers. A consult defaults to the
     # flagship at max; the caller keeps full control by passing model_policy/target_model/effort.
-    policy = normalize_lookup(str(args.get("model_policy") or ""))
-    if policy in {"cheap read", "cheap_read", "cheap reader", "cheap"} and not str(raw_model or "").strip():
+    policy = normalize_lookup(str(args.get("model_policy") or args.get("semantic_lane") or args.get("native_lane") or ""))
+    if policy in {"cheap read", "cheap_read", "cheap reader", "cheap", "reader", "native reader", "explorer"} and not str(raw_model or "").strip():
         return current_codex_role_model("reader"), raw_effort or CODEX_CHEAP_EFFORT, "cheap_read"
-    if policy in {"balanced", "efficient", "lower effort", "lower_effort", "workhorse"} and not str(raw_model or "").strip():
+    if policy in {"balanced", "efficient", "lower effort", "lower_effort", "workhorse", "native workhorse", "worker"} and not str(raw_model or "").strip():
         return current_codex_role_model("workhorse"), raw_effort or "medium", "balanced"
     return raw_model, raw_effort, None
 
@@ -3580,14 +3618,73 @@ def apply_claude_model_policy(
     """Apply only an explicit Claude cost policy. Serious consultations stay on
     the moving ``fable`` frontier alias at max; prompt keywords never guess a
     cheaper tier."""
-    policy = normalize_lookup(str(args.get("model_policy") or ""))
-    if policy in {"cheap read", "cheap_read", "cheap reader", "cheap"} and not str(raw_model or "").strip():
+    policy = normalize_lookup(str(args.get("model_policy") or args.get("semantic_lane") or args.get("native_lane") or ""))
+    if policy in {"cheap read", "cheap_read", "cheap reader", "cheap", "reader", "native reader", "explore"} and not str(raw_model or "").strip():
         # Haiku does not support Claude's adaptive effort parameter. Drop an inherited
         # effort so the CLI does not reject an otherwise valid cheap-reader request.
-        return CLAUDE_CHEAP_MODEL, None, "cheap_read"
-    if policy in {"balanced", "efficient", "lower effort", "lower_effort", "workhorse"} and not str(raw_model or "").strip():
-        return CLAUDE_BALANCED_MODEL, raw_effort or CLAUDE_BALANCED_EFFORT, "balanced"
+        return model_roles.select_claude_roles()["reader"], None, "cheap_read"
+    if policy in {"balanced", "efficient", "lower effort", "lower_effort", "workhorse", "native workhorse", "economy worker"} and not str(raw_model or "").strip():
+        return model_roles.select_claude_roles()["workhorse"], raw_effort or CLAUDE_BALANCED_EFFORT, "balanced"
     return raw_model, raw_effort, None
+
+
+def native_semantic_lane(args: dict[str, Any], task_kind: Any = None) -> str:
+    """Resolve explicit semantic aliases or the declared task kind; never prompt text."""
+    explicit = normalize_lookup(
+        args.get("semantic_lane") or args.get("native_lane") or args.get("model_policy") or ""
+    )
+    if explicit in {"reader", "native reader", "explorer", "explore", "cheap", "cheap read", "cheap reader"}:
+        return "reader"
+    if explicit in {"workhorse", "native workhorse", "worker", "economy worker", "balanced", "efficient"}:
+        return "workhorse"
+    kind = normalize_task_kind(task_kind or args.get("task_kind") or args.get("request_type"))
+    return "reader" if kind in {"quick_check", "research"} else "workhorse"
+
+
+def native_handoff_for_flash_outcome(
+    args: dict[str, Any], outcome: str | None, receipt: str | None
+) -> dict[str, Any] | None:
+    """Describe, but never launch, the Codex/Claude native fallback for failed Flash work."""
+    if outcome == FLASH_OUTCOME_CREDITABLE or not receipt:
+        return None
+    caller_family = family_from_caller()
+    if caller_family not in {"codex", "claude"}:
+        return None
+    lane = native_semantic_lane(args)
+    if caller_family == "codex":
+        role = "explorer" if lane == "reader" else "worker"
+        model = current_codex_role_model(lane)
+        effort = "low" if lane == "reader" else "medium"
+    else:
+        roles = model_roles.select_claude_roles()
+        role = "Explore" if lane == "reader" else "economy-worker"
+        model = roles[lane]
+        effort = None if lane == "reader" else "medium"
+    unavailable = outcome == "unavailable_pre_mutation"
+    reason = f"{'flash-unavailable' if unavailable else 'flash-failed'}:{receipt}"
+    needs_review = outcome in {"rejected", "blocked", "failed_pre_mutation"}
+    handoff = {
+        "work_package_id": str(args.get("work_package_id") or "").strip() or None,
+        "semantic_lane": lane,
+        "native": {
+            "family": caller_family,
+            "role": role,
+            "model": model,
+            "effort": effort,
+            "mechanism": "managed_native_subagent",
+        },
+        "flash_outcome": outcome,
+        "flash_skip_reason": reason,
+        "record_requirement": f"Record this package-specific fallback as {reason}.",
+        "auto_launch": False,
+        "action": "Start the named current native role with the same bounded package only after applying any review caveat.",
+    }
+    if needs_review:
+        handoff["brain_review"] = {
+            "required": True,
+            "action": "Inspect the Flash failure and rescope or resolve ambiguity before native delegation; do not silently replay the same package.",
+        }
+    return handoff
 
 
 def enforce_native_first_broker_fallback(args: dict[str, Any], target_family: str) -> None:
@@ -6465,6 +6562,9 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             result["receipt"] = f"broker:{consult_request_id}" if consult_request_id else None
             result["outcome"] = flash_outcome
             result["credit_eligible"] = flash_outcome == FLASH_OUTCOME_CREDITABLE
+            native_handoff = native_handoff_for_flash_outcome(args, flash_outcome, result["receipt"])
+            if native_handoff is not None:
+                result["native_handoff"] = native_handoff
             result["requested_model"] = resolved_model
             result["resolved_model"] = resolved_model
             result["attested_model"] = flash_cli_meta.get("model")
@@ -6475,12 +6575,12 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             if flash_outcome == "unavailable_pre_mutation":
                 result["fallback_advice"] = (
                     "Flash was unavailable before any work started. A native cheap role may take "
-                    "this package; cite flash-unavailable with this receipt in the routing audit."
+                    "this package; record the package-specific flash-unavailable reason with this ledger receipt."
                 )
             elif flash_outcome == "rejected":
                 result["fallback_advice"] = (
-                    "The worker's own output was rejected. Do NOT silently reroute this package: "
-                    "inspect the rejection, then re-scope it or retain it in the brain."
+                    "The worker's own output was rejected. Inspect the rejection and re-scope it "
+                    "before using the structured native handoff; do not silently replay the package."
                 )
                 result["disposition"] = "rejected"
                 result["validation_failures"] = _rejection_validation_failures(response)
@@ -10452,7 +10552,7 @@ TOOLS = [
     },
     {
         "name": "route_agent_task",
-        "description": "DEFAULT WORKHORSE LANE for one bounded package, and the required MCP entry point for routing to Antigravity, Codex, Claude, or Gemini. Prefer this over doing bounded reading/search/extraction/summary/drafting yourself or spending a native subagent on it: Gemini Flash High costs roughly a tenth of the same-vendor native workhorse and runs several times faster. Read-only call: {target_agent:'antigravity', surface:'cli', target_model:'gemini flash', effort:'high', mode:'plan', task_kind:'quick_check', work_package_id:'WP-...', prompt:'...'}. Implementation call: the same plus mode:'accept-edits', 1-5 allowed_writes (or allowed_creates for new files), and acceptance_criteria. SCOPE IS THE MANIFEST, NOT A DIRECTORY: only the files you declare are copied to the worker, so a big task does not make a big package — decompose it. Declare every file the worker must READ in read_context (up to 20); nothing else is staged, and undeclared reading is what makes workers wander. workspace_root is used only to resolve paths and is never walked. A refusal names the exact cap, the measurement and a rescope hint — act on that instead of retrying the same shape. Send exactly ONE package; never an entire plan, production SSH, credentials, migrations, or live deployment. Switchboard alone invokes agy, enforces --output-format json with --json-schema, rejects danger-full-access/malformed/contradictory completion and resolved-model mismatch, and returns brain_verification=pending with a ledger receipt (broker:<uuid>) you cite in the routing audit. A completed dispatch is evidence, never acceptance: check cited lines, the actual diff, and test output before accepting or sending the next package. When you use a native role instead for an eligible package, state the flash_skip reason. KEEP prompt SHORT.",
+        "description": "DEFAULT WORKHORSE LANE for Codex/Claude brains handling one eligible bounded package, and the required MCP entry point for explicit routing to Antigravity, Codex, Claude, or Gemini. Gemini/Antigravity and unknown hosts receive no automatic downward route; their explicit routes and upward consult_decision remain available. Read-only call: {target_agent:'antigravity', surface:'cli', target_model:'gemini flash', effort:'high', mode:'plan', task_kind:'quick_check', work_package_id:'WP-...', prompt:'...'}. Implementation call: the same plus mode:'accept-edits', 1-5 allowed_writes (or allowed_creates for new files), and acceptance_criteria. SCOPE IS THE MANIFEST, NOT A DIRECTORY: only declared files are copied. Send exactly ONE package; never an entire plan, production SSH, credentials, migrations, or live deployment. Switchboard alone invokes agy, enforces --output-format json with --json-schema, and returns brain_verification=pending with a ledger receipt. Every non-creditable Flash outcome returns Codex/Claude callers a structured current-native reader/workhorse handoff with a broker-backed flash-failed or flash-unavailable reason; native work is never auto-launched. A completed dispatch is evidence, never acceptance. KEEP prompt SHORT.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -12992,6 +13092,19 @@ def broker_doctor() -> dict[str, Any]:
     # --- Antigravity CLI first, in-app bridge fallback ---
     antigravity_cli = _cli_probe(config, "antigravity")
     antigravity_full = bool(antigravity_cli["found"] and antigravity_cli["smoke_ok"])
+    try:
+        import setup as setup_module
+        antigravity_mcp = setup_module.antigravity_mcp_stdio_diagnostic()
+    except Exception as exc:  # noqa: BLE001
+        antigravity_mcp = {
+            "registered": False,
+            "server_reachable": False,
+            "tools_declared": {"required": [], "present": [], "missing": [], "ok": False},
+            "tool_callable": False,
+            "host_exposure": "unavailable",
+            "status": "mcp_unavailable",
+            "reason": f"Antigravity MCP diagnostic failed: {type(exc).__name__}: {exc}",
+        }
     antigravity_routes: list[str] = []
     if antigravity_full:
         antigravity_routes.append("antigravity_cli (agy; full headless round-trip, default)")
@@ -13005,7 +13118,12 @@ def broker_doctor() -> dict[str, Any]:
         "default_route": "antigravity_cli" if antigravity_full else "antigravity_inbox",
         "reply_path": "stdout" if antigravity_full else "complete_antigravity_request",
         "best_quality": "full" if antigravity_full else "full (structured) when Antigravity is running",
+        "mcp": antigravity_mcp,
     }
+    if antigravity_mcp.get("host_exposure") == "unverified":
+        recommendations.append(str(antigravity_mcp.get("handoff") or "Antigravity MCP host exposure remains unverified."))
+    elif antigravity_mcp.get("status") == "mcp_unavailable":
+        recommendations.append("Antigravity MCP unavailable: " + str(antigravity_mcp.get("reason") or "unknown diagnostic failure"))
     if antigravity_cli["found"] and not antigravity_cli["smoke_ok"]:
         recommendations.append("Antigravity agy binary was found but `--version` failed; verify the CLI install.")
     if not antigravity_cli["found"]:
@@ -13088,6 +13206,10 @@ def render_doctor(report: dict[str, Any]) -> str:
             ext = s["extension"]
             ext_label = ("yes" if ext is True else ("unknown (not scanned)" if ext is None else ("no" if ext is False else ext)))
             lines.append(f"  extension  : {ext_label}")
+        if fam == "antigravity" and isinstance(s.get("mcp"), dict):
+            mcp = s["mcp"]
+            lines.append(f"  mcp        : {mcp.get('status')} (host exposure: {mcp.get('host_exposure')})")
+            lines.append(f"  mcp reason : {mcp.get('reason')}")
         if s.get("cdp_port"):
             lines.append(f"  cdp_port   : {s['cdp_port']}")
         for route in s.get("routes", []):

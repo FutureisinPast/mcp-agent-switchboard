@@ -8,16 +8,21 @@ style copied from tests/test_registration_repair.py.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import setup  # noqa: E402
+import agent_broker_entry  # noqa: E402
+import agent_broker_mcp as broker  # noqa: E402
 
 
 class RegistrationHealthTests(unittest.TestCase):
@@ -61,6 +66,59 @@ class RegistrationHealthTests(unittest.TestCase):
     def _write_json(self, path: Path, data: dict):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data), encoding="utf-8")
+
+    def _registration(self, env=None):
+        config = setup.ANTIGRAVITY_USER_DIRS[0] / "mcp_config.json"
+        self._write_json(config, {
+            "mcpServers": {
+                "agent-switchboard": {
+                    "command": sys.executable,
+                    "args": [str(REPO_ROOT / "agent_broker_mcp.py")],
+                    "env": env or {"PYTHONUTF8": "1"},
+                }
+            }
+        })
+        return config
+
+    @staticmethod
+    def _stdio(*, names=None, initialize=True, call=True):
+        rows = []
+        if initialize:
+            rows.append({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18"}})
+        else:
+            rows.append({"jsonrpc": "2.0", "id": 1, "error": {"code": -1, "message": "no"}})
+        rows.append({"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": name} for name in (names or [])]}})
+        rows.append(
+            {"jsonrpc": "2.0", "id": 3, "result": {"content": []}}
+            if call else
+            {"jsonrpc": "2.0", "id": 3, "error": {"code": -1, "message": "call failed"}}
+        )
+        return "\n".join(json.dumps(row) for row in rows) + "\n"
+
+    def _fake_popen(self, stdout="", timeout=False, capture=None):
+        should_timeout = timeout
+        class FakeProcess:
+            def __init__(self, command, **kwargs):
+                self.command = command
+                self.kwargs = kwargs
+                self.killed = False
+                self.calls = 0
+                if capture is not None:
+                    capture.append(self)
+
+            def communicate(self, payload=None, timeout=None):
+                self.calls += 1
+                if should_timeout and not self.killed:
+                    raise subprocess.TimeoutExpired(self.command, timeout)
+                return stdout, ""
+
+            def kill(self):
+                self.killed = True
+
+            def poll(self):
+                return 0 if self.calls and not should_timeout else (0 if self.killed else None)
+
+        return FakeProcess
 
     # -- missing_registrations -------------------------------------------------
 
@@ -164,6 +222,93 @@ class RegistrationHealthTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertTrue(rows[0]["selected"])
         self.assertEqual(rows[0]["directory"], str(only_dir))
+
+    # -- Antigravity MCP stdio diagnostic ---------------------------------
+
+    def test_mcp_diagnostic_reports_missing_selected_registration(self):
+        result = setup.antigravity_mcp_stdio_diagnostic()
+        self.assertEqual(result["status"], "mcp_unavailable")
+        self.assertFalse(result["registered"])
+        self.assertIn("no agent-switchboard", result["reason"])
+
+    def test_mcp_diagnostic_reports_initialize_failure_and_timeout(self):
+        self._registration()
+        required = sorted(setup.ANTIGRAVITY_REQUIRED_MCP_TOOLS)
+        with mock.patch.object(setup.subprocess, "Popen", self._fake_popen(self._stdio(names=required, initialize=False))):
+            failed = setup.antigravity_mcp_stdio_diagnostic()
+        self.assertEqual(failed["status"], "mcp_unavailable")
+        self.assertFalse(failed["server_reachable"])
+        with mock.patch.object(setup.subprocess, "Popen", self._fake_popen(timeout=True)):
+            timed_out = setup.antigravity_mcp_stdio_diagnostic(timeout=0.1)
+        self.assertEqual(timed_out["status"], "mcp_unavailable")
+        self.assertIn("timed out", timed_out["reason"])
+
+    def test_mcp_diagnostic_reports_missing_required_tool(self):
+        self._registration()
+        names = sorted(setup.ANTIGRAVITY_REQUIRED_MCP_TOOLS - {"consult_decision"})
+        with mock.patch.object(setup.subprocess, "Popen", self._fake_popen(self._stdio(names=names))):
+            result = setup.antigravity_mcp_stdio_diagnostic()
+        self.assertTrue(result["server_reachable"])
+        self.assertFalse(result["tools_declared"]["ok"])
+        self.assertEqual(result["tools_declared"]["missing"], ["consult_decision"])
+        self.assertEqual(result["status"], "mcp_unavailable")
+
+    def test_mcp_diagnostic_reports_declared_tools_but_failed_call(self):
+        self._registration()
+        names = sorted(setup.ANTIGRAVITY_REQUIRED_MCP_TOOLS)
+        with mock.patch.object(setup.subprocess, "Popen", self._fake_popen(self._stdio(names=names, call=False))):
+            result = setup.antigravity_mcp_stdio_diagnostic()
+        self.assertTrue(result["tools_declared"]["ok"])
+        self.assertFalse(result["tool_callable"])
+        self.assertEqual(result["status"], "mcp_unavailable")
+
+    def test_mcp_diagnostic_local_success_is_host_unverified_and_redacts_env_values(self):
+        secret = "do-not-return-this-value"
+        self._registration({"PYTHONUTF8": "1", "PRIVATE_TEST_VALUE": secret})
+        names = sorted(setup.ANTIGRAVITY_REQUIRED_MCP_TOOLS)
+        capture = []
+        with mock.patch.object(setup.subprocess, "Popen", self._fake_popen(self._stdio(names=names), capture=capture)):
+            result = setup.antigravity_mcp_stdio_diagnostic()
+        self.assertEqual(result["status"], "local_callable_host_unverified")
+        self.assertEqual(result["host_exposure"], "unverified")
+        self.assertTrue(result["tool_callable"])
+        self.assertIn("fresh chat", result["handoff"])
+        self.assertEqual(result["registration"]["env_keys"], ["PRIVATE_TEST_VALUE", "PYTHONUTF8"])
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertEqual(capture[0].kwargs["env"]["PRIVATE_TEST_VALUE"], secret)
+        self.assertEqual(capture[0].kwargs["env"]["AGENT_BROKER_DIAGNOSTIC_PROBE"], "1")
+        self.assertFalse(capture[0].kwargs["shell"])
+
+    def test_diagnostic_serve_flag_skips_only_hierarchy_refresh(self):
+        with mock.patch.dict(os.environ, {"AGENT_BROKER_DIAGNOSTIC_PROBE": "1"}), \
+             mock.patch.object(sys, "argv", ["agent-switchboard.exe", "serve"]), \
+             mock.patch.object(setup, "refresh_hierarchy") as refresh, \
+             mock.patch.object(broker, "main", return_value=0) as serve:
+            self.assertEqual(agent_broker_entry.run(), 0)
+        refresh.assert_not_called()
+        serve.assert_called_once()
+
+    def test_doctor_integrates_unverified_mcp_handoff_without_healthy_claim(self):
+        mcp = {
+            "registered": True, "server_reachable": True,
+            "tools_declared": {"required": [], "present": [], "missing": [], "ok": True},
+            "tool_callable": True, "host_exposure": "unverified",
+            "status": "local_callable_host_unverified", "reason": "local only",
+            "handoff": "Gracefully reload Antigravity and verify tools in a fresh chat.",
+        }
+        cli = {"found": True, "smoke_ok": True, "version": "test", "source": "test", "path": "test"}
+        nerve = {"claude_desktop": {"installed": False, "registered": False}}
+        with mock.patch.object(broker, "load_config", return_value={}), \
+             mock.patch.object(broker, "detect_agent_surfaces", return_value={}), \
+             mock.patch.object(broker, "find_executable", return_value=None), \
+             mock.patch.object(broker, "_cli_probe", return_value=cli), \
+             mock.patch.object(broker, "_bridge_package_version", return_value=None), \
+             mock.patch.object(broker, "_nerve_system_report", return_value=nerve), \
+             mock.patch.object(setup, "antigravity_mcp_stdio_diagnostic", return_value=mcp):
+            report = broker.broker_doctor()
+        self.assertEqual(report["surfaces"]["antigravity"]["mcp"], mcp)
+        self.assertNotIn("All core surfaces look healthy.", report["recommendations"])
+        self.assertTrue(any("fresh chat" in item for item in report["recommendations"]))
 
     # -- host_is_installed --------------------------------------------------
 

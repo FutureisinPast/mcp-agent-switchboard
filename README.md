@@ -18,8 +18,8 @@ Modern AI coding workflows are fragmented. You might use **Codex** or **Claude C
 - **Consult flagships without dumping context** - Codex/Claude hosts use their native same-vendor flagship child agent, then `consult_decision` adds only the bounded cross-vendor leg needed for the task; Gemini uses the broker for both.
 - **See across chats** - pull a *compact snapshot* of what another agent's session knows; **Codex and Claude Code are read on demand from disk**, no copy-paste.
 - **Run cross-model debate** - Codex vs Claude for N rounds, then synthesize a verdict.
-- **Keep the selected model as the brain, route labour cheaply** - global Codex/Claude/Gemini rules, reader/workhorse roles, and a completion audit are installed and refreshed by the same exe.
-- **Use Gemini Flash as an external workhorse** - Codex, Claude, and Gemini brains can proactively route bounded cheap labour through the Switchboard MCP `route_agent_task` tool, without treating Flash as a native child or authoritative brain.
+- **Keep the selected model as the brain, route labour cheaply** - global model rules, reader/workhorse roles, and a completion audit are installed and refreshed by the same exe.
+- **Use Gemini Flash as an external workhorse** - Codex and Claude brains route eligible bounded labour through the Switchboard MCP `route_agent_task` tool by default, without treating Flash as a native child or authoritative brain. Gemini, Antigravity, and unknown hosts receive no automatic downward routing, though explicit routes remain available.
 - **Token compaction is built in** - compressed handoffs, compact context packs, work memory, and retrievable originals instead of dumping entire transcripts.
 - **Keep it local** - SQLite state under `~/.agent-broker`; no private chat scraping, no cloud broker.
 - **Use subscriptions you already pay for** - no required API keys or metered orchestration service.
@@ -100,7 +100,7 @@ The broker is a dependency-free Python MCP server. Each assistant talks to it ov
 1. **Surface** — Codex, Claude, and Antigravity default to the **headless CLI** (reliable, model-switchable, answer returned inline). For Antigravity, that means the standalone `agy` executable, not the IDE's `antigravity chat` launcher. Say **"in app"** / **"inbox"**, pass `surface: extension` / `surface: inbox`, or set `use_inbox: true` to force the bridge panel. If `agy` is absent, an automatic Antigravity route falls back to that bridge/inbox.
 2. **Model** — vague Codex requests resolve from live `codex debug models` metadata plus the Astra capability seed; a future live model with higher catalog priority wins automatically. Claude frontier consults use the moving `fable` alias and fall back to the moving `opus` alias only on an explicit availability/entitlement error. Bare Antigravity and **"Gemini Flash"** select the newest exact stable `gemini-<numeric>-flash-high` slug advertised by live `agy models`, using numeric version order; the bundled static slug is offline fallback only. Explicit version pins remain exact, and preview/nonconforming SKUs are never auto-promoted. Gemini Flash remains a non-authoritative labour model regardless of version.
 3. **Flagship decision lane** — decision work maps `bounded` / `architecture` / `critical` to `high` / `xhigh` / `max`. Sol-or-lower Codex hosts consult Astra through a native Codex child agent; Opus-or-lower Claude hosts do the equivalent with Fable. The compact native result is passed to `consult_decision`, which adds only Fable for Codex or Astra for Claude on architecture/critical work. A missing native result returns `needs_native_consultation` without launching a nested same-vendor CLI. Astra and Fable hosts consult the opposite vendor; Gemini hosts consult both through the broker. Every path keeps the 12,000-byte / roughly 3,000-token brief cap and reports unavailable advisers instead of substituting Flash for flagship judgment.
-4. **External workhorse lane** — Codex, Claude, and Gemini brains should proactively consider newest live Flash High through Agent Switchboard for bounded search/read/extraction/summaries/drafting, low-risk implementation/tests from an approved plan, and independent parallel packages. Flash is not a native child agent. Each call carries exactly one package and schema-enforced output; implementation requires a package id, a 1-5-file allowlist, and explicit acceptance criteria. Flash cannot receive danger-full-access or live production work. If `agy`/Flash is missing, quota-limited, times out, mismatches, returns malformed/contradictory output, or fails, use the host's native cheap reader/workhorse and record the fallback. The brain independently verifies cited lines, the actual diff, and checks before accepting or sending another package.
+4. **External workhorse lane** — Codex and Claude brains use newest live Flash High through Agent Switchboard first for eligible bounded search/read/extraction/summaries/drafting, low-risk implementation/tests from an approved plan, and independent parallel packages. Gemini, Antigravity, and unknown hosts receive no automatic downward cost route; they may still request an explicit route, and Gemini retains its upward Astra/Fable decision consultation described above. Flash is not a native child agent. Each call carries exactly one package and schema-enforced output; implementation requires a package id, a 1-5-file allowlist, and explicit acceptance criteria. Flash cannot receive danger-full-access or live production work. Every non-creditable Flash result — unavailable, rejected schema/structure, blocked, or failed — returns Codex/Claude callers a structured native reader/workhorse handoff with the package id, semantic lane, live native role/model/effort, a broker-backed failure reason, and any required brain-review/rescope caveat. Switchboard never auto-launches that native work; the brain reviews the handoff and independently verifies cited lines, the actual diff, and checks.
 5. **Token budget** — every routed task carries a task contract (`implementation_plan`, `co_audit`, `debate`, `review`, …) with a word budget, and a compressed context pack instead of raw history. If a caller inlines a bloated `prompt` (over a soft token limit), the broker stashes the full text as a retrievable `context_ref` and returns a `prompt_notice` nudging it to send a short instruction + ref next time — so token discipline is enforced by the system, not left to each agent.
 
 Use the Switchboard MCP tool `route_agent_task` with `target_agent: "antigravity"`, `surface: "cli"`, `target_model: "gemini flash"`, and `effort: "high"`. The sender brain must not run `agy` directly; `surface: "cli"` tells Switchboard to invoke its internal CLI backend. Set `mode: "plan"` for read-only work. For implementation, set `mode: "accept-edits"` and include `work_package_id`, 1-5 exact `allowed_files`, and `acceptance_criteria`; Switchboard rejects an incomplete or whole-plan handoff.
@@ -166,6 +166,10 @@ surfaces can feed `request_context_snapshot` (on-disk fast-path vs live bridge v
 push-only), so a blind spot like a disconnected desktop app is visible. It flags
 broker/bridge version drift and prints actionable next steps.
 
+For Antigravity MCP specifically, `doctor` reads the selected effective registration and runs a bounded stdio probe against that exact registered command, arguments, and environment: JSON-RPC `initialize`, `initialized`, `tools/list`, then one harmless read-only tool call. The process is always reconciled and only environment key names are reported. A locally callable server proves registration and stdio behavior, not that an existing Antigravity chat imported the tools; host exposure therefore remains `unverified` until the user gracefully reloads/restarts Antigravity and checks a fresh chat.
+
+On Windows, Switchboard-owned bounded subprocesses use hidden-window flags and are waited on or killed/reaped on timeout. Launches of persistent user-facing IDE/app windows are explicitly external-owned and are not reconciled as package workers. When diagnosing empty `cmd.exe` chains, parentage matters: the observed Antigravity `language_server` → `cmd /c npx` → `chrome-devtools-mcp` chains were external to Switchboard, not broker-owned; that distinction identifies those observed processes rather than asserting a universal cause.
+
 **What each install combination gets you** (this is what `doctor` checks):
 
 | You have… | Codex / Claude result |
@@ -183,6 +187,12 @@ broker/bridge version drift and prints actionable next steps.
 ---
 
 ## Changelog
+
+### v1.0.44 (host-aware labour routing + MCP/process diagnostics)
+- **Flash-first labour routing is host-aware.** Codex and Claude use Flash first for eligible bounded labour; Gemini, Antigravity, and unknown hosts receive no automatic downward route, while explicit routing and Gemini's upward Astra/Fable decision consultation remain available.
+- **Flash failures return an actionable native handoff.** Every unavailable, rejected, blocked, or failed Flash outcome gives Codex/Claude callers a structured reader/workhorse fallback without auto-launching native work.
+- **Antigravity MCP diagnosis now exercises the registered server.** `doctor` performs a bounded stdio initialize/list/read-only-call probe and keeps chat-level host exposure explicitly unverified until a user-controlled reload/fresh-chat check.
+- **Windows lifecycle ownership is explicit.** Bounded broker processes are hidden and reconciled; persistent IDE/app launches are external-owned.
 
 ### v1.0.43 (native flagship handoff + capable Codex CLI selection)
 - **Same-vendor flagship advice now stays inside the initiating host.** Codex uses a native Astra child agent and Claude uses its native Fable child-agent path; the compact result is handed back to `consult_decision`, which invokes only the opposite-vendor adviser required for architecture/critical work. If that native result is missing, the broker returns an explicit request without contacting any provider.
@@ -485,26 +495,27 @@ Register it with an MCP client by pointing the client's MCP config at:
 
 **MCP tools exposed:**
 
-- Full profile: 36 tools.
-- Claude/default lite profile: 18 compact user-facing tools (`consult_codex`, `route_agent_task`, Codex queue/status, model listing, compact history/memory/context/snapshot reads, memory/event recording, retrieval, live-surface status, request ledger, and `respond_to_request`).
+- Default registered public profile: 37 tools.
+- Full profile: 44 tools.
+- Claude lite profile: 26 compact user-facing tools (`consult_decision`, `consult_codex`, `route_agent_task`, evidence probes, Codex/Claude queue/status, model listing/routing, compact history/memory/context/snapshot reads, memory/event recording, retrieval, live-surface status, request ledger, and `respond_to_request`).
 - Override with `AGENT_BROKER_TOOL_PROFILE=full|public|lite|compact` or `mcp_tool_profile` in `~/.agent-broker/config.json`.
 
-Full profile:
+Default registered public profile:
 
 ```text
-register_project, route_agent_task, resolve_model_request, list_agent_models,
+register_project, consult_decision, route_agent_task, run_evidence_probe,
+resolve_model_request, get_model_routing_guide, list_agent_models,
 set_model_default, get_model_defaults,
-consult_codex, consult_claude, consult_gemini, get_consultation_history,
-queue_antigravity_request, claim_antigravity_request, complete_antigravity_request,
-get_antigravity_requests, queue_codex_request, get_codex_requests,
+consult_codex, consult_claude, consult_antigravity, consult_gemini,
+get_consultation_history, queue_codex_request, get_codex_requests,
+queue_claude_request, get_claude_requests, request_status, request_result,
 record_agent_event, get_topic_timeline, get_topic_status,
 respond_to_request, get_request_ledger,
 get_work_memory, record_work_memory,
 get_context_pack, record_context_event, compact_topic,
 store_shared_context, retrieve_shared_context, get_shared_context_stats,
 get_chat_bootstrap,
-request_context_snapshot, claim_context_snapshot_request, complete_context_snapshot_request,
-get_latest_context_snapshot, list_live_surfaces, record_surface_heartbeat
+request_context_snapshot, get_latest_context_snapshot, list_live_surfaces
 ```
 
 **Antigravity model auto-selection (experimental, off by default)** requires launching Antigravity with a debug port so the bridge can drive the model picker over Chrome DevTools Protocol, then enabling `agentBrokerBridge.useCdpModelSelection`:

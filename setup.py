@@ -271,6 +271,147 @@ def registered_command(host: str) -> str | None:
         return None
 
 
+ANTIGRAVITY_REQUIRED_MCP_TOOLS = {
+    "consult_decision", "route_agent_task", "run_evidence_probe",
+}
+
+
+def effective_antigravity_mcp_registration() -> dict | None:
+    """Read the broker entry from the profile Antigravity currently selects."""
+    path = antigravity_mcp_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entry = (data.get("mcpServers") or {}).get(MCP_KEY)
+        if not isinstance(entry, dict) or not str(entry.get("command") or "").strip():
+            return None
+        args = entry.get("args") or []
+        env = entry.get("env") or {}
+        if not isinstance(args, list) or not isinstance(env, dict):
+            return None
+        return {
+            "config_path": str(path),
+            "command": str(entry["command"]),
+            "args": [str(value) for value in args],
+            "env": {str(key): str(value) for key, value in env.items()},
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def antigravity_mcp_stdio_diagnostic(timeout: float = 10.0) -> dict:
+    """Probe the selected Antigravity MCP registration over stdio without mutation.
+
+    This proves only that the registered process is locally callable. Antigravity
+    host/chat exposure remains deliberately unverified until the user reloads it.
+    """
+    registration = effective_antigravity_mcp_registration()
+    base = {
+        "registered": bool(registration),
+        "server_reachable": False,
+        "tools_declared": {
+            "required": sorted(ANTIGRAVITY_REQUIRED_MCP_TOOLS),
+            "present": [],
+            "missing": sorted(ANTIGRAVITY_REQUIRED_MCP_TOOLS),
+            "ok": False,
+        },
+        "tool_callable": False,
+        "host_exposure": "unavailable",
+        "status": "mcp_unavailable",
+    }
+    if not registration:
+        return {
+            **base,
+            "registration": None,
+            "reason": "Selected Antigravity profile has no agent-switchboard MCP registration.",
+        }
+
+    command = registration["command"]
+    args = list(registration["args"])
+    registered_env = dict(registration["env"])
+    base["registration"] = {
+        "config_path": registration["config_path"],
+        "command": command,
+        "args": args,
+        "env_keys": sorted(registered_env),
+    }
+    probe_env = os.environ.copy()
+    probe_env.update(registered_env)
+    probe_env["AGENT_BROKER_DIAGNOSTIC_PROBE"] = "1"
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "agent-switchboard-diagnostic", "version": BROKER_VERSION}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "get_model_routing_guide", "arguments": {}}},
+    ]
+    payload = "".join(json.dumps(item, separators=(",", ":")) + "\n" for item in messages)
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [command, *args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=probe_env,
+            shell=False,
+            creationflags=WINDOWS_NO_WINDOW,
+        )
+        stdout, _stderr = proc.communicate(payload, timeout=max(0.1, float(timeout)))
+    except subprocess.TimeoutExpired:
+        if proc is not None:
+            proc.kill()
+            proc.communicate()
+        return {**base, "reason": f"MCP stdio probe timed out after {timeout:g}s."}
+    except Exception as exc:  # noqa: BLE001
+        return {**base, "reason": f"MCP stdio process launch failed: {type(exc).__name__}: {exc}"}
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+    responses = {}
+    for line in str(stdout or "").splitlines():
+        try:
+            item = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(item, dict) and item.get("id") in {1, 2, 3}:
+            responses[item["id"]] = item
+    initialized = responses.get(1) or {}
+    if "result" not in initialized or initialized.get("error"):
+        return {**base, "reason": "MCP initialize did not return a successful response."}
+    base["server_reachable"] = True
+    listed = responses.get(2) or {}
+    raw_tools = (listed.get("result") or {}).get("tools") if not listed.get("error") else None
+    names = sorted({str(item.get("name")) for item in (raw_tools or []) if isinstance(item, dict) and item.get("name")})
+    present = sorted(ANTIGRAVITY_REQUIRED_MCP_TOOLS.intersection(names))
+    missing = sorted(ANTIGRAVITY_REQUIRED_MCP_TOOLS.difference(names))
+    base["tools_declared"] = {
+        "required": sorted(ANTIGRAVITY_REQUIRED_MCP_TOOLS),
+        "present": present,
+        "missing": missing,
+        "ok": not missing,
+    }
+    if missing:
+        return {**base, "reason": "MCP tools/list omitted required tools: " + ", ".join(missing)}
+    called = responses.get(3) or {}
+    call_result = called.get("result") if not called.get("error") else None
+    if not isinstance(call_result, dict) or call_result.get("isError") is True:
+        return {**base, "reason": "Read-only get_model_routing_guide tools/call failed."}
+    base.update({
+        "tool_callable": True,
+        "host_exposure": "unverified",
+        "status": "local_callable_host_unverified",
+        "reason": "Registered MCP server is locally reachable, declares required tools, and completed a read-only call; Antigravity chat exposure is not yet proven.",
+        "handoff": "Gracefully reload/restart Antigravity under user control, open a fresh chat, and verify that consult_decision, route_agent_task, and run_evidence_probe are exposed. Do not force-close the IDE.",
+    })
+    return base
+
+
 def canonical_registration() -> tuple[str, list[str]]:
     """The command hosts SHOULD be registered to.
 

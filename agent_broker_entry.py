@@ -79,13 +79,14 @@ def run() -> int:
         return switchboard_canary.gate_harness(sys.argv[2:])
     if first in SERVE_ALIASES:
         import setup
-        try:
-            hierarchy = setup.refresh_hierarchy(silent=True)
-            errors = [f"{name}: {result}" for name, result in hierarchy.items() if result.startswith("ERROR")]
-            if errors:
-                print("Agent Switchboard hierarchy refresh: " + "; ".join(errors), file=sys.stderr)
-        except Exception as exc:  # noqa: BLE001
-            print(f"Agent Switchboard hierarchy refresh failed open: {exc}", file=sys.stderr)
+        if os.environ.get("AGENT_BROKER_DIAGNOSTIC_PROBE") != "1":
+            try:
+                hierarchy = setup.refresh_hierarchy(silent=True)
+                errors = [f"{name}: {result}" for name, result in hierarchy.items() if result.startswith("ERROR")]
+                if errors:
+                    print("Agent Switchboard hierarchy refresh: " + "; ".join(errors), file=sys.stderr)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Agent Switchboard hierarchy refresh failed open: {exc}", file=sys.stderr)
         import agent_broker_mcp as broker
         # Enter the MCP stdio loop: the server keys off argv, so present it with none.
         sys.argv = [sys.argv[0]]

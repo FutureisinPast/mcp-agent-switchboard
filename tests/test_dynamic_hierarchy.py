@@ -179,9 +179,11 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
         self.assertEqual(policy["failure_fallback"]["codex"], ["explorer", "worker"])
         self.assertEqual(policy["failure_fallback"]["claude"], ["Explore", "economy-worker"])
         self.assertTrue(policy["failure_fallback"]["record_fallback"])
-        self.assertIn("proactively consider", policy["rule"])
-        self.assertIn("not a native child agent", policy["rule"])
-        self.assertIn("missing, quota-limited, times out, mismatches, or fails", policy["rule"])
+        self.assertIn("automatic external labour default only for Codex and Claude", policy["rule"])
+        self.assertIn("not Gemini/Antigravity or unknown hosts", policy["rule"])
+        self.assertIn("Every non-creditable Flash outcome", policy["rule"])
+        self.assertIn("never auto-launches native work", policy["rule"])
+        self.assertIn("structured native reader/workhorse handoff", policy["rule"])
         self.assertIn("concurrently only on independent packages", policy["rule"])
         self.assertIn("writes are serial unless demonstrably isolated", policy["rule"])
         self.assertIn("brain reviews evidence/diffs", policy["rule"])
@@ -524,6 +526,31 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         self.assertEqual([item["lane"] for item in opus["consultations"]], ["native_same_vendor"])
         self.assertEqual([call.args[0] for call in gemini_consult.call_args_list], ["codex", "claude"])
 
+    def test_gemini_complexity_routes_both_flagships_at_progressive_effort(self):
+        for complexity, expected_effort in (
+            ("bounded", "high"),
+            ("architecture", "xhigh"),
+            ("critical", "max"),
+        ):
+            with self.subTest(complexity=complexity):
+                result, consult = self._run(
+                    self._args("gemini", "gemini-3.8-flash-high", complexity)
+                )
+            self.assertEqual([call.args[0] for call in consult.call_args_list], ["codex", "claude"])
+            self.assertEqual([call.args[1]["effort"] for call in consult.call_args_list], [expected_effort, expected_effort])
+            self.assertEqual([item["requested_effort"] for item in result["consultations"]], [expected_effort, expected_effort])
+
+    def test_gemini_bounded_critical_risk_promotes_both_calls_to_max(self):
+        result, consult = self._run(
+            self._args(
+                "gemini", "gemini-3.8-flash-high", "bounded", risk_flags=["data-loss"]
+            )
+        )
+        self.assertEqual(result["complexity"], "critical")
+        self.assertTrue(result["complexity_escalated"])
+        self.assertEqual([call.args[0] for call in consult.call_args_list], ["codex", "claude"])
+        self.assertEqual([call.args[1]["effort"] for call in consult.call_args_list], ["max", "max"])
+
     def test_risk_flag_raises_effort_to_max(self):
         result, consult = self._run(
             self._args(
@@ -609,6 +636,75 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         self.assertEqual(first["consultations"][0]["status"], "skipped_quota")
         self.assertEqual(second["consultations"][0]["attestation"], "not_run")
         self.assertTrue(first["handoff_notices"])
+
+    def test_assembled_provider_prompt_budget_rejects_before_dispatch(self):
+        args = self._args("gemini", "gemini-3.8-flash-high", "bounded")
+        with mock.patch.object(broker, "DECISION_PROVIDER_PROMPT_MAX_BYTES", 100), \
+             mock.patch.object(broker, "consult") as consult:
+            with self.assertRaisesRegex(ValueError, "assembled flagship request exceeds the provider budget"):
+                broker.consult_decision(args)
+        consult.assert_not_called()
+
+    def test_oversized_provider_advice_respects_per_advice_and_combined_caps(self):
+        calls = []
+
+        def oversized(family, args):
+            calls.append((family, args["max_response_chars"]))
+            result = self._ok_consult(family, args)
+            result["response"] = family + ":" + ("x" * 20_000)
+            return result
+
+        result, _ = self._run(
+            self._args(
+                "gemini", "gemini-3.8-flash-high", "architecture", max_response_chars=1200
+            ),
+            oversized,
+        )
+        self.assertEqual(calls, [("codex", 1200), ("claude", 1200)])
+        self.assertEqual([item["target"] for item in result["consultations"]], ["codex", "claude"])
+        self.assertTrue(all(len(item["advice"]) <= 1200 for item in result["consultations"]))
+        self.assertLessEqual(
+            len(json.dumps(result, ensure_ascii=False, default=str).encode("utf-8")),
+            broker.DECISION_COMBINED_MAX_BYTES,
+        )
+        self.assertIsInstance(result["consultations"], list)
+
+    def test_nonquota_unavailability_is_isolated_latched_and_noticed(self):
+        calls = []
+
+        def outcome(family, args):
+            calls.append(family)
+            if family == "codex":
+                return {"status": "error", "response": "Connection refused by provider"}
+            return self._ok_consult(family, args)
+
+        first, _ = self._run(self._args("gemini", "gemini-3.8-flash-high"), outcome)
+        second, _ = self._run(self._args("gemini", "gemini-3.8-flash-high"), outcome)
+        self.assertEqual(calls, ["codex", "claude", "claude"])
+        self.assertEqual(first["status"], "partial")
+        self.assertEqual(first["consultations"][0]["status"], "skipped_unavailable")
+        self.assertEqual(second["consultations"][0]["status"], "skipped_unavailable")
+        self.assertEqual(second["consultations"][0]["attestation"], "not_run")
+        self.assertTrue(first["handoff_notices"])
+        self.assertTrue(second["handoff_notices"])
+
+    def test_both_gemini_flagships_unavailable_returns_unavailable_with_notices(self):
+        calls = []
+
+        def unavailable(family, _args):
+            calls.append(family)
+            return {"status": "error", "response": "Authentication failed for provider"}
+
+        result, _ = self._run(
+            self._args("gemini", "gemini-3.8-flash-high", "critical"), unavailable
+        )
+        self.assertEqual(calls, ["codex", "claude"])
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(
+            [item["status"] for item in result["consultations"]],
+            ["skipped_unavailable", "skipped_unavailable"],
+        )
+        self.assertEqual(len(result["handoff_notices"]), 2)
 
     def test_unicode_excerpt_budget_is_enforced_before_dispatch(self):
         args = self._args("codex", "gpt-5.6-sol")
@@ -835,6 +931,41 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         self.assertFalse(result["accepted"])
         self.assertEqual(result["brain_verification"]["status"], "pending")
         self.assertTrue(result["structured_output_enforced"])
+
+    def test_consult_attaches_native_handoff_for_each_noncreditable_flash_outcome(self):
+        package = self._flash_package()
+        args = {
+            "prompt": "Implement the approved bounded change.",
+            "task_kind": "implementation",
+            "mode": "accept-edits",
+            "target_model": "gemini-3.7-flash-high",
+            "effort": "high",
+            "work_package_id": package["package_id"],
+            "allowed_files": package["allowed_files"],
+            "acceptance_criteria": package["acceptance_criteria"],
+        }
+        responses = {
+            "unavailable_pre_mutation": "Antigravity CLI was not found. test",
+            "rejected": "Antigravity CLI structured-output validation failed: missing field",
+            "blocked": json.dumps({"worker_status": "blocked", "structured_output": {"status": "blocked"}, "cli": {}}),
+            "failed_pre_mutation": json.dumps({"worker_status": "failed", "structured_output": {"status": "failed"}, "cli": {}}),
+        }
+        for expected_outcome, response in responses.items():
+            with self.subTest(outcome=expected_outcome), \
+                 mock.patch.object(broker, "_MCP_CLIENT_NAME", "codex-vscode"), \
+                 mock.patch.object(broker, "load_config", return_value={"compact_task_contract": False}), \
+                 mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
+                 mock.patch.object(broker, "consult_antigravity_cli", return_value=response), \
+                 mock.patch.object(broker, "store_consultation"), \
+                 mock.patch.object(broker, "current_codex_role_model", return_value="gpt-live-terra"):
+                result = broker.consult("antigravity", args)
+            self.assertEqual(result["outcome"], expected_outcome)
+            handoff = result["native_handoff"]
+            self.assertEqual(handoff["semantic_lane"], "workhorse")
+            self.assertEqual(handoff["native"]["role"], "worker")
+            self.assertEqual(handoff["native"]["model"], "gpt-live-terra")
+            self.assertTrue(handoff["flash_skip_reason"].endswith(result["receipt"]))
+            self.assertFalse(handoff["auto_launch"])
 
 
 class ClaudeFrontierFallbackTests(unittest.TestCase):
