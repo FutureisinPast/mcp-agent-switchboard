@@ -2,7 +2,7 @@
   "name": "antigravity-agent-broker-bridge",
   "displayName": "Agent Switchboard Bridge",
   "description": "Routes queued Agent Broker requests into Antigravity's in-app agent panel.",
-  "version": "1.0.44",
+  "version": "1.0.45",
   "publisher": "futureisinpast",
   "license": "PolyForm-Noncommercial-1.0.0",
   "engines": {
@@ -48,12 +48,12 @@
         "agentBrokerBridge.pythonPath": {
           "type": "string",
           "default": "python",
-          "description": "Python executable used to run the Agent Broker."
+          "description": "Python executable used only when brokerPath resolves to the source agent_broker_mcp.py script. It is not used for the packaged agent-switchboard.exe."
         },
         "agentBrokerBridge.brokerPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the Agent Broker Python script. Leave empty to auto-detect ~/.agent-broker/agent_broker_mcp.py."
+          "description": "Explicit path to agent-switchboard.exe or agent_broker_mcp.py. Leave empty to auto-detect the packaged ~/.agent-broker/agent-switchboard.exe first, then fall back to the source Python script."
         },
         "agentBrokerBridge.showCompletionNotifications": {
           "type": "boolean",

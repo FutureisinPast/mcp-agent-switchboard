@@ -4,6 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const vscode = require('vscode');
+const { buildBrokerInvocation, resolveBrokerCommand } = require('./broker_command');
 
 let output;
 let timer;
@@ -17,6 +18,9 @@ const injectedClaudeFiles = new Set();
 let claudeFirstPoll = true;
 let antigravitySendSupported = null;
 let antigravitySendCheckedAt = 0;
+let brokerResolutionCache;
+let brokerResolutionKey = '';
+let brokerResolutionErrorReported = false;
 const ANTIGRAVITY_SEND_RECHECK_MS = 15000;
 const extensionStartedAt = Date.now();
 
@@ -82,12 +86,11 @@ const taskContracts = {
 
 function config() {
   const cfg = vscode.workspace.getConfiguration('agentBrokerBridge');
-  const defaultBrokerPath = path.join(os.homedir(), '.agent-broker', 'agent_broker_mcp.py');
   return {
     enabled: cfg.get('enabled', true),
     pollIntervalMs: cfg.get('pollIntervalMs', 3000),
     pythonPath: cfg.get('pythonPath', 'python'),
-    brokerPath: cfg.get('brokerPath', '') || defaultBrokerPath,
+    brokerPath: cfg.get('brokerPath', '') || '',
     showCompletionNotifications: cfg.get('showCompletionNotifications', false),
     showCodexInboxNotifications: cfg.get('showCodexInboxNotifications', true),
     autoOpenCodexInbox: cfg.get('autoOpenCodexInbox', true),
@@ -151,8 +154,29 @@ function configuredCdpPort(cfg) {
 
 function runBroker(args) {
   const cfg = config();
+  const resolutionKey = JSON.stringify([cfg.brokerPath, cfg.pythonPath, os.homedir()]);
+  const resolutionKeyChanged = brokerResolutionKey !== resolutionKey;
+  if (!brokerResolutionCache || !brokerResolutionCache.ok || resolutionKeyChanged) {
+    brokerResolutionKey = resolutionKey;
+    brokerResolutionCache = resolveBrokerCommand({
+      brokerPath: cfg.brokerPath,
+      pythonPath: cfg.pythonPath,
+      homeDir: os.homedir(),
+    });
+    if (resolutionKeyChanged) {
+      brokerResolutionErrorReported = false;
+    }
+  }
+  if (!brokerResolutionCache.ok) {
+    if (!brokerResolutionErrorReported) {
+      log(brokerResolutionCache.error);
+      brokerResolutionErrorReported = true;
+    }
+    return Promise.reject(new Error('Agent Switchboard launcher is unavailable; see the bridge output for checked paths.'));
+  }
+  const invocation = buildBrokerInvocation(brokerResolutionCache, args);
   return new Promise((resolve, reject) => {
-    const child = cp.spawn(cfg.pythonPath, [cfg.brokerPath, 'bridge', ...args], {
+    const child = cp.spawn(invocation.command, invocation.args, {
       windowsHide: true,
       cwd: os.homedir(),
     });
@@ -160,7 +184,11 @@ function runBroker(args) {
     let stderr = '';
     child.stdout.on('data', chunk => { stdout += chunk.toString(); });
     child.stderr.on('data', chunk => { stderr += chunk.toString(); });
-    child.on('error', reject);
+    child.on('error', err => {
+      // Re-resolve on the next call if an installed launcher is moved or removed.
+      brokerResolutionCache = undefined;
+      reject(err);
+    });
     child.on('close', code => {
       if (code !== 0) {
         reject(new Error(`broker exited ${code}: ${stderr || stdout}`));

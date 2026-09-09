@@ -188,6 +188,11 @@ On Windows, Switchboard-owned bounded subprocesses use hidden-window flags and a
 
 ## Changelog
 
+### v1.0.45 (Antigravity registration, bridge launch, and live Flash selection)
+- **Antigravity registration targets its authoritative Gemini configuration.** Installation writes the schema-compatible server entry to `~/.gemini/config/mcp_config.json` without the forbidden `type` field, safely handles an empty file, and migrates recognized legacy registrations without overwriting unrelated entries.
+- **The bridge launches the installed packaged broker directly.** Auto-detection prefers `~/.agent-broker/agent-switchboard.exe`, then falls back to the source `agent_broker_mcp.py` through Python; explicit executable and script paths remain supported.
+- **Symbolic `gemini flash` routing refreshes the live CLI catalog before dispatch.** It selects the newest advertised stable numeric Flash High (3.8 when the CLI advertises it, then future 3.9, 4, and later releases automatically), preserves explicit model pins, and retains bounded breaker/cache fallback behavior when live discovery fails.
+
 ### v1.0.44 (host-aware labour routing + MCP/process diagnostics)
 - **Flash-first labour routing is host-aware.** Codex and Claude use Flash first for eligible bounded labour; Gemini, Antigravity, and unknown hosts receive no automatic downward route, while explicit routing and Gemini's upward Astra/Fable decision consultation remain available.
 - **Flash failures return an actionable native handoff.** Every unavailable, rejected, blocked, or failed Flash outcome gives Codex/Claude callers a structured reader/workhorse fallback without auto-launching native work.

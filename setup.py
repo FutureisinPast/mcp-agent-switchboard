@@ -75,7 +75,12 @@ ANTIGRAVITY_USER_DIRS = [
     APPDATA / "Antigravity IDE" / "User",
     APPDATA / "Antigravity" / "User",
 ]
-ANTIGRAVITY_MCP_CANDIDATES = [p / "mcp_config.json" for p in ANTIGRAVITY_USER_DIRS]
+# Antigravity reads its MCP registration from the Gemini home, not from the
+# VS Code-style roaming profile directories.  The roaming paths are retained only
+# to diagnose and safely migrate registrations written by older Switchboard builds.
+ANTIGRAVITY_MCP = HOME / ".gemini" / "config" / "mcp_config.json"
+ANTIGRAVITY_LEGACY_MCP_CANDIDATES = [p / "mcp_config.json" for p in ANTIGRAVITY_USER_DIRS]
+ANTIGRAVITY_MCP_CANDIDATES = [ANTIGRAVITY_MCP, *ANTIGRAVITY_LEGACY_MCP_CANDIDATES]
 VSCODE_MCP = APPDATA / "Code" / "User" / "mcp.json"
 
 # MCP server key names per host (Codex uses an underscore; the rest use a hyphen).
@@ -482,7 +487,11 @@ def host_is_installed(host: str) -> bool:
         if host == "claude_desktop":
             return bool(claude_desktop_installed())
         if host == "antigravity":
-            return bool(antigravity_user_dir().exists() or antigravity_cli())
+            return bool(
+                antigravity_mcp_path().exists()
+                or antigravity_user_dir().exists()
+                or antigravity_cli()
+            )
         if host == "vscode":
             return bool((APPDATA / "Code" / "User").exists() or vscode_cli())
     except Exception:  # noqa: BLE001
@@ -511,22 +520,12 @@ def missing_registrations() -> list[dict]:
 
 
 def antigravity_profile_report() -> list[dict]:
-    """Every Antigravity profile directory that exists, and its registration state.
-
-    Two profile roots can exist side by side on one box ("Antigravity IDE\\User"
-    and "Antigravity\\User"), typically because the app was renamed between
-    versions. Only the first EXISTING one is ever written, and the other keeps
-    whatever it last had. A reader that opens the wrong one concludes the IDE is
-    unregistered when it is not -- which is exactly what happened here. Report
-    both, and mark which one the installer selects, so the two are never confused
-    again.
-    """
-    selected = antigravity_user_dir()
+    """Report the authoritative Gemini-home config plus existing legacy profiles."""
     rows = []
-    for directory in ANTIGRAVITY_USER_DIRS:
-        if not directory.exists():
-            continue
-        config = directory / "mcp_config.json"
+    candidates = [(antigravity_mcp_path(), True)] + [
+        (path, False) for path in ANTIGRAVITY_LEGACY_MCP_CANDIDATES if path.exists() or path.parent.exists()
+    ]
+    for config, authoritative in candidates:
         registered = None
         if config.exists():
             try:
@@ -536,8 +535,11 @@ def antigravity_profile_report() -> list[dict]:
             except Exception:  # noqa: BLE001
                 registered = None
         rows.append({
-            "directory": str(directory),
-            "selected": directory == selected,
+            "directory": str(config.parent),
+            "config_path": str(config),
+            "selected": authoritative,
+            "authoritative": authoritative,
+            "legacy": not authoritative,
             "config_exists": config.exists(),
             "registered": registered,
         })
@@ -572,8 +574,13 @@ def repair_registrations(dry: bool) -> dict[str, str]:
             continue
         outcome = writer(command, cargs, False)
         results[label] = (
-            f"re-pointed {stale} -> {Path(command).name}" if outcome == "registered" else outcome
+            f"re-pointed {stale} -> {Path(command).name}" if outcome.startswith("registered") else outcome
         )
+    if host_is_installed("antigravity") and registered_command("antigravity") is None:
+        results["Antigravity MCP"] = register_antigravity(command, cargs, dry)
+    legacy_cleanup = _cleanup_legacy_antigravity_registrations(dry)
+    if legacy_cleanup:
+        results["Antigravity legacy MCP"] = legacy_cleanup
     return results
 
 
@@ -746,7 +753,7 @@ def antigravity_user_dir() -> Path:
 
 
 def antigravity_mcp_path() -> Path:
-    return antigravity_user_dir() / "mcp_config.json"
+    return ANTIGRAVITY_MCP
 
 
 def antigravity_schema() -> str | None:
@@ -822,7 +829,7 @@ def detect() -> dict[str, dict]:
         "antigravity": {
             "label": "Antigravity IDE",
             "cli": antigravity_cli(),
-            "config": antigravity_mcp_path() if antigravity_user_dir().exists() else None,
+            "config": antigravity_mcp_path() if antigravity_mcp_path().exists() else None,
         },
         "vscode": {
             "label": "VS Code",
@@ -836,12 +843,15 @@ def detect() -> dict[str, dict]:
 
 
 # --- MCP registration writers (idempotent, backed up) ----------------------
-def _mcp_block(caller: str, command: str, args: list[str]) -> dict:
+def _mcp_block(caller: str, command: str, args: list[str], *, include_type: bool = True) -> dict:
     # The host's stdio pipe is not guaranteed to be UTF-8 (Windows consoles
     # default to the system codepage); force the interpreter's own side so
     # the server always reads/writes UTF-8 regardless of host locale.
-    return {"type": "stdio", "command": command, "args": list(args),
-            "env": {"AGENT_BROKER_CALLER": caller, "PYTHONUTF8": "1"}}
+    block = {"command": command, "args": list(args),
+             "env": {"AGENT_BROKER_CALLER": caller, "PYTHONUTF8": "1"}}
+    if include_type:
+        block["type"] = "stdio"
+    return block
 
 
 def register_codex(command: str, args: list[str], dry: bool) -> str:
@@ -883,21 +893,41 @@ def _remove_toml_sections(text: str, sections: list[str]) -> str:
     return "\n".join(out)
 
 
-def _register_json(path: Path, caller: str, command: str, args: list[str], dry: bool, ensure_schema=None) -> str:
+def _register_json(
+    path: Path,
+    caller: str,
+    command: str,
+    args: list[str],
+    dry: bool,
+    ensure_schema=None,
+    *,
+    include_type: bool = True,
+    allow_empty: bool = False,
+) -> str:
     if dry:
         return f"would set mcpServers['{MCP_KEY}'] in {path.name}"
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {}
+    backed_up = False
     if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:  # noqa: BLE001
-            return f"ERROR: {path.name} is not valid JSON ({exc}); left untouched"
-    backup_file(path)
+        raw = path.read_text(encoding="utf-8")
+        if allow_empty and not raw.strip():
+            # Antigravity can leave its authoritative MCP file at zero bytes. It is
+            # safe to initialize that state, but preserve the original first.
+            backup_file(path)
+            backed_up = True
+            data = {}
+        else:
+            try:
+                data = json.loads(raw)
+            except Exception as exc:  # noqa: BLE001
+                return f"ERROR: {path.name} is not valid JSON ({exc}); left untouched"
+    if not backed_up:
+        backup_file(path)
     if ensure_schema and "$schema" not in data:
         data["$schema"] = ensure_schema
     servers = data.setdefault("mcpServers", {})
-    servers[MCP_KEY] = _mcp_block(caller, command, args)
+    servers[MCP_KEY] = _mcp_block(caller, command, args, include_type=include_type)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return "registered"
 
@@ -924,17 +954,30 @@ def register_claude_desktop(command: str, args: list[str], dry: bool) -> str:
 
 
 def register_antigravity(command: str, args: list[str], dry: bool) -> str:
-    if not antigravity_user_dir().exists() and not antigravity_cli():
+    if not (
+        antigravity_mcp_path().exists()
+        or any(path.parent.exists() for path in ANTIGRAVITY_LEGACY_MCP_CANDIDATES)
+        or antigravity_cli()
+    ):
         return "skipped (not installed)"
     schema = antigravity_schema()
-    return _register_json(
+    outcome = _register_json(
         antigravity_mcp_path(),
         "antigravity",
         command,
         args,
         dry,
         ensure_schema=schema,
+        include_type=False,
+        allow_empty=True,
     )
+    if outcome == "registered":
+        cleanup = _cleanup_legacy_antigravity_registrations(False)
+        return outcome + (f"; {cleanup}" if cleanup else "")
+    if dry:
+        cleanup = _cleanup_legacy_antigravity_registrations(True)
+        return outcome + (f"; {cleanup}" if cleanup else "")
+    return outcome
 
 
 def register_vscode(command: str, args: list[str], dry: bool) -> str:
@@ -987,14 +1030,69 @@ def _unregister_json(path: Path, key_parent: str, dry: bool) -> str:
     return "removed"
 
 
+def _is_recognized_switchboard_entry(entry: object) -> bool:
+    """Whether a JSON MCP entry points to a known Switchboard launch shape."""
+    if not isinstance(entry, dict):
+        return False
+    command = str(entry.get("command") or "").strip()
+    if not command:
+        return False
+    command_name = Path(command.replace("\\", "/")).name.lower()
+    if command_name == "agent-switchboard.exe" or (
+        command_name.startswith("agent-switchboard-") and command_name.endswith(".exe")
+    ):
+        return True
+    args = entry.get("args") or []
+    if not isinstance(args, list):
+        return False
+    python_names = {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"}
+    return command_name in python_names and any(
+        Path(str(value).replace("\\", "/")).name.lower() == SERVER_NAME.lower()
+        for value in args
+    )
+
+
+def _unregister_owned_antigravity_entry(path: Path, dry: bool) -> str:
+    """Remove only a recognized Switchboard entry, preserving all unrelated data."""
+    if not path.exists():
+        return "nothing to remove"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return "skipped (invalid JSON)"
+    servers = data.get("mcpServers") or {}
+    entry = servers.get(MCP_KEY) if isinstance(servers, dict) else None
+    if entry is None:
+        return "nothing to remove"
+    if not _is_recognized_switchboard_entry(entry):
+        return "preserved (unrecognized command)"
+    if dry:
+        return f"would remove mcpServers['{MCP_KEY}'] from {path.name}"
+    backup_file(path)
+    servers.pop(MCP_KEY, None)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return "removed"
+
+
+def _cleanup_legacy_antigravity_registrations(dry: bool) -> str:
+    results = []
+    for path in ANTIGRAVITY_LEGACY_MCP_CANDIDATES:
+        if not path.exists():
+            continue
+        outcome = _unregister_owned_antigravity_entry(path, dry)
+        if outcome != "nothing to remove":
+            results.append(f"{path.parent.parent.name}: {outcome}")
+    return "; ".join(results)
+
+
 def unregister_antigravity(dry: bool) -> str:
-    paths = [p for p in ANTIGRAVITY_MCP_CANDIDATES if p.exists()]
+    paths = [p for p in [antigravity_mcp_path(), *ANTIGRAVITY_LEGACY_MCP_CANDIDATES] if p.exists()]
     if not paths:
         return "nothing to remove"
     results = []
     for path in paths:
-        label = path.parent.parent.name
-        results.append(f"{label}: {_unregister_json(path, 'mcpServers', dry)}")
+        label = "authoritative" if path == antigravity_mcp_path() else f"legacy {path.parent.parent.name}"
+        results.append(f"{label}: {_unregister_owned_antigravity_entry(path, dry)}")
     return "; ".join(results)
 
 
@@ -1268,18 +1366,18 @@ def show_registration_health() -> bool:
         healthy = False
         print(f"  [!!] {row['label']:<16} installed but NOT registered — run: install")
 
-    # Two Antigravity profile roots can coexist; only one is ever written. Show
-    # both so a registration sitting in the unused profile is visible as such.
+    # Roaming profile configs are historical only. Show them beside the selected
+    # Gemini-home config without treating a legacy registration as healthy.
     profiles = antigravity_profile_report()
     if len(profiles) > 1:
-        print("  [--] Antigravity has more than one profile directory:")
+        print("  [--] Antigravity authoritative and legacy MCP locations:")
         for profile in profiles:
-            marker = "<- installer writes here" if profile["selected"] else "   (not written)"
+            marker = "<- authoritative" if profile["authoritative"] else "   (legacy diagnostic only)"
             state = "registered" if profile["registered"] else "no broker entry"
             print(f"         {profile['directory']}  [{state}] {marker}")
         if not any(p["selected"] and p["registered"] for p in profiles):
             healthy = False
-            print("  [!!] the profile the installer writes carries no broker entry — run: install")
+            print("  [!!] the authoritative Gemini-home config carries no broker entry — run: install")
     if not healthy:
         info("")
         info(f"UNHEALTHY: a host is registered to a binary that is not this build ({BROKER_VERSION}).")

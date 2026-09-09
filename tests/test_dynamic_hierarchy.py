@@ -130,10 +130,14 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
             self._catalog(
                 "gemini-3.9-flash-high",
                 "gemini-3.10-flash-high",
+                "gemini-4-flash-high",
                 "gemini-99.0-flash-high-preview",
+                "gemini-99-flash-lite-high",
+                "gemini-99-image-flash-high",
+                "gemini-99-pro-high",
             )
         )
-        self.assertEqual(roles["workhorse"]["id"], "gemini-3.10-flash-high")
+        self.assertEqual(roles["workhorse"]["id"], "gemini-4-flash-high")
 
     def test_static_36_is_offline_fallback_only(self):
         roles = broker.antigravity_roles_from_models(self._catalog())
@@ -147,7 +151,7 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
             "project": "p",
             "topic": "routing-test",
         }
-        with mock.patch.object(broker, "discover_antigravity_models", return_value=catalog), \
+        with mock.patch.object(broker, "discover_antigravity_models", return_value=catalog) as discover, \
              mock.patch.object(broker, "find_model_default", return_value=None), \
              mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")):
             bare = broker.resolve_model_request(common)
@@ -161,6 +165,10 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
         self.assertEqual(generic["source"], "family_workhorse")
         self.assertEqual(exact["target_model"], "gemini-3.6-flash-high")
         self.assertEqual(exact["source"], "explicit_request")
+        self.assertGreaterEqual(
+            sum(call.kwargs.get("force_live") is True for call in discover.call_args_list),
+            2,
+        )
 
     def test_catalog_and_guide_expose_non_authoritative_workhorse_role(self):
         models = self._catalog("gemini-3.6-flash-high", "gemini-3.7-flash-high")
@@ -178,6 +186,7 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
         self.assertIn("bounded search/read/extraction/summaries/drafting", policy["recommended_for"])
         self.assertEqual(policy["failure_fallback"]["codex"], ["explorer", "worker"])
         self.assertEqual(policy["failure_fallback"]["claude"], ["Explore", "economy-worker"])
+
         self.assertTrue(policy["failure_fallback"]["record_fallback"])
         self.assertIn("automatic external labour default only for Codex and Claude", policy["rule"])
         self.assertIn("not Gemini/Antigravity or unknown hosts", policy["rule"])
@@ -204,6 +213,20 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
         self.assertTrue(write_args["acceptance_criteria"])
         self.assertIn("one work package per call", " ".join(policy["hard_requirements"]))
         self.assertIn("schema-enforced JSON", " ".join(policy["hard_requirements"]))
+
+    def test_explicit_flash_pin_does_not_force_live_refresh_or_upgrade(self):
+        catalog = self._catalog("gemini-3.8-flash-high")
+        with mock.patch.object(broker, "discover_antigravity_models", return_value=catalog) as discover, \
+             mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")):
+            result = broker.resolve_model_request(
+                {
+                    "project": "p",
+                    "target_agent": "antigravity",
+                    "target_model": "gemini-3.6-flash-high",
+                }
+            )
+        self.assertEqual(result["target_model"], "gemini-3.6-flash-high")
+        self.assertFalse(any(call.kwargs.get("force_live") for call in discover.call_args_list))
 
     @staticmethod
     def _flash_package() -> dict:

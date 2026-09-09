@@ -11,18 +11,20 @@ after repeated failures, while never dropping the previously observed slugs.
 ISOLATION: every test monkeypatches `agent_broker_mcp.ANTIGRAVITY_CATALOG_PATH` to
 a file inside a TemporaryDirectory and restores the original value in teardown.
 No test reads or writes the real `~/.agent-broker/antigravity-models.json`. No
-test calls `discover_antigravity_models()` (real network call) or invokes `agy`.
+discovery test invokes a real `agy` process; subprocess calls are mocked.
 """
 from __future__ import annotations
 
 import calendar
 import json
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -46,6 +48,9 @@ class AntigravityCatalogCacheTests(unittest.TestCase):
         broker.ANTIGRAVITY_CATALOG_LOCK_PATH = broker.ANTIGRAVITY_CATALOG_PATH.with_suffix(".lock")
         # Keep the timeout tiny so the lock-contention tests below stay fast.
         broker.ANTIGRAVITY_CATALOG_LOCK_TIMEOUT_SECONDS = 0.3
+        broker._ANTIGRAVITY_MODEL_CACHE = None
+        broker._ANTIGRAVITY_MODEL_CACHE_AT = 0.0
+        broker._ANTIGRAVITY_LAST_DISCOVERY_STATUS = {}
 
     def tearDown(self):
         broker.ANTIGRAVITY_CATALOG_PATH = self._orig_path
@@ -306,6 +311,99 @@ class AntigravityCatalogCacheTests(unittest.TestCase):
 
         after = broker._read_antigravity_catalog_state()
         self.assertEqual(after, before)
+
+    def _discover_with(self, proc, *, force_live=True):
+        run_kwargs = (
+            {"side_effect": proc}
+            if isinstance(proc, BaseException)
+            else {"return_value": proc}
+        )
+        with mock.patch.object(broker, "load_config", return_value={}), \
+             mock.patch.object(broker, "discover_antigravity_cli", return_value="agy"), \
+             mock.patch.object(broker.subprocess, "run", **run_kwargs) as runner, \
+             mock.patch.object(broker.shutil, "which", return_value=None):
+            result = broker.discover_antigravity_models(force_live=force_live)
+        return result, runner
+
+    def test_forced_refresh_bypasses_memory_and_fresh_disk_each_time(self):
+        broker._save_antigravity_catalog(["gemini-3.7-flash-high"])
+        broker._ANTIGRAVITY_MODEL_CACHE = [
+            broker.antigravity_model_entry_from_slug("gemini-3.7-flash-high")
+        ]
+        broker._ANTIGRAVITY_MODEL_CACHE_AT = time.monotonic()
+        replies = iter(
+            [
+                mock.Mock(returncode=0, stdout="gemini-3.8-flash-high\n", stderr=""),
+                mock.Mock(returncode=0, stdout="gemini-4-flash-high\n", stderr=""),
+            ]
+        )
+        with mock.patch.object(broker, "load_config", return_value={}), \
+             mock.patch.object(broker, "discover_antigravity_cli", return_value="agy"), \
+             mock.patch.object(broker.subprocess, "run", side_effect=lambda *a, **k: next(replies)) as runner, \
+             mock.patch.object(broker.shutil, "which", return_value=None):
+            first = broker.current_antigravity_workhorse_model(force_live=True, require_observed=True)
+            second = broker.current_antigravity_workhorse_model(force_live=True, require_observed=True)
+        self.assertEqual(first, "gemini-3.8-flash-high")
+        self.assertEqual(second, "gemini-4-flash-high")
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(runner.call_args.kwargs["timeout"], broker.ANTIGRAVITY_MODEL_DISCOVERY_TIMEOUT)
+        self.assertEqual(runner.call_args.kwargs["creationflags"], broker.WINDOWS_NO_WINDOW)
+
+    def test_failed_forced_refresh_uses_observed_cache_and_reports_fallback(self):
+        broker._save_antigravity_catalog(["gemini-3.7-flash-high"])
+        models, _ = self._discover_with(subprocess.TimeoutExpired("agy", 1))
+        roles = broker.antigravity_roles_from_models(models)
+        status = broker.antigravity_catalog_status()
+        self.assertEqual(roles["workhorse"]["id"], "gemini-3.7-flash-high")
+        self.assertTrue(status["live_refresh_attempted"])
+        self.assertFalse(status["live_refresh_succeeded"])
+        self.assertTrue(status["catalog_fallback"])
+        self.assertTrue(status["catalog_stale"])
+
+    def test_forced_refresh_respects_open_breaker_and_uses_cache(self):
+        broker._save_antigravity_catalog(["gemini-3.7-flash-high"])
+        broker._record_antigravity_discovery_failure()
+        broker._record_antigravity_discovery_failure()
+        self.assertTrue(
+            broker._antigravity_breaker_open(broker._read_antigravity_catalog_state())
+        )
+        proc = mock.Mock(returncode=0, stdout="gemini-4-flash-high\n", stderr="")
+        models, runner = self._discover_with(proc)
+        roles = broker.antigravity_roles_from_models(models)
+        status = broker.antigravity_catalog_status()
+        runner.assert_not_called()
+        self.assertEqual(roles["workhorse"]["id"], "gemini-3.7-flash-high")
+        self.assertFalse(status["live_refresh_attempted"])
+        self.assertEqual(status["live_refresh_failure"], "discovery_breaker_open")
+        self.assertTrue(status["catalog_fallback"])
+        self.assertTrue(status["catalog_stale"])
+
+    def test_successful_catalog_without_flash_does_not_resurrect_stale_flash(self):
+        broker._save_antigravity_catalog(["gemini-3.7-flash-high"])
+        proc = mock.Mock(returncode=0, stdout="gemini-4-pro-high\n", stderr="")
+        models, _ = self._discover_with(proc)
+        self.assertIsNone(
+            broker.current_antigravity_workhorse_model(
+                force_live=False, require_observed=True
+            )
+        )
+        ids = {item["id"] for item in models if item.get("source") == "antigravity-cli"}
+        self.assertEqual(ids, {"gemini-4-pro-high"})
+        self.assertFalse(broker.antigravity_catalog_status()["catalog_fallback"])
+
+    def test_no_live_or_cache_returns_structured_model_selection_failure(self):
+        proc = mock.Mock(returncode=1, stdout="", stderr="offline")
+        with mock.patch.object(broker, "load_config", return_value={}), \
+             mock.patch.object(broker, "discover_antigravity_cli", return_value="agy"), \
+             mock.patch.object(broker.subprocess, "run", return_value=proc), \
+             mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
+             mock.patch.object(broker.shutil, "which", return_value=None):
+            result = broker.resolve_model_request(
+                {"project": "p", "target_agent": "antigravity", "target_model": "gemini flash"}
+            )
+        self.assertEqual(result["status"], "needs_model_selection")
+        self.assertIn("No eligible stable Gemini Flash High", result["reason"])
+        self.assertTrue(result["catalog_status"]["live_refresh_attempted"])
 
 
 if __name__ == "__main__":

@@ -38,9 +38,15 @@ class RegistrationHealthTests(unittest.TestCase):
         self._patch("CODEX_TOML", self.root / "codex" / "config.toml")
         self._patch("CLAUDE_JSON", self.root / "claude" / ".claude.json")
         self._patch("CLAUDE_DESKTOP_CONFIG", self.root / "claude_desktop" / "claude_desktop_config.json")
-        self._patch("ANTIGRAVITY_USER_DIRS", [self.root / "antigravity_missing" / "User"])
+        legacy_dir = self.root / "appdata_missing" / "Antigravity IDE" / "User"
+        authoritative = self.root / "home" / ".gemini" / "config" / "mcp_config.json"
+        self._patch("ANTIGRAVITY_USER_DIRS", [legacy_dir])
+        self._patch("ANTIGRAVITY_MCP", authoritative)
+        self._patch("ANTIGRAVITY_LEGACY_MCP_CANDIDATES", [legacy_dir / "mcp_config.json"])
+        self._patch("ANTIGRAVITY_MCP_CANDIDATES", [authoritative, legacy_dir / "mcp_config.json"])
         self._patch("VSCODE_MCP", self.root / "vscode_missing" / "mcp.json")
         self._patch("BROKER_HOME", self.root / "broker")
+        self._patch("_backup_root", None)
         self._patch("FROZEN", False)
         # host_is_installed("vscode") checks (APPDATA / "Code" / "User").exists()
         # directly, independent of VSCODE_MCP -- patch APPDATA too so a real VS Code
@@ -68,7 +74,7 @@ class RegistrationHealthTests(unittest.TestCase):
         path.write_text(json.dumps(data), encoding="utf-8")
 
     def _registration(self, env=None):
-        config = setup.ANTIGRAVITY_USER_DIRS[0] / "mcp_config.json"
+        config = setup.antigravity_mcp_path()
         self._write_json(config, {
             "mcpServers": {
                 "agent-switchboard": {
@@ -169,59 +175,56 @@ class RegistrationHealthTests(unittest.TestCase):
 
     # -- antigravity_profile_report ---------------------------------------------
 
-    def test_antigravity_profile_report_both_dirs_selects_first(self):
-        # With two profile roots present, exactly one row must be marked selected,
-        # and it must be the FIRST candidate -- matching antigravity_user_dir()'s
-        # first-match-wins behavior.
-        first = self.root / "antigravity_ide" / "User"
-        second = self.root / "antigravity_old" / "User"
-        first.mkdir(parents=True)
-        second.mkdir(parents=True)
-        setup.ANTIGRAVITY_USER_DIRS = [first, second]
+    def test_antigravity_profile_report_selects_authoritative_home_path(self):
+        legacy = setup.ANTIGRAVITY_LEGACY_MCP_CANDIDATES[0]
+        legacy.parent.mkdir(parents=True)
 
         rows = setup.antigravity_profile_report()
 
         self.assertEqual(len(rows), 2)
         selected_rows = [r for r in rows if r["selected"]]
         self.assertEqual(len(selected_rows), 1)
-        self.assertEqual(selected_rows[0]["directory"], str(first))
+        self.assertEqual(selected_rows[0]["config_path"], str(setup.ANTIGRAVITY_MCP))
+        self.assertTrue(selected_rows[0]["authoritative"])
+        legacy_row = [r for r in rows if r["legacy"]][0]
+        self.assertEqual(legacy_row["config_path"], str(legacy))
+        self.assertFalse(legacy_row["selected"])
 
-    def test_antigravity_profile_report_shows_asymmetry_when_selected_dir_is_unregistered(self):
-        # The exact trap this function exists to catch: the SELECTED (first-match)
-        # profile dir has no broker entry, but the OTHER (unused) dir does. A reader
-        # that only opens the selected dir would wrongly conclude the IDE is unregistered.
-        selected_dir = self.root / "antigravity_ide" / "User"
-        other_dir = self.root / "antigravity_old" / "User"
-        selected_dir.mkdir(parents=True)
-        other_dir.mkdir(parents=True)
-        setup.ANTIGRAVITY_USER_DIRS = [selected_dir, other_dir]
-
+    def test_legacy_only_registration_is_reported_but_not_authoritative_or_healthy(self):
+        legacy = setup.ANTIGRAVITY_LEGACY_MCP_CANDIDATES[0]
         self._write_json(
-            other_dir / "mcp_config.json",
+            legacy,
             {"mcpServers": {"agent-switchboard": {"command": r"C:\path\agent-switchboard.exe"}}},
         )
 
-        rows = setup.antigravity_profile_report()
+        profiles = setup.antigravity_profile_report()
+        authoritative = [row for row in profiles if row["authoritative"]][0]
+        legacy_row = [row for row in profiles if row["legacy"]][0]
+        self.assertIsNone(authoritative["registered"])
+        self.assertEqual(legacy_row["registered"], r"C:\path\agent-switchboard.exe")
+        self.assertIsNone(setup.registered_command("antigravity"))
+        self.assertFalse(any(row["host"] == "antigravity" for row in setup.registration_report()))
+        self.assertIn("antigravity", {row["host"] for row in setup.missing_registrations()})
 
-        by_dir = {r["directory"]: r for r in rows}
-        self.assertIsNone(by_dir[str(selected_dir)]["registered"])
-        self.assertTrue(by_dir[str(selected_dir)]["selected"])
-        self.assertEqual(by_dir[str(other_dir)]["registered"], r"C:\path\agent-switchboard.exe")
-        self.assertFalse(by_dir[str(other_dir)]["selected"])
-
-    def test_antigravity_profile_report_single_dir_returns_one_selected_row(self):
-        # Only one candidate dir exists on this box: report exactly one row, and it
-        # must still be marked selected (no false "second profile" noise).
-        only_dir = self.root / "antigravity_ide" / "User"
-        missing_dir = self.root / "antigravity_old" / "User"
-        only_dir.mkdir(parents=True)
-        setup.ANTIGRAVITY_USER_DIRS = [only_dir, missing_dir]
-
+    def test_antigravity_profile_report_always_includes_authoritative_row(self):
         rows = setup.antigravity_profile_report()
 
         self.assertEqual(len(rows), 1)
         self.assertTrue(rows[0]["selected"])
-        self.assertEqual(rows[0]["directory"], str(only_dir))
+        self.assertTrue(rows[0]["authoritative"])
+        self.assertEqual(rows[0]["config_path"], str(setup.ANTIGRAVITY_MCP))
+
+    def test_effective_registration_prefers_authoritative_over_legacy(self):
+        self._registration()
+        legacy = setup.ANTIGRAVITY_LEGACY_MCP_CANDIDATES[0]
+        self._write_json(legacy, {
+            "mcpServers": {"agent-switchboard": {"command": "legacy.exe", "args": [], "env": {}}}
+        })
+
+        result = setup.effective_antigravity_mcp_registration()
+
+        self.assertEqual(result["config_path"], str(setup.ANTIGRAVITY_MCP))
+        self.assertEqual(result["command"], sys.executable)
 
     # -- Antigravity MCP stdio diagnostic ---------------------------------
 
@@ -318,6 +321,20 @@ class RegistrationHealthTests(unittest.TestCase):
         # missing_registrations() would nag about apps the user does not have.
         for host, _ in setup.REGISTRATION_HOSTS:
             self.assertFalse(setup.host_is_installed(host), host)
+
+    def test_bare_gemini_config_directory_does_not_mean_antigravity_is_installed(self):
+        setup.ANTIGRAVITY_MCP.parent.mkdir(parents=True)
+
+        self.assertFalse(setup.ANTIGRAVITY_MCP.exists())
+        self.assertFalse(setup.host_is_installed("antigravity"))
+
+    def test_existing_authoritative_config_or_legacy_profile_is_antigravity_evidence(self):
+        self._write_json(setup.ANTIGRAVITY_MCP, {"mcpServers": {}})
+        self.assertTrue(setup.host_is_installed("antigravity"))
+
+        setup.ANTIGRAVITY_MCP.unlink()
+        setup.ANTIGRAVITY_LEGACY_MCP_CANDIDATES[0].parent.mkdir(parents=True)
+        self.assertTrue(setup.host_is_installed("antigravity"))
 
 
 if __name__ == "__main__":

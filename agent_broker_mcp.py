@@ -2579,8 +2579,15 @@ def antigravity_roles_from_models(models: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
-def current_antigravity_workhorse_model() -> str:
-    role = antigravity_roles_from_models(discover_antigravity_models()).get("workhorse") or {}
+def current_antigravity_workhorse_model(
+    *, force_live: bool = False, require_observed: bool = False
+) -> str | None:
+    roles = antigravity_roles_from_models(
+        discover_antigravity_models(force_live=force_live)
+    )
+    if require_observed and roles.get("source") != "antigravity-cli":
+        return None
+    role = roles.get("workhorse") or {}
     return str(role.get("id") or ANTIGRAVITY_DEFAULT_MODEL)
 
 
@@ -2597,6 +2604,7 @@ def antigravity_model_slugs_from_output(output: Any) -> list[str]:
 
 _ANTIGRAVITY_MODEL_CACHE: list[dict[str, Any]] | None = None
 _ANTIGRAVITY_MODEL_CACHE_AT = 0.0
+_ANTIGRAVITY_LAST_DISCOVERY_STATUS: dict[str, Any] = {}
 
 
 def local_port_open(port: int, timeout: float = 0.2) -> bool:
@@ -2747,7 +2755,7 @@ def antigravity_catalog_status() -> dict[str, Any]:
     """What the receipt must disclose about how the model list was obtained."""
     state = _read_antigravity_catalog_state()
     age = _catalog_age_seconds(state)
-    return {
+    result = {
         "catalog_source": "disk_cache" if state.get("slugs") else "bundled_static",
         "catalog_observed_at": state.get("observed_at"),
         "catalog_age_seconds": None if age is None else int(age),
@@ -2755,9 +2763,11 @@ def antigravity_catalog_status() -> dict[str, Any]:
         "discovery_breaker_open": _antigravity_breaker_open(state),
         "consecutive_discovery_failures": int(state.get("consecutive_failures") or 0),
     }
+    result.update(_ANTIGRAVITY_LAST_DISCOVERY_STATUS)
+    return result
 
 
-def _should_probe_antigravity_models() -> bool:
+def _should_probe_antigravity_models(force_live: bool = False) -> bool:
     """Whether this route should pay for a live `agy models` call.
 
     Ordering matters more than the timeout here. The previously observed catalog
@@ -2767,10 +2777,12 @@ def _should_probe_antigravity_models() -> bool:
     it is genuinely stale and the breaker is closed.
     """
     state = _read_antigravity_catalog_state()
-    if not state.get("slugs"):
-        return True  # nothing observed yet: the probe is the only source of truth
     if _antigravity_breaker_open(state):
         return False
+    if force_live:
+        return True
+    if not state.get("slugs"):
+        return True  # nothing observed yet: the probe is the only source of truth
     age = _catalog_age_seconds(state)
     if age is None:
         return True
@@ -2783,10 +2795,11 @@ def _load_antigravity_catalog() -> list[str]:
     return [str(s) for s in slugs] if isinstance(slugs, list) else []
 
 
-def discover_antigravity_models() -> list[dict[str, Any]]:
-    global _ANTIGRAVITY_MODEL_CACHE, _ANTIGRAVITY_MODEL_CACHE_AT
+def discover_antigravity_models(force_live: bool = False) -> list[dict[str, Any]]:
+    global _ANTIGRAVITY_MODEL_CACHE, _ANTIGRAVITY_MODEL_CACHE_AT, _ANTIGRAVITY_LAST_DISCOVERY_STATUS
     if (
-        _ANTIGRAVITY_MODEL_CACHE is not None
+        not force_live
+        and _ANTIGRAVITY_MODEL_CACHE is not None
         and time.monotonic() - _ANTIGRAVITY_MODEL_CACHE_AT < ANTIGRAVITY_MODEL_CACHE_SECONDS
     ):
         return [dict(item) for item in _ANTIGRAVITY_MODEL_CACHE]
@@ -2810,7 +2823,10 @@ def discover_antigravity_models() -> list[dict[str, Any]]:
 
     agy = discover_antigravity_cli(config)
     discovered_live = False
-    if agy and _should_probe_antigravity_models():
+    attempted_live = False
+    live_failure: str | None = None
+    if agy and _should_probe_antigravity_models(force_live=force_live):
+        attempted_live = True
         try:
             proc = subprocess.run(
                 [agy, "models"],
@@ -2830,19 +2846,58 @@ def discover_antigravity_models() -> list[dict[str, Any]]:
                 if slugs:
                     discovered_live = True
                     _save_antigravity_catalog(slugs)
+                else:
+                    live_failure = "malformed_or_empty_catalog"
+                    _record_antigravity_discovery_failure()
             else:
+                live_failure = f"exit_{proc.returncode}"
                 log(f"agy models exited {proc.returncode}: {proc.stderr[:500]}")
+                _record_antigravity_discovery_failure()
         except Exception as exc:  # noqa: BLE001
+            live_failure = type(exc).__name__
             log(f"agy model discovery failed: {exc}")
             _record_antigravity_discovery_failure()
-    if not discovered_live:
+    used_disk_cache = False
+    # A successful live catalog is authoritative even if it advertises no eligible
+    # Flash High model. Only an unavailable/failed/malformed probe may fall back to
+    # the last observed catalog; this prevents stale Flash resurrection.
+    if not discovered_live and not (attempted_live and live_failure is None):
         # Live discovery is a network call and is genuinely slow sometimes. Falling
         # straight back to the bundled static list silently DOWNGRADES every brain to
         # an older Flash than the one actually available -- the exact failure this
         # round exists to prevent. A previously observed catalog is stale at worst;
         # the static list is wrong by construction the moment a new model ships.
-        for slug in _load_antigravity_catalog():
+        cached_slugs = _load_antigravity_catalog()
+        used_disk_cache = bool(cached_slugs)
+        for slug in cached_slugs:
             models.append(antigravity_model_entry_from_slug(slug))
+
+    if attempted_live:
+        _ANTIGRAVITY_LAST_DISCOVERY_STATUS = {
+            "live_refresh_attempted": True,
+            "live_refresh_succeeded": discovered_live,
+            "live_refresh_failure": live_failure,
+            "catalog_source": "live" if discovered_live else ("disk_cache" if used_disk_cache else "bundled_static"),
+            "catalog_fallback": used_disk_cache,
+            "catalog_stale": used_disk_cache,
+        }
+    elif force_live:
+        breaker_open = bool(agy) and _antigravity_breaker_open(
+            _read_antigravity_catalog_state()
+        )
+        _ANTIGRAVITY_LAST_DISCOVERY_STATUS = {
+            "live_refresh_attempted": False,
+            "live_refresh_succeeded": False,
+            "live_refresh_failure": "discovery_breaker_open" if breaker_open else "cli_not_found",
+            "catalog_source": "disk_cache" if used_disk_cache else "bundled_static",
+            "catalog_fallback": used_disk_cache,
+            "catalog_stale": used_disk_cache,
+        }
+    elif not force_live:
+        _ANTIGRAVITY_LAST_DISCOVERY_STATUS = {
+            "live_refresh_attempted": False,
+            "catalog_fallback": False,
+        }
 
     # Keep models visible only in the IDE picker as inbox choices too.
     # OPT-IN, and deliberately default-off: cdp_list_models.mjs enumerates the
@@ -3513,14 +3568,17 @@ def split_model_and_effort(raw: Any) -> tuple[str, str | None]:
     return re.sub(r"\s+", " ", padded).strip(), found
 
 
-def family_frontier_model(family: str) -> str | None:
+def family_frontier_model(family: str, *, force_live: bool = False) -> str | None:
     if family == "codex":
         return current_codex_role_model("frontier")
     if family == "antigravity":
         # Antigravity has no frontier-brain role. Generic requests use its moving
         # Flash High workhorse; the historical function name is retained for API
         # compatibility with the shared CLI resolver.
-        return current_antigravity_workhorse_model()
+        return current_antigravity_workhorse_model(
+            force_live=force_live,
+            require_observed=force_live,
+        )
     return FAMILY_FLAGSHIP.get(family)
 
 
@@ -3531,12 +3589,12 @@ def pick_cli_model(family: str, model_text: Any) -> str | None:
     brand-new CLI models still work."""
     text = str(model_text or "").strip()
     if not text or normalize_lookup(text) in GENERIC_MODEL_REQUESTS:
-        return family_frontier_model(family)
+        return family_frontier_model(family, force_live=(family == "antigravity"))
     match = match_model_request(family, text)
     if match.get("status") == "matched":
         return match["model"]
     if match.get("status") == "generic":
-        return family_frontier_model(family)
+        return family_frontier_model(family, force_live=(family == "antigravity"))
     return text
 
 
@@ -3846,7 +3904,7 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
             return result
         # No explicit pin: default to the family's moving default instead of
         # interrupting to ask. Antigravity's moving default is a workhorse, not a brain.
-        flagship = family_frontier_model(family)
+        flagship = family_frontier_model(family, force_live=(family == "antigravity"))
         if flagship is not None:
             flagship = (
                 antigravity_model_for_effort(flagship, resolved_effort)
@@ -3867,6 +3925,8 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
                 "effort": final_effort,
                 "source": "family_workhorse" if family == "antigravity" else "family_flagship",
             }
+            if family == "antigravity":
+                result["catalog_status"] = antigravity_catalog_status()
             if model_policy:
                 result["model_policy"] = model_policy
             if effort_policy:
@@ -3875,12 +3935,18 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
         catalog = list_agent_models(family, project, topic).get("catalogs", {}).get(family, {})
         return {
             "status": "needs_model_selection",
-            "reason": f"No default {family} model is set for this topic.",
+            "reason": (
+                "No eligible stable Gemini Flash High model was available from live Antigravity CLI "
+                "discovery or its last valid observed catalog."
+                if family == "antigravity"
+                else f"No default {family} model is set for this topic."
+            ),
             "ask_user": f"Which {family} model should be used for this topic?",
             "model_family": family,
             "target_agent": default_target_agent_for_family(family),
             "choices": catalog.get("models") or [],
             "action": "Call set_model_default after the user chooses, then retry route_agent_task.",
+            **({"catalog_status": antigravity_catalog_status()} if family == "antigravity" else {}),
         }
 
     if match["status"] == "matched":
@@ -6315,6 +6381,20 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         model, requested_model, requested_effort, codex_default_effort
     )
     if model == "antigravity":
+        if not resolved_model:
+            catalog = list_agent_models("antigravity").get("catalogs", {}).get("antigravity", {})
+            return {
+                "status": "needs_model_selection",
+                "reason": (
+                    "No eligible stable Gemini Flash High model was available from live Antigravity CLI "
+                    "discovery or its last valid observed catalog."
+                ),
+                "model_family": "antigravity",
+                "target_agent": "antigravity_cli",
+                "choices": catalog.get("models") or [],
+                "catalog_status": antigravity_catalog_status(),
+                "action": "Retry after Antigravity CLI advertises an eligible Flash High model, or use an explicit pin.",
+            }
         resolved_model = antigravity_model_for_effort(resolved_model, effort)
     # A direct serious Codex frontier consult/plan is forced to max — even if the caller passed
     # high/medium — unless it explicitly opted into a cheaper tier (model_policy=cheap_read /
