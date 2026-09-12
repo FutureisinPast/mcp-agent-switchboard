@@ -384,36 +384,31 @@ class HierarchyInstallTests(unittest.TestCase):
         self.assertIn("UserPromptSubmit", result["missing_events"])
         self.assertEqual(result["config_path"], str(self.paths.codex_hooks))
 
-    def test_refresh_activates_codex_hooks_from_top_level_config_and_preserves_tables(self):
+    def test_refresh_preserves_codex_hook_state_table_and_uses_automatic_discovery(self):
         self.paths.codex_config.parent.mkdir(parents=True)
+        original = (
+            'model = "gpt-test"\n\n[features]\nhooks = true\napps = true\n\n'
+            '[hooks.state."plugin:stop:0:0"]\ntrusted_hash = "sha256:test"\n'
+        )
         self.paths.codex_config.write_text(
-            'model = "gpt-test"\n\n[features]\nhooks = true\napps = true\n',
+            original,
             encoding="utf-8",
         )
-        first = self.refresh()
-        parsed = tomllib.loads(self.paths.codex_config.read_text(encoding="utf-8"))
-        self.assertEqual(Path(parsed["hooks"]).resolve(), self.paths.codex_hooks.resolve())
-        self.assertTrue(parsed["features"]["hooks"])
-        self.assertTrue(parsed["features"]["apps"])
-        self.assertEqual(first["Codex routing hook activation"], "updated")
-        second = self.refresh()
-        self.assertEqual(second["Codex routing hook activation"], "unchanged")
-
-    def test_refresh_refuses_to_replace_a_user_selected_codex_hooks_file(self):
-        self.paths.codex_config.parent.mkdir(parents=True)
-        original = 'hooks = "C:/user/hooks.json"\n[features]\nhooks = true\n'
-        self.paths.codex_config.write_text(original, encoding="utf-8")
-        result = self.refresh()
-        self.assertIn("different hooks file", result["Codex routing hook activation"])
-        self.assertEqual(self.paths.codex_config.read_text(encoding="utf-8"), original)
-
-    def test_codex_hook_health_degrades_when_hooks_file_is_not_activated(self):
         self.refresh()
-        self.paths.codex_config.unlink()
+        self.assertEqual(self.paths.codex_config.read_text(encoding="utf-8"), original)
+        result = hierarchy_install.inspect_routing_hook_health(self.paths.codex_hooks)
+        self.assertEqual(result["status"], "configured_runtime_unverified")
+        self.assertEqual(result["discovery"]["mode"], "automatic_sibling_hooks_json")
+        self.assertTrue(result["discovery"]["feature_enabled"])
+
+    def test_codex_hook_health_degrades_when_feature_is_explicitly_disabled(self):
+        self.paths.codex_config.parent.mkdir(parents=True)
+        self.paths.codex_config.write_text("[features]\nhooks = false\n", encoding="utf-8")
+        self.refresh()
         result = hierarchy_install.inspect_routing_hook_health(self.paths.codex_hooks)
         self.assertEqual(result["status"], "degraded")
-        self.assertFalse(result["activation"]["configured"])
-        self.assertIn("top-level hooks path is not active", result["activation"]["error"])
+        self.assertFalse(result["discovery"]["feature_enabled"])
+        self.assertIn("disabled", result["discovery"]["error"])
 
     def test_codex_hook_health_is_unverified_until_current_session_is_observed(self):
         self.refresh()

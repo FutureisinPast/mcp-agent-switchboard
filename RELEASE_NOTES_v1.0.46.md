@@ -1,5 +1,7 @@
 # Agent Switchboard v1.0.46
 
+> Superseded by v1.0.47. Do not use v1.0.46 for Codex hook setup: Codex auto-discovers `~/.codex/hooks.json`, while `hooks` in `config.toml` is a table, not the scalar path assumed by this release. v1.0.47 removes that incompatible writer and adds authoritative trust diagnosis.
+
 ## Highlights
 
 - Activates the generated Codex hook file through the required top-level `hooks` setting in `~/.codex/config.toml`. Installation preserves existing TOML structure and feature flags, while refusing to overwrite a different user-selected hook file.

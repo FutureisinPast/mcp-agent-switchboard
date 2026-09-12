@@ -545,32 +545,41 @@ def inspect_routing_hook_health(
     if report["missing_events"]:
         return report
 
-    # Codex does not auto-discover hooks.json. The top-level config.toml
-    # `hooks` key activates it; a perfect orphaned file still means no runtime
-    # enforcement and must therefore be degraded.
+    # Codex auto-discovers hooks.json beside an active config layer.  The
+    # top-level `hooks` value in config.toml is a TABLE for inline hooks and
+    # trust state, not a string path.  Keep discovery separate from current-
+    # session evidence and let doctor query Codex's authoritative hooks/list
+    # inventory for per-handler trust.
     config_path = path.with_name("config.toml")
-    activation = {
+    discovery = {
         "config_path": str(config_path),
-        "expected_hooks_path": str(path),
-        "configured": False,
+        "hooks_path": str(path),
+        "mode": "automatic_sibling_hooks_json",
+        "feature_enabled": True,
     }
-    report["activation"] = activation
+    report["discovery"] = discovery
     try:
-        if not config_path.exists():
-            raise ValueError("config.toml is missing; top-level hooks path is not active")
-        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
-        configured_value = config.get("hooks") if isinstance(config, dict) else None
-        if not isinstance(configured_value, str) or not configured_value.strip():
-            raise ValueError("top-level hooks path is missing")
-        configured_path = Path(configured_value)
-        if not configured_path.is_absolute():
-            configured_path = config_path.parent / configured_path
-        activation["configured_hooks_path"] = str(configured_path.resolve())
-        if configured_path.resolve() != path.resolve():
-            raise ValueError("top-level hooks path points to a different file")
-        activation["configured"] = True
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, ValueError, TypeError) as exc:
-        activation["error"] = f"{type(exc).__name__}: {exc}"
+        config = (
+            tomllib.loads(config_path.read_text(encoding="utf-8"))
+            if config_path.exists()
+            else {}
+        )
+        features = config.get("features") if isinstance(config, dict) else None
+        features = features if isinstance(features, dict) else {}
+        canonical = features.get("hooks")
+        legacy = features.get("codex_hooks")
+        enabled = canonical is not False and not (canonical is None and legacy is False)
+        discovery["feature_enabled"] = enabled
+        discovery["feature_source"] = (
+            "features.hooks"
+            if canonical is not None
+            else ("features.codex_hooks" if legacy is not None else "default")
+        )
+        if not enabled:
+            discovery["error"] = "Codex hooks are disabled in config.toml"
+            return report
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, TypeError) as exc:
+        discovery["error"] = f"{type(exc).__name__}: {exc}"
         return report
 
     # A per-session state file is written by the hook itself (including the
@@ -593,52 +602,6 @@ def inspect_routing_hook_health(
             return report
     report["status"] = "configured_runtime_unverified"
     return report
-
-
-def update_codex_hook_reference(
-    config_path: Path,
-    hooks_path: Path,
-    backup: BackupFn,
-    dry: bool = False,
-) -> str:
-    """Safely activate the owned Codex hooks file from top-level config.toml."""
-    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    try:
-        parsed = tomllib.loads(existing) if existing.strip() else {}
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-        return f"ERROR: {config_path.name} is not safely mergeable ({exc}); left untouched"
-    configured = parsed.get("hooks") if isinstance(parsed, dict) else None
-    if configured is not None:
-        if not isinstance(configured, str) or not configured.strip():
-            return f"ERROR: {config_path.name} has a non-string top-level hooks value; left untouched"
-        current = Path(configured)
-        if not current.is_absolute():
-            current = config_path.parent / current
-        if current.resolve() != hooks_path.resolve():
-            return (
-                f"ERROR: {config_path.name} already activates a different hooks file "
-                f"({configured}); left untouched"
-            )
-        return "unchanged"
-
-    rendered_line = f"hooks = {json.dumps(str(hooks_path.resolve()))}\n"
-    lines = existing.splitlines(keepends=True)
-    insert_at = next(
-        (index for index, line in enumerate(lines) if re.match(r"^\s*\[", line)),
-        len(lines),
-    )
-    if insert_at and lines[insert_at - 1].strip():
-        rendered_line = "\n" + rendered_line
-    lines.insert(insert_at, rendered_line)
-    rendered = "".join(lines)
-    if rendered and not rendered.endswith("\n"):
-        rendered += "\n"
-    if dry:
-        return f"would activate {hooks_path} from {config_path}"
-    if config_path.exists():
-        backup(config_path)
-    atomic_io.atomic_write_text(config_path, rendered)
-    return "updated"
 
 
 def update_hooks(
@@ -765,9 +728,6 @@ def refresh(
                 "Claude Explore role": write_managed_file(paths.claude_explore, role_bodies["claude_explore"], True, _legacy_claude_role("Explore"), backup, dry),
                 "Claude worker role": write_managed_file(paths.claude_worker, role_bodies["claude_worker"], True, _legacy_claude_role("economy-worker"), backup, dry),
                 "Codex routing hooks": update_hooks(paths.codex_hooks, hook_command_prefix, "codex", backup, dry),
-                "Codex routing hook activation": update_codex_hook_reference(
-                    paths.codex_config, paths.codex_hooks, backup, dry
-                ),
                 "Claude routing hooks": update_hooks(paths.claude_settings, hook_command_prefix, "claude", backup, dry),
             }
     except TimeoutError as exc:

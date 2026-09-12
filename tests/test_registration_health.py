@@ -7,6 +7,7 @@ style copied from tests/test_registration_repair.py.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -291,6 +292,54 @@ class RegistrationHealthTests(unittest.TestCase):
         refresh.assert_not_called()
         serve.assert_called_once()
 
+    def test_codex_hook_inventory_reports_authoritative_trust_state(self):
+        hooks_path = self.root / "codex" / "hooks.json"
+        hooks_path.parent.mkdir(parents=True)
+        hooks_path.write_text("{}", encoding="utf-8")
+
+        class FakeProcess:
+            def __init__(self, trust_status):
+                entries = [
+                    {
+                        "key": f"{hooks_path}:{event}:0:0",
+                        "sourcePath": str(hooks_path),
+                        "command": setup.hierarchy_install.routing_hook_command_identity(event, "codex"),
+                        "enabled": True,
+                        "trustStatus": trust_status,
+                    }
+                    for event in setup.hierarchy_install.ROUTING_HOOK_EVENTS
+                ]
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO(
+                    json.dumps({"id": 1, "result": {"codexHome": str(hooks_path.parent)}})
+                    + "\n"
+                    + json.dumps({"id": 2, "result": {"data": [{"hooks": entries}]}})
+                    + "\n"
+                )
+                self.stderr = io.StringIO("")
+                self.returncode = None
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+            def kill(self):
+                self.returncode = -9
+
+        for trust_status, expected in (("untrusted", "pending_user_review"), ("trusted", "ready")):
+            with self.subTest(trust_status=trust_status), mock.patch.object(
+                broker.subprocess, "Popen", return_value=FakeProcess(trust_status)
+            ):
+                result = broker._codex_hook_inventory_probe(
+                    "codex", self.root, hooks_path, timeout_seconds=2
+                )
+            self.assertEqual(result["status"], expected)
+            self.assertTrue(result["queried"])
+            self.assertEqual(result["missing_events"], [])
+            self.assertEqual(
+                {entry["trust_status"] for entry in result["entries"]}, {trust_status}
+            )
+
     def test_doctor_integrates_unverified_mcp_handoff_without_healthy_claim(self):
         mcp = {
             "registered": True, "server_reachable": True,
@@ -329,12 +378,14 @@ class RegistrationHealthTests(unittest.TestCase):
             "live_surfaces_now": 0, "live_hosts": [], "contributors": [], "blind_spots": [],
         }
         mcp = {"host_exposure": "verified", "status": "ready"}
+        inventory = {"status": "ready", "queried": True, "missing_events": [], "entries": []}
         with mock.patch.object(broker, "load_config", return_value={}), \
              mock.patch.object(broker, "detect_agent_surfaces", return_value={}), \
              mock.patch.object(broker, "find_executable", return_value=None), \
              mock.patch.object(broker, "_cli_probe", return_value=cli), \
              mock.patch.object(broker, "_bridge_package_version", return_value=None), \
              mock.patch.object(broker, "_nerve_system_report", return_value=nerve), \
+             mock.patch.object(broker, "_codex_hook_inventory_probe", return_value=inventory), \
              mock.patch.object(setup, "antigravity_mcp_stdio_diagnostic", return_value=mcp), \
              mock.patch.object(broker.hierarchy_install, "inspect_routing_hook_health", return_value=health):
             report = broker.broker_doctor()
@@ -347,6 +398,35 @@ class RegistrationHealthTests(unittest.TestCase):
         self.assertIn("routing enforcement: configured_runtime_unverified", rendered)
         self.assertIn("switchboard executable:", rendered)
         self.assertIn("gate harness command", rendered)
+
+    def test_doctor_degrades_and_explains_pending_codex_hook_review(self):
+        cli = {"found": True, "smoke_ok": True, "version": "test", "source": "test", "path": "test"}
+        health = {
+            "config_path": "C:/test/.codex/hooks.json", "required_events": ["PreToolUse"],
+            "present_events": ["PreToolUse"], "missing_events": [], "owned_command_identity": {},
+            "status": "configured_runtime_unverified", "runtime_evidence": {"observed": False},
+        }
+        inventory = {
+            "status": "pending_user_review", "queried": True, "missing_events": [],
+            "entries": [{"event": "PreToolUse", "enabled": True, "trust_status": "untrusted"}],
+            "remediation": "Open /hooks and approve Agent Switchboard.",
+        }
+        nerve = {"claude_desktop": {"installed": False, "registered": False}, "live_surfaces_now": 0,
+                 "live_hosts": [], "contributors": [], "blind_spots": []}
+        with mock.patch.object(broker, "load_config", return_value={}), \
+             mock.patch.object(broker, "detect_agent_surfaces", return_value={}), \
+             mock.patch.object(broker, "find_executable", return_value=None), \
+             mock.patch.object(broker, "_cli_probe", return_value=cli), \
+             mock.patch.object(broker, "_codex_hook_inventory_probe", return_value=inventory), \
+             mock.patch.object(broker, "_bridge_package_version", return_value=None), \
+             mock.patch.object(broker, "_nerve_system_report", return_value=nerve), \
+             mock.patch.object(setup, "antigravity_mcp_stdio_diagnostic", return_value={"status": "ready"}), \
+             mock.patch.object(broker.hierarchy_install, "inspect_routing_hook_health", return_value=health):
+            report = broker.broker_doctor()
+        enforcement = report["surfaces"]["codex"]["routing_enforcement"]
+        self.assertEqual(enforcement["status"], "pending_user_review")
+        self.assertEqual(report["status"], "degraded")
+        self.assertIn("Open /hooks", " ".join(report["recommendations"]))
 
     def test_doctor_session_resolver_accepts_equal_ids_and_surfaces_conflicts(self):
         with mock.patch.dict(os.environ, {"CODEX_SESSION_ID": "same", "CODEX_THREAD_ID": "same"}, clear=False):

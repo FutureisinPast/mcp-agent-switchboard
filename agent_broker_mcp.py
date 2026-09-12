@@ -13,6 +13,7 @@ import errno
 import json
 import hashlib
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -13431,6 +13432,189 @@ def _resolve_codex_doctor_session(current_session_id: str | None) -> dict[str, s
     }
 
 
+def _codex_hook_inventory_probe(
+    codex_path: str | None,
+    cwd: Path,
+    hooks_path: Path,
+    timeout_seconds: float = 12.0,
+) -> dict[str, Any]:
+    """Ask Codex's read-only hooks/list RPC for authoritative discovery/trust state."""
+    base: dict[str, Any] = {
+        "status": "unavailable",
+        "queried": False,
+        "source_path": str(hooks_path),
+        "required_events": list(hierarchy_install.ROUTING_HOOK_EVENTS),
+        "entries": [],
+        "missing_events": list(hierarchy_install.ROUTING_HOOK_EVENTS),
+    }
+    if not codex_path:
+        return {**base, "reason": "Codex CLI is unavailable; hooks/list was not queried."}
+
+    proc: subprocess.Popen[str] | None = None
+    stdout_lines: queue.Queue[str] = queue.Queue()
+    stderr_tail: list[str] = []
+
+    def pump_stdout(stream: Any) -> None:
+        try:
+            for line in stream:
+                stdout_lines.put(line)
+        finally:
+            stdout_lines.put("")
+
+    def pump_stderr(stream: Any) -> None:
+        for line in stream:
+            stderr_tail.append(line.strip())
+            if len(stderr_tail) > 8:
+                del stderr_tail[0]
+
+    def await_response(request_id: int, deadline: float) -> dict[str, Any]:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Codex app-server timed out waiting for response {request_id}")
+            try:
+                line = stdout_lines.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise TimeoutError(
+                    f"Codex app-server timed out waiting for response {request_id}"
+                ) from exc
+            if not line:
+                raise RuntimeError("Codex app-server closed stdout before hooks/list completed")
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") == request_id:
+                return message
+
+    try:
+        proc = subprocess.Popen(
+            [codex_path, "app-server", "--stdio"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            cwd=str(cwd),
+            creationflags=WINDOWS_NO_WINDOW,
+        )
+        assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+        threading.Thread(target=pump_stdout, args=(proc.stdout,), daemon=True).start()
+        threading.Thread(target=pump_stderr, args=(proc.stderr,), daemon=True).start()
+        deadline = time.monotonic() + max(2.0, timeout_seconds)
+        initialize = {
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "agent-switchboard-doctor",
+                    "title": "Agent Switchboard Doctor",
+                    "version": BROKER_VERSION,
+                }
+            },
+        }
+        proc.stdin.write(json.dumps(initialize, separators=(",", ":")) + "\n")
+        proc.stdin.flush()
+        initialized = await_response(1, deadline)
+        if initialized.get("error"):
+            raise RuntimeError(f"Codex app-server initialize failed: {initialized['error']}")
+        proc.stdin.write('{"method":"initialized"}\n')
+        proc.stdin.write(
+            json.dumps(
+                {"id": 2, "method": "hooks/list", "params": {"cwds": [str(cwd)]}},
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        response = await_response(2, deadline)
+        if response.get("error"):
+            raise RuntimeError(f"Codex hooks/list failed: {response['error']}")
+        rows = ((response.get("result") or {}).get("data") or [])
+        hook_rows = [
+            hook
+            for row in rows
+            if isinstance(row, dict)
+            for hook in (row.get("hooks") or [])
+            if isinstance(hook, dict)
+        ]
+        expected_source = os.path.normcase(os.path.normpath(str(hooks_path.resolve())))
+        owned: dict[str, dict[str, Any]] = {}
+        for event in hierarchy_install.ROUTING_HOOK_EVENTS:
+            identity = hierarchy_install.routing_hook_command_identity(event, "codex")
+            for hook in hook_rows:
+                source = os.path.normcase(os.path.normpath(str(hook.get("sourcePath") or "")))
+                if source == expected_source and identity in str(hook.get("command") or ""):
+                    owned[event] = hook
+                    break
+        missing = [event for event in hierarchy_install.ROUTING_HOOK_EVENTS if event not in owned]
+        entries = [
+            {
+                "event": event,
+                "enabled": bool(hook.get("enabled")),
+                "trust_status": str(hook.get("trustStatus") or "unknown"),
+                "key": str(hook.get("key") or "")[:500],
+            }
+            for event, hook in owned.items()
+        ]
+        warnings = [
+            str(item)[:500]
+            for row in rows
+            if isinstance(row, dict)
+            for item in (row.get("warnings") or [])
+        ][:8]
+        errors = [
+            str(item)[:500]
+            for row in rows
+            if isinstance(row, dict)
+            for item in (row.get("errors") or [])
+        ][:8]
+        status = "ready"
+        if missing or errors:
+            status = "incomplete"
+        elif any(not entry["enabled"] for entry in entries):
+            status = "disabled"
+        elif any(entry["trust_status"] not in {"trusted", "managed"} for entry in entries):
+            status = "pending_user_review"
+        result = {
+            **base,
+            "status": status,
+            "queried": True,
+            "entries": entries,
+            "missing_events": missing,
+            "warnings": warnings,
+            "errors": errors,
+        }
+        if status == "pending_user_review":
+            result["remediation"] = (
+                "Open /hooks in Codex, review the Agent Switchboard hooks from "
+                f"{hooks_path}, and approve them; installers must not manufacture trust hashes."
+            )
+        return result
+    except Exception as exc:  # noqa: BLE001
+        detail = f"{type(exc).__name__}: {exc}"[:800]
+        if stderr_tail:
+            detail += "; stderr: " + " | ".join(stderr_tail[-3:])[:800]
+        return {**base, "status": "probe_failed", "reason": detail}
+    finally:
+        if proc is not None:
+            try:
+                if proc.stdin is not None and not proc.stdin.closed:
+                    proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+
+
 def broker_doctor(current_session_id: str | None = None) -> dict[str, Any]:
     """Assemble a read-only, per-surface capability report for this machine."""
     config = load_config()
@@ -13463,6 +13647,22 @@ def broker_doctor(current_session_id: str | None = None) -> dict[str, Any]:
 
     # --- Codex ---
     codex_cli = _cli_probe(config, "codex")
+    hook_inventory = _codex_hook_inventory_probe(
+        codex_cli.get("path") if codex_cli.get("found") else None,
+        Path.cwd(),
+        Path(codex_hook_health["config_path"]),
+    )
+    codex_hook_health["runtime_inventory"] = hook_inventory
+    if codex_hook_health["status"] != "degraded":
+        inventory_status = hook_inventory.get("status")
+        if inventory_status in {"pending_user_review", "disabled", "incomplete"}:
+            codex_hook_health["status"] = str(inventory_status)
+        elif inventory_status == "ready":
+            codex_hook_health["status"] = (
+                "observed"
+                if (codex_hook_health.get("runtime_evidence") or {}).get("observed")
+                else "configured_runtime_unverified"
+            )
     codex_ext = detected.get("codex", {}).get("extension")
     codex_full = bool(codex_cli["found"] and codex_cli["smoke_ok"])
     codex_routes: list[str] = []
@@ -13487,7 +13687,19 @@ def broker_doctor(current_session_id: str | None = None) -> dict[str, Any]:
             "Codex CLI not found on PATH - install it for a full headless round-trip "
             "(the extension still delivers, but auto-submit is best-effort)."
         )
-    if codex_hook_health["status"] == "degraded":
+    if codex_hook_health["status"] == "pending_user_review":
+        recommendations.append(
+            str(
+                hook_inventory.get("remediation")
+                or "Open /hooks in Codex, review the Agent Switchboard hooks, and approve them."
+            )
+        )
+    elif codex_hook_health["status"] == "disabled":
+        recommendations.append(
+            "Codex hooks are disabled. Remove `features.hooks = false` (or set it to true), "
+            "then restart Codex and review /hooks."
+        )
+    elif codex_hook_health["status"] in {"degraded", "incomplete"}:
         recommendations.append(
             "Codex routing enforcement is degraded; restore the owned hooks in "
             f"{codex_hook_health['config_path']} and verify with `"
@@ -13610,7 +13822,12 @@ def broker_doctor(current_session_id: str | None = None) -> dict[str, Any]:
             "(it can then PUSH context, though it still can't be read on disk like Claude Code/Codex)."
         )
 
-    doctor_status = "degraded" if codex_hook_health["status"] == "degraded" else "ok"
+    doctor_status = (
+        "degraded"
+        if codex_hook_health["status"]
+        in {"degraded", "pending_user_review", "disabled", "incomplete"}
+        else "ok"
+    )
     return {
         "status": doctor_status,
         "broker_version": BROKER_VERSION,
@@ -13671,6 +13888,11 @@ def render_doctor(report: dict[str, Any]) -> str:
             lines.append("  hook events: " + ", ".join(enforcement.get("present_events") or [])
                          + ("; missing " + ", ".join(enforcement.get("missing_events") or [])
                             if enforcement.get("missing_events") else ""))
+            inventory = enforcement.get("runtime_inventory") or {}
+            if inventory:
+                lines.append(f"  Codex hooks/list: {inventory.get('status')}")
+                if inventory.get("missing_events"):
+                    lines.append("  inventory missing: " + ", ".join(inventory["missing_events"]))
         if fam == "antigravity" and isinstance(s.get("mcp"), dict):
             mcp = s["mcp"]
             lines.append(f"  mcp        : {mcp.get('status')} (host exposure: {mcp.get('host_exposure')})")
