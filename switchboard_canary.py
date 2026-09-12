@@ -256,6 +256,41 @@ def gate_harness(argv: list[str]) -> int:
             "the block was relieved by a dispatch that did not complete-and-verify",
         )
 
+    # 9. Important read-only work is completion-gated even when it never mutates.
+    session = fresh()
+    routing_gate.user_prompt_submit({
+        "session_id": session,
+        "task_kind": "architecture",
+        "prompt": "Choose the compatibility-safe architecture.",
+    })
+    before_receipt = routing_gate.stop({
+        "session_id": session,
+        "last_assistant_message": "Architecture answer without consultation.",
+    })
+    check(
+        "read-only architecture without a decision receipt is blocked",
+        _denied(before_receipt),
+        "the completion gate allowed important read-only work without consultation",
+    )
+    routing_gate.subagent_start({
+        "session_id": session, "turn_id": "decision-turn", "agent_id": "astra-harness",
+        "agent_type": "default", "model": "gpt-6-astra",
+    })
+    routing_gate.subagent_stop({
+        "session_id": session, "turn_id": "decision-turn", "agent_id": "astra-harness",
+        "agent_type": "default", "model": "gpt-6-astra",
+        "last_assistant_message": "Bounded decision advice.",
+    })
+    after_receipt = routing_gate.stop({
+        "session_id": session,
+        "last_assistant_message": "Architecture answer after consultation.",
+    })
+    check(
+        "completed native Astra receipt satisfies the read-only gate",
+        not _denied(after_receipt),
+        "a completed native flagship receipt did not satisfy the gate",
+    )
+
     width = max(len(name) for name, _, _ in checks)
     for name, ok, detail in checks:
         mark = "PASS" if ok else "FAIL"

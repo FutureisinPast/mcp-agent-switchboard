@@ -300,7 +300,10 @@ class RegistrationHealthTests(unittest.TestCase):
             "handoff": "Gracefully reload Antigravity and verify tools in a fresh chat.",
         }
         cli = {"found": True, "smoke_ok": True, "version": "test", "source": "test", "path": "test"}
-        nerve = {"claude_desktop": {"installed": False, "registered": False}}
+        nerve = {
+            "claude_desktop": {"installed": False, "registered": False},
+            "live_surfaces_now": 0, "live_hosts": [], "contributors": [], "blind_spots": [],
+        }
         with mock.patch.object(broker, "load_config", return_value={}), \
              mock.patch.object(broker, "detect_agent_surfaces", return_value={}), \
              mock.patch.object(broker, "find_executable", return_value=None), \
@@ -312,6 +315,65 @@ class RegistrationHealthTests(unittest.TestCase):
         self.assertEqual(report["surfaces"]["antigravity"]["mcp"], mcp)
         self.assertNotIn("All core surfaces look healthy.", report["recommendations"])
         self.assertTrue(any("fresh chat" in item for item in report["recommendations"]))
+
+    def test_doctor_reports_codex_hook_status_and_resolved_switchboard_path(self):
+        cli = {"found": True, "smoke_ok": True, "version": "test", "source": "test", "path": "test"}
+        health = {
+            "config_path": "C:/test/.codex/hooks.json",
+            "required_events": ["PreToolUse"], "present_events": ["PreToolUse"],
+            "missing_events": [], "owned_command_identity": {"PreToolUse": "routing-hook PreToolUse agent-switchboard codex"},
+            "status": "configured_runtime_unverified", "runtime_evidence": {"observed": False},
+        }
+        nerve = {
+            "claude_desktop": {"installed": False, "registered": False},
+            "live_surfaces_now": 0, "live_hosts": [], "contributors": [], "blind_spots": [],
+        }
+        mcp = {"host_exposure": "verified", "status": "ready"}
+        with mock.patch.object(broker, "load_config", return_value={}), \
+             mock.patch.object(broker, "detect_agent_surfaces", return_value={}), \
+             mock.patch.object(broker, "find_executable", return_value=None), \
+             mock.patch.object(broker, "_cli_probe", return_value=cli), \
+             mock.patch.object(broker, "_bridge_package_version", return_value=None), \
+             mock.patch.object(broker, "_nerve_system_report", return_value=nerve), \
+             mock.patch.object(setup, "antigravity_mcp_stdio_diagnostic", return_value=mcp), \
+             mock.patch.object(broker.hierarchy_install, "inspect_routing_hook_health", return_value=health):
+            report = broker.broker_doctor()
+        self.assertEqual(report["surfaces"]["codex"]["routing_enforcement"], health)
+        self.assertEqual(report["status"], "ok")
+        self.assertTrue(report["switchboard"]["executable"])
+        self.assertTrue(report["switchboard"]["gate_harness_command"])
+        rendered = broker.render_doctor(report)
+        self.assertIn("status         : ok", rendered)
+        self.assertIn("routing enforcement: configured_runtime_unverified", rendered)
+        self.assertIn("switchboard executable:", rendered)
+        self.assertIn("gate harness command", rendered)
+
+    def test_doctor_session_resolver_accepts_equal_ids_and_surfaces_conflicts(self):
+        with mock.patch.dict(os.environ, {"CODEX_SESSION_ID": "same", "CODEX_THREAD_ID": "same"}, clear=False):
+            resolved = broker._resolve_codex_doctor_session(None)
+        self.assertEqual(resolved["session_id"], "same")
+        self.assertIsNone(resolved["diagnostic"])
+        with mock.patch.dict(os.environ, {"CODEX_SESSION_ID": "one", "CODEX_THREAD_ID": "two"}, clear=False):
+            conflict = broker._resolve_codex_doctor_session(None)
+        self.assertIsNone(conflict["session_id"])
+        self.assertIn("disagree", conflict["diagnostic"])
+
+    def test_doctor_is_degraded_when_codex_hook_health_is_degraded(self):
+        cli = {"found": True, "smoke_ok": True, "version": "test", "source": "test", "path": "test"}
+        health = {"config_path": "C:/test/.codex/hooks.json", "required_events": [], "present_events": [],
+                  "missing_events": ["PreToolUse"], "owned_command_identity": {}, "status": "degraded"}
+        nerve = {"claude_desktop": {"installed": False, "registered": False}, "live_surfaces_now": 0,
+                 "live_hosts": [], "contributors": [], "blind_spots": []}
+        with mock.patch.object(broker, "load_config", return_value={}), \
+             mock.patch.object(broker, "detect_agent_surfaces", return_value={}), \
+             mock.patch.object(broker, "find_executable", return_value=None), \
+             mock.patch.object(broker, "_cli_probe", return_value=cli), \
+             mock.patch.object(broker, "_bridge_package_version", return_value=None), \
+             mock.patch.object(broker, "_nerve_system_report", return_value=nerve), \
+             mock.patch.object(setup, "antigravity_mcp_stdio_diagnostic", return_value={"status": "ready"}), \
+             mock.patch.object(broker.hierarchy_install, "inspect_routing_hook_health", return_value=health):
+            report = broker.broker_doctor()
+        self.assertEqual(report["status"], "degraded")
 
     # -- host_is_installed --------------------------------------------------
 

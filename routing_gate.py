@@ -273,6 +273,12 @@ DIRECT_BRAIN_LABOUR_CATEGORIES = (
 )
 VALID_RESPONDER_PREFIXES = ("codex:", "claude:", "antigravity:")
 NATIVE_CHEAP_AGENT_TYPES = {"explore", "explorer", "worker", "economy-worker"}
+IMPORTANT_DECISION_RE = re.compile(
+    r"\b(?:architect(?:ure|ural|ing)?|hard\s+diagnos(?:is|e)|"
+    r"root\s+cause|security|authentication|authorization|payment|migration|"
+    r"data[- ]loss|irreversible|critical\s+decision)\b",
+    re.IGNORECASE,
+)
 
 
 def normalize_tool_name(name: str) -> str:
@@ -475,8 +481,21 @@ def mark_blocked(session_id: str) -> None:
     _update_state(session_id, lambda state: state.__setitem__("blocked_once", True))
 
 
+def _decision_already_blocked(session_id: str) -> bool:
+    return bool(_read_state(session_id).get("decision_blocked_once"))
+
+
+def _mark_decision_blocked(session_id: str) -> None:
+    _update_state(session_id, lambda state: state.__setitem__("decision_blocked_once", True))
+
+
 def _normalized_agent_type(value: object) -> str:
     return str(value or "").strip().lower()
+
+
+def _is_native_flagship_model(value: object) -> bool:
+    model = str(value or "").strip().lower()
+    return bool(re.search(r"(?:^|[:/\s-])(?:astra|fable)(?:$|[:/\s-])|gpt-6-astra", model))
 
 
 def _cheap_native_agent_active(state: dict) -> bool:
@@ -540,6 +559,8 @@ def subagent_stop(payload: dict) -> dict:
     if not session_id or not agent_id or not agent_type:
         return {}
 
+    completion = {"recorded": False}
+
     def update(state: dict) -> None:
         agents = state.setdefault("native_agents", {})
         previous = agents.get(agent_id) if isinstance(agents.get(agent_id), dict) else {}
@@ -560,11 +581,24 @@ def subagent_stop(payload: dict) -> dict:
             "model": str(payload.get("model") or previous.get("model") or ""),
             "has_result": bool(str(payload.get("last_assistant_message") or "").strip()),
         }
+        completion["recorded"] = True
+        completed_model = str(payload.get("model") or previous.get("model") or "")
+        if _is_native_flagship_model(completed_model):
+            receipts = state.setdefault("decision_receipts", [])
+            receipt = f"native:{agent_id}"
+            if receipt not in receipts:
+                receipts.append(receipt)
         # A worker can mutate without the parent directly calling an edit tool.
         if _normalized_agent_type(agent_type) in {"worker", "economy-worker"}:
             state["mutated"] = True
 
     _update_state(session_id, update)
+    if completion["recorded"]:
+        log_gate_decision(
+            session_id, "SubagentStop", "-", None, "native-complete",
+            extra={"agent_id": agent_id, "agent_type": agent_type,
+                   "model": str(payload.get("model") or "")},
+        )
     return {}
 
 
@@ -726,9 +760,35 @@ def user_prompt_submit(payload: dict) -> dict:
     sweep_stale()
     session_id = str(payload.get("session_id") or "").strip()
     reset_turn_state(session_id)
+    explicit_kind = str(payload.get("task_kind") or payload.get("work_kind") or "").strip().lower()
+    prompt_text = " ".join(
+        str(payload.get(key) or "") for key in ("prompt", "user_prompt", "message")
+    )
+    requires_decision = bool(
+        payload.get("requires_decision_receipt") is True
+        or explicit_kind in {"architecture", "critical", "hard_diagnosis", "hard-diagnosis"}
+        or IMPORTANT_DECISION_RE.search(prompt_text)
+    )
+    if session_id and requires_decision:
+        def require_decision(state: dict) -> None:
+            state["decision_receipt_required"] = True
+            state["decision_requirement_source"] = (
+                f"task_kind:{explicit_kind}" if explicit_kind else "prompt-classifier"
+            )
+
+        _update_state(session_id, require_decision)
+        log_gate_decision(
+            session_id, "UserPromptSubmit", "-", None, "decision-required",
+            extra={"source": f"task_kind:{explicit_kind}" if explicit_kind else "prompt-classifier"},
+        )
     context = _standing_policy_context(session_id)
     if not context:
         return {}
+    if requires_decision:
+        context += (
+            " This turn is classified as important diagnosis/architecture work; before the final "
+            "response, record a completed native flagship or consult_decision receipt."
+        )
     return {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
@@ -857,6 +917,62 @@ def _report_state_files_by_mtime(limit: int) -> list[Path]:
     return files[: max(0, limit)]
 
 
+def resolve_current_session_identity(
+    environ: dict[str, str] | None = None,
+) -> dict[str, str | None]:
+    """Resolve one unambiguous current Codex session without historical guesses."""
+    env = os.environ if environ is None else environ
+    session_id = str(env.get("CODEX_SESSION_ID") or "").strip()
+    thread_id = str(env.get("CODEX_THREAD_ID") or "").strip()
+    if session_id and thread_id and session_id != thread_id:
+        return {
+            "session_id": None,
+            "source": None,
+            "diagnostic": (
+                "CODEX_SESSION_ID and CODEX_THREAD_ID disagree; "
+                "current-session evidence is not trusted."
+            ),
+        }
+    resolved = session_id or thread_id
+    return {
+        "session_id": resolved or None,
+        "source": (
+            "CODEX_SESSION_ID/CODEX_THREAD_ID" if session_id and thread_id
+            else ("CODEX_SESSION_ID" if session_id else ("CODEX_THREAD_ID" if thread_id else None))
+        ),
+        "diagnostic": None,
+    }
+
+
+def _resolve_report_sessions(args: argparse.Namespace) -> tuple[list[tuple[str, Path]], str | None]:
+    """Resolve report scope without guessing a session from unrelated state files.
+
+    ``--last`` is deliberately the only path which selects historical files by
+    mtime. The no-flag path binds to the current Codex identity, if one is
+    available, so a report invoked from one session cannot silently display a
+    prior smoke session.
+    """
+    if args.session:
+        return [(args.session, _session_path(args.session))], None
+    if args.last is not None:
+        limit = args.last if args.last > 0 else 1
+        return [(path.stem, path) for path in _report_state_files_by_mtime(limit)], None
+
+    resolution = resolve_current_session_identity()
+    if resolution["diagnostic"]:
+        return [], (
+            "Routing report: conflicting current session identities: "
+            f"{resolution['diagnostic']} Use --session or --last\n"
+        )
+    current_id = resolution["session_id"]
+    if current_id:
+        return [(current_id, _session_path(current_id))], None
+    return [], (
+        "Routing report: no current session identity "
+        "(CODEX_SESSION_ID or CODEX_THREAD_ID); use --session or --last\n"
+    )
+
+
 def _read_session_log(log_path: Path) -> list[dict]:
     records: list[dict] = []
     if not log_path.exists():
@@ -875,6 +991,52 @@ def _read_session_log(log_path: Path) -> list[dict]:
             continue
         if isinstance(record, dict):
             records.append(record)
+    return records
+
+
+def _read_session_broker_events(session_id: str, limit: int = 1000) -> list[dict]:
+    """Read bounded broker events explicitly linked to this session.
+
+    The LIKE predicate is only a prefilter. Every candidate is JSON-decoded and
+    must carry the exact session id, so a prefix/suffix match cannot leak an
+    unrelated consultation into the report.
+    """
+    if not session_id or not DB_PATH.exists():
+        return []
+    records: list[dict] = []
+    try:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, event_type, summary, details, created_at
+                FROM agent_events
+                WHERE event_type IN ('flagship_consultation', 'flagship_consultation_terminal')
+                  AND details LIKE ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (f"%{session_id}%", max(1, min(int(limit), 5000))),
+            ).fetchall()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return []
+    for row in rows:
+        try:
+            details = json.loads(row["details"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(details, dict) or str(details.get("session_id") or "") != session_id:
+            continue
+        records.append({
+            "id": row["id"],
+            "event_type": row["event_type"],
+            "summary": row["summary"],
+            "details": details,
+            "created_at": row["created_at"],
+        })
     return records
 
 
@@ -942,7 +1104,11 @@ _AGENT_LANES = {
 }
 
 
-def _format_routing_audit_table(label: str, log_records: list[dict]) -> str:
+def _format_routing_audit_table(
+    label: str,
+    log_records: list[dict],
+    broker_events: list[dict] | None = None,
+) -> str:
     """Render the routing audit FROM THE LEDGER, as a markdown table.
 
     Built from the append-only decision log rather than session state, because
@@ -972,10 +1138,87 @@ def _format_routing_audit_table(label: str, log_records: list[dict]) -> str:
             model = str(record.get("model") or "") or "configured (runtime unverified)"
             rows.append((f"native:{agent_type}", lane, f"native {agent_type}", model,
                          f"native:{agent_id}"))
+        elif decision == "native-complete":
+            agent_id = str(record.get("agent_id") or "")
+            agent_type = str(record.get("agent_type") or "")
+            lane = _AGENT_LANES.get(agent_type.lower(), "workhorse")
+            model = str(record.get("model") or "") or "configured (runtime unverified)"
+            rows.append((f"native:{agent_type}", lane, f"native {agent_type}", model,
+                         f"native-complete:{agent_id}"))
         elif decision == "credit":
             package = str(record.get("work_package_id") or "WP-unknown")
             receipt = str(record.get("receipt") or "")
             rows.append((package, "workhorse", "switchboard", "gemini flash (resolved)", receipt))
+        elif decision == "no-credit" and "route_agent_task" in str(record.get("tool") or ""):
+            package = str(record.get("work_package_id") or "WP-unknown")
+            outcome = str(record.get("outcome") or record.get("reason") or "rejected")
+            receipt = str(record.get("receipt") or "")
+            model = str(record.get("model") or "gemini flash (resolved)")
+            handoff = record.get("native_handoff")
+            mechanism = "switchboard"
+            details = [receipt, f"outcome={outcome}"]
+            quarantine = str(record.get("quarantine_path") or "")
+            if quarantine:
+                details.append(f"quarantine={quarantine}")
+            if isinstance(handoff, dict):
+                native = handoff.get("native") if isinstance(handoff.get("native"), dict) else {}
+                native_role = str(native.get("role") or "native")
+                native_model = str(native.get("model") or "unverified")
+                mechanism = "switchboard -> native handoff"
+                details.append(f"fallback={native_role}:{native_model}")
+            rows.append((package, "workhorse", mechanism, model, "; ".join(x for x in details if x)))
+
+    # Broker decision events carry provider consultations that never pass through
+    # a host tool lifecycle hook. Merge initial+terminal events by their immutable
+    # parent ref so one consultation appears exactly once in the unified report.
+    consultations: dict[str, dict] = {}
+    order: list[str] = []
+    for event_record in broker_events or []:
+        event_type = str(event_record.get("event_type") or "")
+        details = event_record.get("details") if isinstance(event_record.get("details"), dict) else {}
+        event_id = str(event_record.get("id") or "")
+        if event_type == "flagship_consultation":
+            parent_ref = f"event:{event_id}"
+            if parent_ref not in consultations:
+                order.append(parent_ref)
+            consultations[parent_ref] = {**details, "parent_ref": parent_ref,
+                                         "summary": event_record.get("summary")}
+        elif event_type == "flagship_consultation_terminal":
+            parent_ref = str(
+                details.get("parent_ledger_ref")
+                or (f"event:{details.get('parent_event_id')}" if details.get("parent_event_id") else "")
+            )
+            if not parent_ref:
+                continue
+            if parent_ref not in consultations:
+                order.append(parent_ref)
+            consultations[parent_ref] = {
+                **consultations.get(parent_ref, {}),
+                **details,
+                "parent_ref": parent_ref,
+                "terminal_ref": f"event:{event_id}",
+            }
+    for parent_ref in order:
+        details = consultations[parent_ref]
+        summary = str(details.get("summary") or "")
+        package = str(details.get("work_package_id") or summary.split(":", 1)[0] or "WP-decision")
+        targets = details.get("targets") if isinstance(details.get("targets"), list) else []
+        models = [str(item.get("resolved_model") or item.get("target") or "")
+                  for item in targets if isinstance(item, dict)]
+        status = str(
+            details.get("terminal_overall_status")
+            or details.get("terminal_status")
+            or details.get("status")
+            or "recorded"
+        )
+        receipt_parts = [parent_ref, f"status={status}"]
+        if details.get("terminal_ref"):
+            receipt_parts.append(f"terminal={details['terminal_ref']}")
+        notices = details.get("handoff_notices") if isinstance(details.get("handoff_notices"), list) else []
+        if notices:
+            receipt_parts.append("handoff=" + " / ".join(str(item)[:240] for item in notices[:4]))
+        rows.append((package, "brain", "flagship consultation",
+                     ", ".join(x for x in models if x) or "flagship", "; ".join(receipt_parts)))
 
     lines = [f"## Routing audit — {label}", "", f"packages: {len(rows)}", ""]
     if rows:
@@ -1003,7 +1246,7 @@ def routing_report_cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="agent-switchboard routing-report")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--session")
-    group.add_argument("--last", type=int, default=1)
+    group.add_argument("--last", type=int)
     parser.add_argument(
         "--table", action="store_true",
         help="render the routing audit as a markdown table from the ledger",
@@ -1013,12 +1256,10 @@ def routing_report_cli(argv: list[str]) -> int:
     except SystemExit:
         return 0
     try:
-        if args.session:
-            state_path = _session_path(args.session)
-            sessions = [(args.session, state_path)]
-        else:
-            limit = args.last if args.last and args.last > 0 else 1
-            sessions = [(p.stem, p) for p in _report_state_files_by_mtime(limit)]
+        sessions, diagnostic = _resolve_report_sessions(args)
+        if diagnostic:
+            sys.stdout.write(diagnostic)
+            return 0
         if not sessions:
             sys.stdout.write("Routing report: no sessions found\n")
             return 0
@@ -1034,8 +1275,9 @@ def routing_report_cli(argv: list[str]) -> int:
                 state = {}
             log_path = state_path.with_name(state_path.stem + ".log.jsonl")
             records = _read_session_log(log_path)
+            broker_events = _read_session_broker_events(label)
             reports.append(
-                _format_routing_audit_table(label, records)
+                _format_routing_audit_table(label, records, broker_events)
                 if args.table
                 else _format_routing_report(label, state, records)
             )
@@ -1497,6 +1739,9 @@ def post_tool_use(payload: dict) -> dict:
     )
     if ingress_feedback is not None:
         return _merge_post_tool_context(ingress_feedback, claude_context)
+    decision_receipt = _credit_decision_consultation(session_id, normalized_tool, payload)
+    if decision_receipt is not None:
+        return _merge_post_tool_context(decision_receipt, claude_context)
     credit = _credit_switchboard_dispatch(session_id, normalized_tool, payload)
     if credit is not None:
         return _merge_post_tool_context(credit, claude_context)
@@ -1595,6 +1840,89 @@ def _extract_dispatch_result(payload: dict) -> dict | None:
     return None
 
 
+def _decision_event_resolves(session_id: str, ledger_ref: str) -> bool:
+    match = re.fullmatch(r"event:(\d+)", str(ledger_ref or "").strip())
+    if not session_id or not match or not DB_PATH.exists():
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT event_type, details FROM agent_events WHERE id = ? LIMIT 1",
+                (int(match.group(1)),),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    if not row or row["event_type"] not in {
+        "flagship_consultation", "flagship_consultation_terminal"
+    }:
+        return False
+    try:
+        details = json.loads(row["details"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(details, dict) and str(details.get("session_id") or "") == session_id
+
+
+def _credit_decision_consultation(
+    session_id: str, normalized_tool: str, payload: dict
+) -> dict | None:
+    """Record a terminal flagship receipt for the read-only completion gate."""
+    if not session_id or not normalized_tool.startswith("mcp__agent_switchboard__"):
+        return None
+    result = _extract_dispatch_result(payload)
+    if not isinstance(result, dict):
+        return None
+    ledger_ref = ""
+    status = ""
+    if normalized_tool.endswith("__consult_decision"):
+        ledger_ref = str(result.get("ledger_ref") or "")
+        status = str(result.get("status") or "").strip().lower()
+    elif normalized_tool.endswith("__request_result"):
+        update = result.get("decision_update")
+        if not isinstance(update, dict):
+            return None
+        ledger_ref = str(update.get("parent_ledger_ref") or "")
+        status = str(update.get("terminal_overall_status") or "").strip().lower()
+    else:
+        return None
+    if status not in {"complete", "partial", "unavailable", "failed"}:
+        return None
+    if not _decision_event_resolves(session_id, ledger_ref):
+        log_gate_decision(
+            session_id, "PostToolUse", normalized_tool, None, "decision-no-credit",
+            extra={"reason": "decision ledger ref does not resolve for current session"},
+        )
+        return None
+
+    credited = {"value": False}
+
+    def update_state(state: dict) -> None:
+        receipts = state.setdefault("decision_receipts", [])
+        if ledger_ref not in receipts:
+            receipts.append(ledger_ref)
+            credited["value"] = True
+
+    _update_state(session_id, update_state)
+    if not credited["value"]:
+        return None
+    log_gate_decision(
+        session_id, "PostToolUse", normalized_tool, None, "decision-receipt",
+        extra={"receipt": ledger_ref, "status": status},
+    )
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": (
+                f"Important-decision completion receipt recorded: {ledger_ref} ({status})."
+            ),
+        }
+    }
+
+
 def _receipt_resolves(receipt: str) -> bool:
     """True when the receipt names a real consultation row.
 
@@ -1649,17 +1977,26 @@ def _credit_switchboard_dispatch(session_id: str, normalized_tool: str, payload:
     receipt = str(result.get("receipt") or "")
     outcome = str(result.get("outcome") or "")
     work_package = str(result.get("work_package_id") or "") or "unnamed-package"
+    outcome_details = {
+        "receipt": receipt[:200],
+        "outcome": outcome[:100],
+        "work_package_id": work_package[:200],
+        "model": str(result.get("model") or result.get("actual_model") or "")[:200],
+        "quarantine_path": str(result.get("quarantine_path") or "")[:1000],
+        "native_handoff": result.get("native_handoff")
+        if isinstance(result.get("native_handoff"), dict) else None,
+    }
     if not BROKER_RECEIPT_RE.search(receipt):
         log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "no-credit",
-                          extra={"reason": "missing or malformed receipt", "outcome": outcome})
+                          extra={"reason": "missing or malformed receipt", **outcome_details})
         return None
     if outcome != CREDITABLE_OUTCOME:
         log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "no-credit",
-                          extra={"reason": f"outcome={outcome or 'unknown'}", "receipt": receipt})
+                          extra={"reason": f"outcome={outcome or 'unknown'}", **outcome_details})
         return None
     if not _receipt_resolves(receipt):
         log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "no-credit",
-                          extra={"reason": "receipt does not resolve in the ledger"})
+                          extra={"reason": "receipt does not resolve in the ledger", **outcome_details})
         return None
 
     granted = {"value": False}
@@ -1875,9 +2212,31 @@ def audit_mode() -> str:
 def stop(payload: dict) -> dict:
     sweep_stale()
     session_id = str(payload.get("session_id") or "").strip()
-    if not session_id or not has_mutation(session_id):
+    if not session_id:
         return {}
     if payload.get("stop_hook_active"):
+        return {}
+    state = _read_state(session_id)
+    if state.get("decision_receipt_required") and not state.get("decision_receipts"):
+        if _decision_already_blocked(session_id):
+            return {}
+        _mark_decision_blocked(session_id)
+        log_gate_decision(
+            session_id, "Stop", "-", None, "decision-block",
+            extra={"mutated": bool(state.get("mutated")),
+                   "source": state.get("decision_requirement_source")},
+        )
+        return {
+            "decision": "block",
+            "reason": (
+                "This important diagnosis/architecture turn has no completed flagship decision "
+                "receipt. Complete the required native Astra/Fable consultation and/or "
+                "consult_decision flow, collect any async request_result, and then finish with "
+                "the recorded handoff notices. The gate is read-only aware: no file mutation is "
+                "required for this check."
+            ),
+        }
+    if not has_mutation(session_id):
         return {}
     if audit_mode() == "on-demand":
         # Recorded, not recited. Everything the audit would have said is already in

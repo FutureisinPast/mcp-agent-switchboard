@@ -17,6 +17,7 @@ from typing import Any
 
 WORKHORSE_KEYWORDS = ("balanced", "everyday", "workhorse")
 READER_KEYWORDS = ("affordable", "cost-efficient", "cost efficient", "fast", "repeatable")
+FRONTIER_KEYWORDS = ("frontier", "flagship", "most capable")
 
 CLAUDE_PEER_ALIASES = {"frontier": "best", "workhorse": "sonnet", "reader": "haiku"}
 # User policy: prefer the moving Fable family at max effort and fall back to
@@ -25,8 +26,8 @@ CLAUDE_PEER_ALIASES = {"frontier": "best", "workhorse": "sonnet", "reader": "hai
 CLAUDE_FRONTIER_FALLBACK_CHAIN = ("fable", "opus")
 
 # Static capability seed used only when the local Codex catalog has not learned about
-# Astra yet.  Priority 5 places it ahead of the current Sol entry (priority 6) while
-# still allowing a future live frontier with a lower priority number to replace it.
+# Astra yet. Capability classification, rather than provider priority, keeps this
+# frontier seed ahead of a live workhorse entry. A future live frontier can replace it.
 # The CLI remains the source of truth for actual availability and runtime attestation.
 CODEX_FRONTIER_SEED = {
     "id": "gpt-6-astra",
@@ -77,16 +78,45 @@ def _capability_text(entry: dict) -> str:
     if not isinstance(entry, dict):
         return ""
     parts: list[str] = []
-    caps = entry.get("capabilities")
-    if isinstance(caps, (list, tuple)):
-        parts.extend(str(c) for c in caps)
-    elif isinstance(caps, str):
-        parts.append(caps)
-    for field in ("description", "tier", "category", "label"):
+    def append_value(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                parts.append(str(key))
+                append_value(nested)
+        elif isinstance(value, (list, tuple, set)):
+            for nested in value:
+                append_value(nested)
+        elif value is not None:
+            parts.append(str(value))
+
+    append_value(entry.get("capabilities"))
+    # Catalogs use different names for semantic role metadata. Keep this
+    # permissive so a future live frontier is recognized without a code patch.
+    for field in (
+        "description", "tier", "category", "label", "capability_tier",
+        "capability", "model_tier", "role",
+    ):
         val = entry.get(field)
-        if isinstance(val, str):
-            parts.append(val)
+        append_value(val)
     return " ".join(parts).lower()
+
+
+def _capability_tier(entry: dict) -> str:
+    """Classify a catalog entry by capability, independent of priority.
+
+    Priority is provider ordering, not a reliable statement that a workhorse is
+    more capable than the current frontier. Unknown fixtures intentionally stay
+    ``unknown`` so legacy priority-only catalogs retain deterministic behavior.
+    """
+    entry_id = _entry_id(entry).lower()
+    text = _capability_text(entry)
+    if entry_id == CODEX_FRONTIER_SEED["id"] or any(word in text for word in FRONTIER_KEYWORDS):
+        return "frontier"
+    if any(word in text for word in READER_KEYWORDS):
+        return "reader"
+    if any(word in text for word in WORKHORSE_KEYWORDS):
+        return "workhorse"
+    return "unknown"
 
 
 def _entry_id(entry: dict) -> str:
@@ -147,14 +177,19 @@ def select_codex_roles(models_json: dict) -> CodexRoles:
         return CodexRoles(frontier=None, workhorse=None, reader=None)
 
     by_priority = sorted(entries, key=lambda e: (e["priority"], e["id"]))
-    frontier = by_priority[0]
+    explicit_frontiers = [
+        entry for entry in by_priority if _capability_tier(entry["raw"]) == "frontier"
+    ]
+    # Prefer a known/declared frontier. If the catalog exposes no capability
+    # signal at all, preserve the previous priority-only behavior for fixtures
+    # and older CLIs.
+    frontier = explicit_frontiers[0] if explicit_frontiers else by_priority[0]
 
     non_frontier = [entry for entry in by_priority if entry["id"] != frontier["id"]]
 
     workhorse = None
     for entry in non_frontier:
-        text = _capability_text(entry["raw"])
-        if any(kw in text for kw in WORKHORSE_KEYWORDS):
+        if _capability_tier(entry["raw"]) == "workhorse":
             workhorse = entry
             break
     if workhorse is None:
@@ -162,8 +197,7 @@ def select_codex_roles(models_json: dict) -> CodexRoles:
 
     reader = None
     for entry in non_frontier:
-        text = _capability_text(entry["raw"])
-        if any(kw in text for kw in READER_KEYWORDS):
+        if _capability_tier(entry["raw"]) == "reader":
             reader = entry
             break
     if reader is None:

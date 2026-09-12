@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 import shlex
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -25,6 +26,19 @@ BLOCK_START_RE = re.compile(
 BLOCK_END = "<!-- agent-switchboard:cost-routing:end -->"
 LEGACY_HEADING_RE = re.compile(r"(?im)^(#{1,2})\s+cost-aware model routing\s*$")
 MANAGED_FILE_RE = re.compile(r"(?m)^# agent-switchboard:managed sha256=([0-9a-f]{64})\s*$")
+
+# Keep installation and health reporting on one contract.  A hook file can show
+# that the configuration is structurally correct, but it cannot prove that the
+# currently running host loaded or invoked it.
+ROUTING_HOOK_EVENTS = (
+    "UserPromptSubmit",
+    "SubagentStart",
+    "SubagentStop",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+)
+ROUTING_HOOK_WILDCARD_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
 
 # sha256 checksums of `routing_rules_body()` output that this installer has
 # shipped in an earlier release, recorded so an in-place upgrade recognizes
@@ -86,6 +100,10 @@ class HierarchyPaths:
     @property
     def codex_hooks(self) -> Path:
         return self.home / ".codex" / "hooks.json"
+
+    @property
+    def codex_config(self) -> Path:
+        return self.home / ".codex" / "config.toml"
 
     @property
     def claude_settings(self) -> Path:
@@ -462,6 +480,167 @@ def _hook_handler(command_prefix: str, event: str, host: str) -> dict:
     }
 
 
+def routing_hook_command_identity(event: str, host: str) -> str:
+    """The stable invocation suffix owned by Switchboard for one host event."""
+    return f"routing-hook {event} agent-switchboard {host}"
+
+
+def _has_owned_routing_handler(group: object, event: str, host: str) -> bool:
+    if not isinstance(group, dict):
+        return False
+    if event in ROUTING_HOOK_WILDCARD_EVENTS and group.get("matcher") != ".*":
+        return False
+    handlers = group.get("hooks")
+    if not isinstance(handlers, list):
+        return False
+    identity = routing_hook_command_identity(event, host)
+    return any(
+        isinstance(handler, dict)
+        and handler.get("type") == "command"
+        and identity in " ".join(
+            [str(handler.get("command") or ""), *(str(arg) for arg in handler.get("args") or [])]
+        )
+        for handler in handlers
+    )
+
+
+def inspect_routing_hook_health(
+    path: Path,
+    host: str = "codex",
+    current_session_id: str | None = None,
+    state_dir: Path | None = None,
+) -> dict:
+    """Read-only structural and bounded current-session health for host hooks.
+
+    Runtime status is intentionally conservative: no session evidence means
+    configured-but-unverified, never "enforced" merely because a file exists.
+    """
+    required = list(ROUTING_HOOK_EVENTS)
+    identities = {event: routing_hook_command_identity(event, host) for event in required}
+    report: dict = {
+        "config_path": str(path),
+        "required_events": required,
+        "present_events": [],
+        "missing_events": required.copy(),
+        "owned_command_identity": identities,
+        "status": "degraded",
+        "runtime_evidence": {"session_id": current_session_id or None, "observed": False},
+    }
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("hooks"), dict):
+            raise ValueError("top-level hooks object is missing or malformed")
+        hooks = data["hooks"]
+        present = [
+            event for event in required
+            if isinstance(hooks.get(event), list)
+            and any(_has_owned_routing_handler(group, event, host) for group in hooks[event])
+        ]
+        report["present_events"] = present
+        report["missing_events"] = [event for event in required if event not in present]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        return report
+
+    if report["missing_events"]:
+        return report
+
+    # Codex does not auto-discover hooks.json. The top-level config.toml
+    # `hooks` key activates it; a perfect orphaned file still means no runtime
+    # enforcement and must therefore be degraded.
+    config_path = path.with_name("config.toml")
+    activation = {
+        "config_path": str(config_path),
+        "expected_hooks_path": str(path),
+        "configured": False,
+    }
+    report["activation"] = activation
+    try:
+        if not config_path.exists():
+            raise ValueError("config.toml is missing; top-level hooks path is not active")
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        configured_value = config.get("hooks") if isinstance(config, dict) else None
+        if not isinstance(configured_value, str) or not configured_value.strip():
+            raise ValueError("top-level hooks path is missing")
+        configured_path = Path(configured_value)
+        if not configured_path.is_absolute():
+            configured_path = config_path.parent / configured_path
+        activation["configured_hooks_path"] = str(configured_path.resolve())
+        if configured_path.resolve() != path.resolve():
+            raise ValueError("top-level hooks path points to a different file")
+        activation["configured"] = True
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, ValueError, TypeError) as exc:
+        activation["error"] = f"{type(exc).__name__}: {exc}"
+        return report
+
+    # A per-session state file is written by the hook itself (including the
+    # UserPromptSubmit reset), so it is bounded current-session invocation
+    # evidence. Do not scan other sessions or infer from file mtimes.
+    session_id = str(current_session_id or "").strip()
+    if session_id and state_dir is not None:
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)[:200]
+        state_path = state_dir / f"{safe}.json"
+        log_path = state_dir / f"{safe}.log.jsonl"
+        observed = state_path.exists() or log_path.exists()
+        report["runtime_evidence"] = {
+            "session_id": session_id,
+            "observed": observed,
+            "state_path": str(state_path),
+            "ledger_path": str(log_path),
+        }
+        if observed:
+            report["status"] = "observed"
+            return report
+    report["status"] = "configured_runtime_unverified"
+    return report
+
+
+def update_codex_hook_reference(
+    config_path: Path,
+    hooks_path: Path,
+    backup: BackupFn,
+    dry: bool = False,
+) -> str:
+    """Safely activate the owned Codex hooks file from top-level config.toml."""
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    try:
+        parsed = tomllib.loads(existing) if existing.strip() else {}
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        return f"ERROR: {config_path.name} is not safely mergeable ({exc}); left untouched"
+    configured = parsed.get("hooks") if isinstance(parsed, dict) else None
+    if configured is not None:
+        if not isinstance(configured, str) or not configured.strip():
+            return f"ERROR: {config_path.name} has a non-string top-level hooks value; left untouched"
+        current = Path(configured)
+        if not current.is_absolute():
+            current = config_path.parent / current
+        if current.resolve() != hooks_path.resolve():
+            return (
+                f"ERROR: {config_path.name} already activates a different hooks file "
+                f"({configured}); left untouched"
+            )
+        return "unchanged"
+
+    rendered_line = f"hooks = {json.dumps(str(hooks_path.resolve()))}\n"
+    lines = existing.splitlines(keepends=True)
+    insert_at = next(
+        (index for index, line in enumerate(lines) if re.match(r"^\s*\[", line)),
+        len(lines),
+    )
+    if insert_at and lines[insert_at - 1].strip():
+        rendered_line = "\n" + rendered_line
+    lines.insert(insert_at, rendered_line)
+    rendered = "".join(lines)
+    if rendered and not rendered.endswith("\n"):
+        rendered += "\n"
+    if dry:
+        return f"would activate {hooks_path} from {config_path}"
+    if config_path.exists():
+        backup(config_path)
+    atomic_io.atomic_write_text(config_path, rendered)
+    return "updated"
+
+
 def update_hooks(
     path: Path,
     command_prefix: str,
@@ -474,9 +653,6 @@ def update_hooks(
         data = json.loads(existing) if existing else {}
         if not isinstance(data, dict):
             raise ValueError("top-level JSON must be an object")
-        _merge_hook_event(data, "UserPromptSubmit", _hook_handler(command_prefix, "UserPromptSubmit", host), None)
-        _merge_hook_event(data, "SubagentStart", _hook_handler(command_prefix, "SubagentStart", host), None)
-        _merge_hook_event(data, "SubagentStop", _hook_handler(command_prefix, "SubagentStop", host), None)
         # Intercept every tool call, not a hand-maintained name list: a static
         # matcher silently regresses whenever a host adds or renames a tool
         # (PowerShell -- this box's primary shell tool -- was missing from the
@@ -484,19 +660,13 @@ def update_hooks(
         # tracking, and the direct-`agy` hard deny). The classifier owns
         # per-tool categorization; the matcher's only job is to make sure it
         # sees everything.
-        _merge_hook_event(
-            data,
-            "PreToolUse",
-            _hook_handler(command_prefix, "PreToolUse", host),
-            ".*",
-        )
-        _merge_hook_event(
-            data,
-            "PostToolUse",
-            _hook_handler(command_prefix, "PostToolUse", host),
-            ".*",
-        )
-        _merge_hook_event(data, "Stop", _hook_handler(command_prefix, "Stop", host), None)
+        for event in ROUTING_HOOK_EVENTS:
+            _merge_hook_event(
+                data,
+                event,
+                _hook_handler(command_prefix, event, host),
+                ".*" if event in ROUTING_HOOK_WILDCARD_EVENTS else None,
+            )
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: {path.name} is not safely mergeable ({exc}); left untouched"
     rendered = json.dumps(data, indent=2) + "\n"
@@ -595,6 +765,9 @@ def refresh(
                 "Claude Explore role": write_managed_file(paths.claude_explore, role_bodies["claude_explore"], True, _legacy_claude_role("Explore"), backup, dry),
                 "Claude worker role": write_managed_file(paths.claude_worker, role_bodies["claude_worker"], True, _legacy_claude_role("economy-worker"), backup, dry),
                 "Codex routing hooks": update_hooks(paths.codex_hooks, hook_command_prefix, "codex", backup, dry),
+                "Codex routing hook activation": update_codex_hook_reference(
+                    paths.codex_config, paths.codex_hooks, backup, dry
+                ),
                 "Claude routing hooks": update_hooks(paths.claude_settings, hook_command_prefix, "claude", backup, dry),
             }
     except TimeoutError as exc:

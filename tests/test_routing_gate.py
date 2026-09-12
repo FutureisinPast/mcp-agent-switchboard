@@ -79,6 +79,54 @@ class RoutingGateTests(unittest.TestCase):
     def test_no_mutation_allows(self):
         self.assertEqual(routing_gate.stop(self.payload()), {})
 
+    def test_read_only_architecture_requires_a_terminal_decision_receipt(self):
+        routing_gate.user_prompt_submit({
+            "session_id": "session-1",
+            "prompt": "Review this architecture and diagnose the root cause.",
+        })
+        result = routing_gate.stop(self.payload("Architecture recommendation."))
+        self.assertEqual(result.get("decision"), "block")
+        self.assertIn("read-only aware", result.get("reason", ""))
+        self.assertFalse(routing_gate.has_mutation("session-1"))
+        # Loop bounded independently from the mutating audit gate.
+        self.assertEqual(routing_gate.stop(self.payload("Second stop.")), {})
+
+    def test_ordinary_read_only_turn_does_not_require_a_decision_receipt(self):
+        routing_gate.user_prompt_submit({"session_id": "session-1", "prompt": "What is this filename?"})
+        self.assertEqual(routing_gate.stop(self.payload("It is source.py.")), {})
+
+    def test_completed_native_astra_satisfies_read_only_decision_gate(self):
+        routing_gate.user_prompt_submit({"session_id": "session-1", "task_kind": "architecture"})
+        lifecycle = {
+            "session_id": "session-1", "turn_id": "turn-1", "agent_id": "astra-1",
+            "agent_type": "default", "model": "gpt-6-astra",
+        }
+        routing_gate.subagent_start(lifecycle)
+        routing_gate.subagent_stop({**lifecycle, "last_assistant_message": "Bounded decision advice."})
+        self.assertEqual(routing_gate.stop(self.payload("Final architecture answer.")), {})
+
+    def test_terminal_consult_decision_receipt_satisfies_read_only_gate(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("CREATE TABLE agent_events (id INTEGER PRIMARY KEY, event_type TEXT, details TEXT)")
+            conn.execute(
+                "INSERT INTO agent_events VALUES (?, ?, ?)",
+                (1083, "flagship_consultation", json.dumps({"session_id": "session-1"})),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        routing_gate.user_prompt_submit({"session_id": "session-1", "task_kind": "architecture"})
+        routing_gate.post_tool_use({
+            "session_id": "session-1",
+            "tool_name": "mcp__agent-switchboard__consult_decision",
+            "tool_input": {},
+            "tool_response": {"status": "complete", "ledger_ref": "event:1083"},
+            "_switchboard_host": "codex",
+        })
+        self.assertEqual(routing_gate.stop(self.payload("Final architecture answer.")), {})
+        self.assertEqual(routing_gate._read_state("session-1")["decision_receipts"], ["event:1083"])
+
     def test_user_prompt_resets_prior_turn(self):
         routing_gate.mark_mutated("session-1")
         routing_gate.mark_blocked("session-1")
@@ -1186,6 +1234,51 @@ class RoutingGateTests(unittest.TestCase):
             self.assertEqual(routing_gate.routing_report_cli(["--last", "3"]), 0)
             self.assertEqual(routing_gate.routing_report_cli([]), 0)
 
+    def test_routing_report_uses_current_env_not_newer_unrelated_state(self):
+        routing_gate._write_state("current-session", {"direct_labour_count": 7})
+        routing_gate._write_state("unrelated-smoke", {"direct_labour_count": 99})
+        unrelated = routing_gate._session_path("unrelated-smoke")
+        os.utime(unrelated, None)
+        with mock.patch.dict(os.environ, {"CODEX_SESSION_ID": "current-session", "CODEX_THREAD_ID": ""}, clear=False), \
+             mock.patch("sys.stdout.write") as write:
+            self.assertEqual(routing_gate.routing_report_cli([]), 0)
+        report = "".join(str(call.args[0]) for call in write.call_args_list)
+        self.assertIn("Routing report: current-session", report)
+        self.assertNotIn("unrelated-smoke", report)
+
+    def test_routing_report_explicit_session_wins_over_current_env(self):
+        routing_gate._write_state("requested", {"direct_labour_count": 1})
+        with mock.patch.dict(os.environ, {"CODEX_SESSION_ID": "different-current"}, clear=False), \
+             mock.patch("sys.stdout.write") as write:
+            self.assertEqual(routing_gate.routing_report_cli(["--session", "requested"]), 0)
+        self.assertIn("Routing report: requested", "".join(str(c.args[0]) for c in write.call_args_list))
+
+    def test_routing_report_accepts_matching_current_ids_and_empty_session(self):
+        with mock.patch.dict(
+            os.environ,
+            {"CODEX_SESSION_ID": "new-session", "CODEX_THREAD_ID": "new-session"},
+            clear=False,
+        ), mock.patch("sys.stdout.write") as write:
+            self.assertEqual(routing_gate.routing_report_cli([]), 0)
+        report = "".join(str(c.args[0]) for c in write.call_args_list)
+        self.assertIn("Routing report: new-session", report)
+        self.assertIn("Total direct labour: 0", report)
+
+    def test_routing_report_last_explicitly_selects_historical_state(self):
+        routing_gate._write_state("historical", {"direct_labour_count": 2})
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("sys.stdout.write") as write:
+            self.assertEqual(routing_gate.routing_report_cli(["--last", "1"]), 0)
+        self.assertIn("Routing report: historical", "".join(str(c.args[0]) for c in write.call_args_list))
+
+    def test_routing_report_reports_missing_or_conflicting_current_identity(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("sys.stdout.write") as write:
+            self.assertEqual(routing_gate.routing_report_cli([]), 0)
+        self.assertIn("no current session identity", "".join(str(c.args[0]) for c in write.call_args_list))
+        with mock.patch.dict(os.environ, {"CODEX_SESSION_ID": "a", "CODEX_THREAD_ID": "b"}, clear=True), \
+             mock.patch("sys.stdout.write") as write:
+            self.assertEqual(routing_gate.routing_report_cli([]), 0)
+        self.assertIn("conflicting current session identities", "".join(str(c.args[0]) for c in write.call_args_list))
+
     def test_direct_labour_limit_default_is_four(self):
         self.assertEqual(routing_gate.DIRECT_LABOUR_LIMIT_DEFAULT, 4)
 
@@ -1536,6 +1629,21 @@ class RoutingGateTests(unittest.TestCase):
         self.assertTrue(native_start_records)
         self.assertEqual(native_start_records[-1].get("agent_id"), "agent-logtest-1")
 
+    def test_native_completion_is_logged_once_and_projected_once(self):
+        payload = {
+            "session_id": "session-1", "turn_id": "turn-1", "agent_id": "agent-1083",
+            "agent_type": "worker", "model": "gpt-5.6-terra",
+        }
+        routing_gate.subagent_start(payload)
+        routing_gate.subagent_stop(payload)
+        routing_gate.subagent_stop(payload)
+        records = routing_gate._read_session_log(routing_gate._session_log_path("session-1"))
+        self.assertEqual(sum(r.get("decision") == "native-start" for r in records), 1)
+        self.assertEqual(sum(r.get("decision") == "native-complete" for r in records), 1)
+        table = routing_gate._format_routing_audit_table("session-1", records)
+        self.assertEqual(table.count("native:agent-1083"), 1)
+        self.assertEqual(table.count("native-complete:agent-1083"), 1)
+
     def test_audit_table_renders_from_log(self):
         log_records = [
             {
@@ -1575,6 +1683,73 @@ class RoutingGateTests(unittest.TestCase):
             "tests=0 | docs=0 | other=0",
             table,
         )
+
+    def test_audit_table_keeps_flash_rejection_and_native_handoff_together(self):
+        table = routing_gate._format_routing_audit_table(
+            "session-1",
+            [{
+                "event": "PostToolUse",
+                "tool": "mcp__agent_switchboard__route_agent_task",
+                "decision": "no-credit",
+                "work_package_id": "WP-REJECTED",
+                "receipt": "broker:39128fa6-4d11-4edc-acc3-996021d474bd",
+                "outcome": "rejected",
+                "quarantine_path": "C:/broker/quarantine/WP-REJECTED",
+                "native_handoff": {
+                    "native": {"role": "explorer", "model": "gpt-5.6-luna"}
+                },
+            }],
+        )
+        self.assertEqual(table.count("| WP-REJECTED |"), 1)
+        self.assertIn("switchboard -> native handoff", table)
+        self.assertIn("outcome=rejected", table)
+        self.assertIn("fallback=explorer:gpt-5.6-luna", table)
+
+    def test_session_broker_events_merge_parent_and_terminal_exactly_once(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE agent_events (
+                    id INTEGER PRIMARY KEY, event_type TEXT, summary TEXT,
+                    details TEXT, created_at TEXT
+                )
+                """
+            )
+            initial = {
+                "session_id": "session-1",
+                "work_package_id": "WP-ARCH",
+                "status": "pending",
+                "targets": [{"target": "claude", "resolved_model": "fable", "status": "pending"}],
+                "handoff_notices": [],
+            }
+            terminal = {
+                "session_id": "session-1",
+                "parent_ledger_ref": "event:1083",
+                "work_package_id": "WP-ARCH",
+                "terminal_overall_status": "unavailable",
+                "handoff_notices": ["Claude Fable was unavailable (HTTP 403)."],
+            }
+            unrelated = {**initial, "session_id": "session-10", "work_package_id": "WRONG"}
+            conn.executemany(
+                "INSERT INTO agent_events VALUES (?, ?, ?, ?, ?)",
+                [
+                    (1083, "flagship_consultation", "WP-ARCH: pending", json.dumps(initial), "now"),
+                    (1085, "flagship_consultation_terminal", "WP-ARCH: unavailable", json.dumps(terminal), "later"),
+                    (1086, "flagship_consultation", "WRONG: pending", json.dumps(unrelated), "later"),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        events = routing_gate._read_session_broker_events("session-1")
+        self.assertEqual([event["id"] for event in events], [1083, 1085])
+        table = routing_gate._format_routing_audit_table("session-1", [], events)
+        self.assertEqual(table.count("| WP-ARCH |"), 1)
+        self.assertNotIn("WRONG", table)
+        self.assertIn("event:1083", table)
+        self.assertIn("terminal=event:1085", table)
+        self.assertIn("HTTP 403", table)
 
 
 if __name__ == "__main__":

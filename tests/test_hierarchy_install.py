@@ -5,6 +5,7 @@ import json
 import re
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -374,6 +375,71 @@ class HierarchyInstallTests(unittest.TestCase):
         second = self.refresh()
         self.assertTrue(all(value == "unchanged" for value in second.values()), second)
         self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_codex_hook_health_degrades_when_required_hooks_are_missing(self):
+        self.paths.codex_hooks.parent.mkdir(parents=True)
+        self.paths.codex_hooks.write_text(json.dumps({"hooks": {"PreToolUse": []}}), encoding="utf-8")
+        result = hierarchy_install.inspect_routing_hook_health(self.paths.codex_hooks)
+        self.assertEqual(result["status"], "degraded")
+        self.assertIn("UserPromptSubmit", result["missing_events"])
+        self.assertEqual(result["config_path"], str(self.paths.codex_hooks))
+
+    def test_refresh_activates_codex_hooks_from_top_level_config_and_preserves_tables(self):
+        self.paths.codex_config.parent.mkdir(parents=True)
+        self.paths.codex_config.write_text(
+            'model = "gpt-test"\n\n[features]\nhooks = true\napps = true\n',
+            encoding="utf-8",
+        )
+        first = self.refresh()
+        parsed = tomllib.loads(self.paths.codex_config.read_text(encoding="utf-8"))
+        self.assertEqual(Path(parsed["hooks"]).resolve(), self.paths.codex_hooks.resolve())
+        self.assertTrue(parsed["features"]["hooks"])
+        self.assertTrue(parsed["features"]["apps"])
+        self.assertEqual(first["Codex routing hook activation"], "updated")
+        second = self.refresh()
+        self.assertEqual(second["Codex routing hook activation"], "unchanged")
+
+    def test_refresh_refuses_to_replace_a_user_selected_codex_hooks_file(self):
+        self.paths.codex_config.parent.mkdir(parents=True)
+        original = 'hooks = "C:/user/hooks.json"\n[features]\nhooks = true\n'
+        self.paths.codex_config.write_text(original, encoding="utf-8")
+        result = self.refresh()
+        self.assertIn("different hooks file", result["Codex routing hook activation"])
+        self.assertEqual(self.paths.codex_config.read_text(encoding="utf-8"), original)
+
+    def test_codex_hook_health_degrades_when_hooks_file_is_not_activated(self):
+        self.refresh()
+        self.paths.codex_config.unlink()
+        result = hierarchy_install.inspect_routing_hook_health(self.paths.codex_hooks)
+        self.assertEqual(result["status"], "degraded")
+        self.assertFalse(result["activation"]["configured"])
+        self.assertIn("top-level hooks path is not active", result["activation"]["error"])
+
+    def test_codex_hook_health_is_unverified_until_current_session_is_observed(self):
+        self.refresh()
+        state_dir = Path(self.tmp.name) / "routing-gate"
+        unverified = hierarchy_install.inspect_routing_hook_health(
+            self.paths.codex_hooks, current_session_id="current", state_dir=state_dir
+        )
+        self.assertEqual(unverified["status"], "configured_runtime_unverified")
+        self.assertEqual(unverified["missing_events"], [])
+        state_dir.mkdir()
+        (state_dir / "current.json").write_text("{}", encoding="utf-8")
+        observed = hierarchy_install.inspect_routing_hook_health(
+            self.paths.codex_hooks, current_session_id="current", state_dir=state_dir
+        )
+        self.assertEqual(observed["status"], "observed")
+        self.assertTrue(observed["runtime_evidence"]["observed"])
+
+    def test_codex_hook_health_preserves_malformed_or_unowned_entries_as_degraded(self):
+        self.paths.codex_hooks.parent.mkdir(parents=True)
+        self.paths.codex_hooks.write_text(
+            json.dumps({"hooks": {event: [{"hooks": [{"type": "command", "command": "user-hook"}]}]
+                                 for event in hierarchy_install.ROUTING_HOOK_EVENTS}}), encoding="utf-8"
+        )
+        result = hierarchy_install.inspect_routing_hook_health(self.paths.codex_hooks)
+        self.assertEqual(result["status"], "degraded")
+        self.assertEqual(result["present_events"], [])
 
     def test_refresh_preserves_unrelated_gemini_content(self):
         self.paths.gemini_md.parent.mkdir(parents=True, exist_ok=True)

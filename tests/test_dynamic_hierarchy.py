@@ -65,17 +65,39 @@ class DynamicCodexRoleTests(unittest.TestCase):
         self.assertEqual(cheap[:2], ("gpt-8-reader", broker.CODEX_CHEAP_EFFORT))
         self.assertEqual(balanced[:2], ("gpt-8-worker", "medium"))
 
-    def test_astra_seed_outranks_sol_but_future_live_frontier_wins(self):
+    def test_astra_seed_outranks_live_sol_and_explicit_future_frontier_wins(self):
         seeded = broker.model_roles.seed_codex_frontier(
-            {"models": [{"id": "gpt-5.6-sol", "priority": 6, "visibility": "list"}]}
+            {"models": [{"id": "gpt-5.6-sol", "priority": 4, "visibility": "list",
+                         "description": "balanced everyday workhorse"}]}
         )
         roles = broker.model_roles.select_codex_roles(seeded)
         self.assertEqual(roles.frontier["id"], "gpt-6-astra")
+        self.assertEqual(roles.workhorse["id"], "gpt-5.6-sol")
         seeded["models"].append(
-            {"id": "gpt-7-future", "priority": 4, "visibility": "list"}
+            {"id": "gpt-7-future", "priority": 4, "visibility": "list",
+             "capability_tier": "frontier"}
         )
         roles = broker.model_roles.select_codex_roles(seeded)
         self.assertEqual(roles.frontier["id"], "gpt-7-future")
+
+    def test_astra_selection_is_valid_native_expectation_for_live_sol(self):
+        models = [
+            broker.model_entry(
+                "gpt-6-astra", source="static", metadata=broker.model_roles.CODEX_FRONTIER_SEED
+            ),
+            broker.model_entry(
+                "gpt-5.6-sol", source="codex-debug",
+                metadata={"priority": 4, "visibility": "list", "description": "balanced workhorse"},
+            ),
+        ]
+        roles = broker.codex_roles_from_models(models)
+        self.assertEqual(roles["frontier"]["id"], "gpt-6-astra")
+        self.assertEqual(roles["workhorse"]["id"], "gpt-5.6-sol")
+        with mock.patch.object(broker, "current_codex_roles", return_value=roles):
+            self.assertEqual(
+                broker._decision_native_requirement("codex", "gpt-5.6-sol"),
+                {"family": "codex", "model": "gpt-6-astra"},
+            )
 
 
 class DynamicAntigravityRoleTests(unittest.TestCase):
@@ -810,6 +832,19 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         self.assertIn("web location must be an http(s) URL", joined)
         self.assertIn("code locator is invalid", joined)
         self.assertIn("document locator is invalid", joined)
+        self.assertIn(broker.RESEARCH_LOCATOR_DESCRIPTION, joined)
+
+    def test_callable_schemas_expose_attestation_and_locator_limits(self):
+        decision_tool = next(tool for tool in broker.TOOLS if tool["name"] == "consult_decision")
+        attestation = decision_tool["inputSchema"]["properties"]["native_consultation"]["properties"]["attestation"]
+        self.assertEqual(attestation["maxLength"], 80)
+        self.assertIn("80 characters", attestation["description"])
+
+        schema = broker.flash_workhorse_output_schema(self._research_package("Q1"))
+        locator = schema["properties"]["research_coverage"]["items"]["properties"]["evidence"]["items"]["properties"]["locator"]
+        self.assertEqual(locator["description"], broker.RESEARCH_LOCATOR_DESCRIPTION)
+        self.assertIn("lines 12-18", locator["description"])
+        self.assertIn("pages 3-4", locator["description"])
 
     def test_valid_code_web_and_well_supported_not_found_research(self):
         questions = ("Code question", "Web question", "Missing question")
@@ -954,6 +989,73 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         self.assertFalse(result["accepted"])
         self.assertEqual(result["brain_verification"]["status"], "pending")
         self.assertTrue(result["structured_output_enforced"])
+
+    def test_flash_completed_plan_returns_terminal_progress_not_live_updates(self):
+        package = broker.prepare_flash_work_package(
+            {"work_package_id": "WP-PLAN-PROGRESS"}, "quick_check", "Inspect the bounded package."
+        )
+        normalized = json.dumps(
+            {
+                "package_id": package["package_id"],
+                "worker_status": "completed",
+                "structured_output": self._flash_output(package["package_id"])["structured_output"],
+                "cli": {"duration_seconds": 2.5},
+            }
+        )
+        args = {
+            "prompt": "Inspect the bounded package.", "task_kind": "quick_check", "mode": "plan",
+            "target_model": "gemini-3.7-flash-high", "effort": "high",
+            "work_package_id": package["package_id"],
+        }
+        with mock.patch.object(broker, "load_config", return_value={"compact_task_contract": False}), \
+             mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
+             mock.patch.object(broker, "consult_antigravity_cli", return_value=normalized), \
+             mock.patch.object(broker, "store_consultation"):
+            result = broker.consult("antigravity", args)
+        progress = result["progress"]
+        self.assertEqual(progress["state"], "completed")
+        self.assertEqual(progress["current_phase"], "structured_validation")
+        self.assertFalse(progress["live_updates_available"])
+        self.assertEqual(progress["elapsed_seconds"], 2.5)
+        self.assertEqual(
+            [(item["phase"], item["status"]) for item in progress["phases"]],
+            [("model_resolution", "completed"), ("containment_staging", "completed"),
+             ("worker_execution", "completed"), ("structured_validation", "completed"),
+             ("workspace_apply", "not_applicable")],
+        )
+
+    def test_flash_rejection_and_unavailability_return_truthful_terminal_progress(self):
+        package = self._flash_package()
+        args = {
+            "prompt": "Implement the approved bounded change.", "task_kind": "implementation",
+            "mode": "accept-edits", "target_model": "gemini-3.7-flash-high", "effort": "high",
+            "work_package_id": package["package_id"], "allowed_files": package["allowed_files"],
+            "acceptance_criteria": package["acceptance_criteria"],
+        }
+        cases = {
+            "rejected": "Antigravity CLI structured-output validation failed: missing field",
+            "unavailable_pre_mutation": "Antigravity CLI was not found. test",
+        }
+        for outcome, response in cases.items():
+            with self.subTest(outcome=outcome), \
+                 mock.patch.object(broker, "load_config", return_value={"compact_task_contract": False}), \
+                 mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
+                 mock.patch.object(broker, "consult_antigravity_cli", return_value=response), \
+                 mock.patch.object(broker, "store_consultation"):
+                result = broker.consult("antigravity", args)
+            progress = result["progress"]
+            self.assertEqual(progress["state"], outcome)
+            self.assertFalse(progress["live_updates_available"])
+            statuses = {item["phase"]: item["status"] for item in progress["phases"]}
+            if outcome == "rejected":
+                self.assertEqual(progress["current_phase"], "structured_validation")
+                self.assertEqual(statuses["structured_validation"], "failed")
+                self.assertEqual(statuses["workspace_apply"], "not_applied")
+                self.assertEqual(result["artifact_disposition"], None)
+            else:
+                self.assertEqual(progress["current_phase"], "model_resolution")
+                self.assertEqual(statuses["worker_execution"], "not_started")
+                self.assertEqual(statuses["structured_validation"], "not_started")
 
     def test_consult_attaches_native_handoff_for_each_noncreditable_flash_outcome(self):
         package = self._flash_package()

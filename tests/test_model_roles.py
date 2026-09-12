@@ -96,6 +96,31 @@ class SelectCodexRolesTests(unittest.TestCase):
         roles = model_roles.select_codex_roles({"models": models})
         self.assertEqual(roles.frontier["id"], "top")
 
+    def test_astra_capability_outranks_lower_priority_live_sol(self):
+        catalog = model_roles.seed_codex_frontier(
+            {"models": [{"id": "gpt-5.6-sol", "priority": 4, "visibility": "list",
+                         "description": "balanced everyday workhorse"}]}
+        )
+        roles = model_roles.select_codex_roles(catalog)
+        self.assertEqual(roles.frontier["id"], "gpt-6-astra")
+        self.assertEqual(roles.workhorse["id"], "gpt-5.6-sol")
+
+    def test_explicit_future_frontier_metadata_outranks_seed(self):
+        catalog = model_roles.seed_codex_frontier(
+            {"models": [{"id": "gpt-7-future", "priority": 4, "visibility": "list",
+                         "capability_tier": "frontier"}]}
+        )
+        roles = model_roles.select_codex_roles(catalog)
+        self.assertEqual(roles.frontier["id"], "gpt-7-future")
+
+    def test_priority_orders_explicit_frontier_candidates_with_deterministic_tie(self):
+        models = [
+            {"id": "zeta-frontier", "priority": 5, "description": "frontier"},
+            {"id": "alpha-frontier", "priority": 5, "capabilities": ["frontier"]},
+        ]
+        roles = model_roles.select_codex_roles({"models": models})
+        self.assertEqual(roles.frontier["id"], "alpha-frontier")
+
     def test_workhorse_chosen_by_keyword(self):
         models = [
             {"id": "top", "priority": 1, "description": "flagship"},
@@ -139,6 +164,14 @@ class SelectCodexRolesTests(unittest.TestCase):
         ]
         roles = model_roles.select_codex_roles({"models": models})
         self.assertEqual(roles.frontier["id"], "top")
+
+    def test_hidden_frontier_metadata_cannot_displace_visible_astra(self):
+        catalog = model_roles.seed_codex_frontier(
+            {"models": [{"id": "hidden-future", "priority": 1, "visibility": "hidden",
+                         "capability_tier": "frontier"}]}
+        )
+        roles = model_roles.select_codex_roles(catalog)
+        self.assertEqual(roles.frontier["id"], "gpt-6-astra")
 
     def test_frontier_keywords_never_make_it_workhorse_or_reader_when_alternatives_exist(self):
         models = [

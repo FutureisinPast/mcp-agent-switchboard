@@ -554,6 +554,141 @@ class NativeLabourPolicyTests(unittest.TestCase):
                 )
 
 
+class AsyncDecisionReconciliationTests(unittest.TestCase):
+    """A detached flagship result must close its immutable parent event exactly once."""
+
+    def setUp(self):
+        # SQLite WAL handles can remain briefly open on Windows after a context
+        # manager returns.  TemporaryDirectory's supported cleanup tolerance
+        # keeps this hermetic test from turning that platform quirk into a false
+        # product failure.
+        self.tmpdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        root = Path(self.tmpdir.name)
+        self.paths = {
+            "DB_PATH": root / "broker.db",
+            "BROKER_DIR": root / "broker",
+            "LOG_PATH": root / "broker" / "broker.log",
+        }
+        self.stack = contextlib.ExitStack()
+        for name, value in self.paths.items():
+            self.stack.enter_context(mock.patch.object(broker, name, value))
+        broker._FLAGSHIP_AVAILABILITY_LATCHES.clear()
+        broker.init_db()
+
+    def tearDown(self):
+        broker._FLAGSHIP_AVAILABILITY_LATCHES.clear()
+        self.stack.close()
+        self.tmpdir.cleanup()
+
+    @staticmethod
+    def _brief():
+        return {
+            "decision": "Choose the compatibility-safe option.",
+            "constraints": ["Preserve the public API."],
+            "options": [{"id": "A", "summary": "Incremental linked event."}],
+            "questions": ["Is the event link sufficient?"],
+            "evidence": [{"ref": "src/router.py:1", "claim": "The parent is append-only."}],
+        }
+
+    def _pending_parent(self, request_id="async-claude"):
+        args = {
+            "project": "project-a",
+            "topic": "async-decision",
+            "session_id": "session-async-1",
+            "work_package_id": "WP-ASYNC",
+            "host": {"vendor": "codex", "model": "gpt-6-astra"},
+            "complexity": "architecture",
+            "brief": self._brief(),
+        }
+        with mock.patch.object(
+            broker, "consult", return_value={"status": "pending", "request_id": request_id, "async": True}
+        ):
+            result = broker.consult_decision(args)
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["decision_session_key"], "session-async-1")
+        self.assertIsNotNone(result["ledger_ref"])
+        return result
+
+    def _insert_claude_result(self, request_id, status, response=None, error=None):
+        with broker.db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO claude_requests (
+                    id, project, root_path, topic, prompt, status, response, error,
+                    created_by, created_at, completed_at, responder, responder_model, target_model
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id, "project-a", str(Path.cwd()), "async-decision", "decision brief",
+                    status, response, error, "agent-switchboard", broker.utc_now(), broker.utc_now(),
+                    "claude-cli-worker" if response else None,
+                    "claude:fable" if response else None, "fable",
+                ),
+            )
+
+    def _terminal_events(self):
+        with broker.db_connect() as conn:
+            return conn.execute(
+                "SELECT details FROM agent_events WHERE event_type = 'flagship_consultation_terminal'"
+            ).fetchall()
+
+    def test_pending_403_is_latched_and_reconciled_once(self):
+        parent = self._pending_parent()
+        self._insert_claude_result(
+            "async-claude", "error", error="HTTP 403: organization subscription access disabled"
+        )
+        first = broker.request_result("async-claude")
+        update = first["decision_update"]
+        self.assertEqual(update["parent_ledger_ref"], parent["ledger_ref"])
+        self.assertEqual(update["updated_target_status"], "skipped_unavailable")
+        self.assertEqual(update["terminal_overall_status"], "unavailable")
+        self.assertTrue(update["handoff_notices"])
+        self.assertIn(("session-async-1", "claude"), broker._FLAGSHIP_AVAILABILITY_LATCHES)
+        again = broker.request_result("async-claude")
+        self.assertTrue(again["decision_update"]["already_recorded"])
+        self.assertEqual(len(self._terminal_events()), 1)
+
+    def test_pending_completed_reconciles_to_complete_with_parent_linkage(self):
+        parent = self._pending_parent("async-completed")
+        self._insert_claude_result("async-completed", "completed", response="Use the linked event.")
+        result = broker.request_result("async-completed")
+        update = result["decision_update"]
+        self.assertEqual(update["parent_ledger_ref"], parent["ledger_ref"])
+        self.assertEqual(update["updated_target_status"], "completed")
+        self.assertEqual(update["terminal_overall_status"], "complete")
+        details = json.loads(self._terminal_events()[0][0])
+        self.assertEqual(details["decision_session_key"], "session-async-1")
+        self.assertEqual(details["request_id"], "async-completed")
+
+    def test_two_async_targets_roll_prior_terminal_state_into_final_partial(self):
+        args = {
+            "project": "project-a", "topic": "async-decision", "session_id": "session-async-2",
+            "work_package_id": "WP-GEMINI-ASYNC",
+            "host": {"vendor": "gemini", "model": "gemini-3.8-flash-high"},
+            "complexity": "architecture", "brief": self._brief(),
+        }
+        with mock.patch.object(
+            broker,
+            "consult",
+            side_effect=[
+                {"status": "pending", "request_id": "async-codex", "async": True},
+                {"status": "pending", "request_id": "async-fable", "async": True},
+            ],
+        ):
+            parent = broker.consult_decision(args)
+        self.assertEqual(parent["status"], "pending")
+
+        self._insert_claude_result("async-codex", "completed", response="Codex advice.")
+        first = broker.request_result("async-codex")["decision_update"]
+        self.assertEqual(first["terminal_overall_status"], "pending")
+
+        self._insert_claude_result("async-fable", "error", error="HTTP 403: subscription disabled")
+        second = broker.request_result("async-fable")["decision_update"]
+        self.assertEqual(second["terminal_overall_status"], "partial")
+        self.assertEqual(second["parent_ledger_ref"], parent["ledger_ref"])
+        self.assertEqual(len(self._terminal_events()), 2)
+
+
 class EntryVersionTests(unittest.TestCase):
     def test_all_version_aliases_print_shared_release_version(self):
         for alias in ("--version", "version", "-v"):

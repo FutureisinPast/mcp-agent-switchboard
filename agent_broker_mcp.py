@@ -14,6 +14,7 @@ import json
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -35,8 +36,10 @@ from typing import Any
 
 import atomic_io
 import flash_manifest
+import hierarchy_install
 import model_roles
 import outbound_screen
+import routing_gate
 from switchboard_version import BROKER_VERSION
 
 
@@ -4216,6 +4219,21 @@ def prepare_flash_work_package(args: dict[str, Any], task_kind: str, prompt: str
     }
 
 
+RESEARCH_LOCATOR_DESCRIPTION = (
+    "Exact source locator. code: L12, 12, lines 12-18, or L12:L18; "
+    "document: page 3, pages 3-4, section 2.1, chapter 4, lines 8-12, or #anchor; "
+    "web/command/provided_context: a nonempty precise locator (web location must be an http(s) URL)."
+)
+RESEARCH_CODE_LOCATOR_RE = re.compile(
+    r"(?:L|lines?\s*)?\d+(?:\s*[-:]\s*(?:L|lines?\s*)?\d+)?", re.I
+)
+RESEARCH_DOCUMENT_LOCATOR_RE = re.compile(
+    r"(?:pages?|p\.?|sections?|sec\.?|chapters?|ch\.?|lines?)\s+[^\s]+"
+    r"(?:\s*[-:]\s*[^\s]+)?|#[\w.-]+",
+    re.I,
+)
+
+
 def flash_workhorse_output_schema(package: dict[str, Any]) -> dict[str, Any]:
     criteria_min = 1 if package.get("task_kind") == "implementation" else 0
     research_questions = package.get("research_questions") or []
@@ -4326,8 +4344,16 @@ def flash_workhorse_output_schema(package: dict[str, Any]) -> dict[str, Any]:
                                         "type": "string",
                                         "enum": ["code", "web", "document", "command", "provided_context"],
                                     },
-                                    "location": {"type": "string", "minLength": 1},
-                                    "locator": {"type": "string", "minLength": 1},
+                                    "location": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "description": "Source path/command/context id, or an http(s) URL for web evidence.",
+                                    },
+                                    "locator": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "description": RESEARCH_LOCATOR_DESCRIPTION,
+                                    },
                                     "observation": {"type": "string", "minLength": 1},
                                     "primary": {"type": "boolean"},
                                 },
@@ -4457,21 +4483,9 @@ def _valid_research_locator(source_kind: str, location: str, locator: str) -> bo
         parsed = urllib.parse.urlparse(location)
         return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
     if source_kind == "code":
-        return bool(
-            re.fullmatch(
-                r"(?:L|lines?\s*)?\d+(?:\s*[-:]\s*(?:L|lines?\s*)?\d+)?",
-                locator,
-                re.I,
-            )
-        )
+        return bool(RESEARCH_CODE_LOCATOR_RE.fullmatch(locator))
     if source_kind == "document":
-        return bool(
-            re.fullmatch(
-                r"(?:pages?|p\.?|sections?|sec\.?|chapters?|ch\.?|lines?)\s+[^\s]+(?:\s*[-:]\s*[^\s]+)?|#[\w.-]+",
-                locator,
-                re.I,
-            )
-        )
+        return bool(RESEARCH_DOCUMENT_LOCATOR_RE.fullmatch(locator))
     return True
 
 
@@ -4622,7 +4636,10 @@ def validate_flash_workhorse_result(
                 if source_kind == "web":
                     errors.append(f"{evidence_label} web location must be an http(s) URL")
                 else:
-                    errors.append(f"{evidence_label} {source_kind} locator is invalid")
+                    errors.append(
+                        f"{evidence_label} {source_kind} locator is invalid. "
+                        + RESEARCH_LOCATOR_DESCRIPTION
+                    )
             evidence_keys.add((source_kind, location, locator, observation))
 
         if worker_status == "completed" and research_questions:
@@ -6023,6 +6040,91 @@ def classify_flash_outcome(
     return "rejected"
 
 
+def flash_terminal_progress(
+    outcome: str | None,
+    mode: str,
+    response: str,
+    *,
+    elapsed_seconds: float | int | None = None,
+    worker_executed: bool | None = None,
+) -> dict[str, Any]:
+    """Return a terminal-only Flash progress receipt for synchronous stdio calls.
+
+    The MCP transport has no progress channel: these facts are assembled after the
+    call returns and must never be presented as a live worker timeline.
+    """
+    normalized_mode = normalize_lookup(mode)
+    implementation = normalized_mode in {
+        "accept edits", "accept-edits", "workspace write", "workspace-write",
+        "implementation", "implement", "edit",
+    }
+    text = str(response or "")
+    unavailable = outcome == "unavailable_pre_mutation"
+    staging_failed = "staging failed" in text or "manifest" in text.lower() and "rejected" in text.lower()
+    rejected = outcome == "rejected"
+    if worker_executed is None:
+        worker_executed = not unavailable and not staging_failed
+
+    def phase(name: str, status: str) -> dict[str, str]:
+        return {"phase": name, "status": status}
+
+    if unavailable:
+        state, current_phase = "unavailable_pre_mutation", "model_resolution"
+        phases = [
+            phase("model_resolution", "failed"),
+            phase("containment_staging", "not_started"),
+            phase("worker_execution", "not_started"),
+            phase("structured_validation", "not_started"),
+            phase("workspace_apply", "not_started" if implementation else "not_applicable"),
+        ]
+    elif rejected:
+        state, current_phase = "rejected", "structured_validation"
+        phases = [
+            phase("model_resolution", "completed"),
+            phase("containment_staging", "failed" if staging_failed else "completed"),
+            phase("worker_execution", "completed" if worker_executed else "not_started"),
+            phase("structured_validation", "failed"),
+            phase("workspace_apply", "not_applied" if implementation else "not_applicable"),
+        ]
+    elif outcome == FLASH_OUTCOME_CREDITABLE:
+        state, current_phase = "completed", "workspace_apply" if implementation else "structured_validation"
+        phases = [
+            phase("model_resolution", "completed"),
+            phase("containment_staging", "completed"),
+            phase("worker_execution", "completed"),
+            phase("structured_validation", "completed"),
+            phase("workspace_apply", "completed" if implementation else "not_applicable"),
+        ]
+    else:
+        state, current_phase = str(outcome or "failed"), "worker_execution"
+        phases = [
+            phase("model_resolution", "completed"),
+            phase("containment_staging", "completed"),
+            phase("worker_execution", "failed" if outcome == "failed_pre_mutation" else "completed"),
+            phase("structured_validation", "not_completed"),
+            phase("workspace_apply", "not_applied" if implementation else "not_applicable"),
+        ]
+    result: dict[str, Any] = {
+        "state": state,
+        "current_phase": current_phase,
+        "phases": phases,
+        "live_updates_available": False,
+        "transport": "This stdio MCP call is synchronous; this is a terminal receipt, not live worker progress.",
+    }
+    if rejected:
+        result["follow_up"] = {
+            "quarantine": "Inspect the quarantine receipt if one is present; rejected artifacts were not applied.",
+            "native_handoff": "Re-scope the rejected package before using any native fallback handoff.",
+        }
+    elif unavailable:
+        result["follow_up"] = {
+            "native_handoff": "Flash did not start; the caller may use the broker-provided native fallback handoff.",
+        }
+    if isinstance(elapsed_seconds, (int, float)) and elapsed_seconds >= 0:
+        result["elapsed_seconds"] = elapsed_seconds
+    return result
+
+
 def _model_identity_tokens(name: str) -> set[str]:
     """Family/version/tier tokens of a model id, for comparison across spellings
     ('gemini-3.6-flash-high' vs 'Gemini 3.6 Flash (High)')."""
@@ -6492,6 +6594,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         codex_model_attested_ok = None
         antigravity_envelope = None
         antigravity_structured = None
+        flash_elapsed_seconds = None
         if model == "codex":
             codex_outcome = _run_codex_consult(
                 project_info, prompt, mode, resolved_model, effort,
@@ -6524,10 +6627,12 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             # confirmed -- that would silently misreport an unverified responder as attested.
             responder_model = f"claude:{claude_actual_model}" if claude_actual_model else "claude:unverified"
         elif model == "antigravity":
+            flash_call_started = time.monotonic()
             response = consult_antigravity_cli(
                 project_info.root_path, prompt, mode, resolved_model, effort, timeout_seconds,
                 flash_package,
             )
+            flash_elapsed_seconds = round(max(0.0, time.monotonic() - flash_call_started), 3)
             if not response.startswith(CONSULT_FAILURE_PREFIXES):
                 try:
                     antigravity_envelope = json.loads(response)
@@ -6651,7 +6756,15 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             result["model_attested"] = bool(flash_cli_meta.get("model"))
             result["attestation"] = flash_cli_meta.get("attestation", "none")
             result["elapsed_seconds"] = flash_cli_meta.get("duration_seconds")
+            if result["elapsed_seconds"] is None:
+                result["elapsed_seconds"] = flash_elapsed_seconds
             result["usage"] = flash_cli_meta.get("usage")
+            result["progress"] = flash_terminal_progress(
+                flash_outcome,
+                mode,
+                response,
+                elapsed_seconds=result["elapsed_seconds"],
+            )
             if flash_outcome == "unavailable_pre_mutation":
                 result["fallback_advice"] = (
                     "Flash was unavailable before any work started. A native cheap role may take "
@@ -6933,7 +7046,7 @@ def _decision_failure(result: dict[str, Any]) -> tuple[str | None, bool]:
         return "skipped_quota", True
     model_specific = bool(re.search(r"\b(?:model|alias)\b.{0,80}\b(?:not found|unknown|unsupported|unavailable)\b", text))
     if re.search(
-        r"\b(?:cli was not found|authentication failed|unauthorized|subscription|entitlement|"
+        r"\b(?:http\s*)?403\b|\b(?:cli was not found|authentication failed|unauthorized|subscription|entitlement|"
         r"access denied|provider unavailable|connection refused|network unreachable)\b",
         text,
     ):
@@ -6947,6 +7060,9 @@ def _decision_session_key(args: dict[str, Any], host_family: str) -> str:
     explicit = str(args.get("session_id") or "").strip()
     if explicit:
         return explicit[:200]
+    current = routing_gate.resolve_current_session_identity()
+    if current.get("session_id"):
+        return str(current["session_id"])[:200]
     return ":".join(
         (
             str(os.getpid()),
@@ -6988,6 +7104,14 @@ def _record_decision_result(
                 {
                     "host": result["host"],
                     "complexity": result["complexity"],
+                    "status": result.get("status"),
+                    # This is deliberately copied into the immutable parent event.
+                    # Detached request rows do not have a session column, so a later
+                    # request_result poll needs this stable identity to latch the
+                    # right provider without guessing from a newer session.
+                    "decision_session_key": result.get("decision_session_key"),
+                    "session_id": result.get("session_id") or result.get("decision_session_key"),
+                    "work_package_id": result["work_package_id"],
                     "targets": [
                         {
                             key: item.get(key)
@@ -7012,6 +7136,180 @@ def _record_decision_result(
     except Exception as exc:  # noqa: BLE001
         result["ledger_ref"] = None
         result["ledger_warning"] = f"Could not record consultation event: {type(exc).__name__}"
+
+
+def _decision_overall_status(statuses: list[str]) -> str:
+    if statuses and all(status == "completed" for status in statuses):
+        return "complete"
+    if "pending" in statuses:
+        return "pending"
+    if "completed" in statuses:
+        return "partial"
+    if statuses and all(status.startswith("skipped_") for status in statuses):
+        return "unavailable"
+    return "failed"
+
+
+def _reconcile_terminal_decision_request(request_id: str, row: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Append one terminal event for a detached flagship consult.
+
+    The initial consultation event remains immutable.  The linked terminal event
+    is the sole reconciliation record and is claimed under BEGIN IMMEDIATE so
+    repeated (or concurrent) request_result polls cannot manufacture duplicates.
+    """
+    rid = str(request_id or "").strip()
+    if not rid or not is_terminal_state(row.get("status")):
+        return None
+    init_db()
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        parents = conn.execute(
+            """
+            SELECT id, project, root_path, topic, details
+            FROM agent_events
+            WHERE event_type = 'flagship_consultation' AND details LIKE ?
+            ORDER BY id DESC
+            LIMIT 1000
+            """
+            , (f"%{rid}%",)
+        ).fetchall()
+        parent = None
+        parent_details: dict[str, Any] | None = None
+        for candidate in parents:
+            try:
+                details = json.loads(candidate["details"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if any(str(target.get("request_id") or "") == rid for target in details.get("targets") or []):
+                parent, parent_details = candidate, details
+                break
+        if parent is None or parent_details is None:
+            return None
+        parent_ref = f"event:{parent['id']}"
+        terminals = conn.execute(
+            """
+            SELECT id, details FROM agent_events
+            WHERE event_type = 'flagship_consultation_terminal' AND details LIKE ?
+            ORDER BY id DESC
+            LIMIT 1000
+            """
+            , (f"%{parent_ref}%",)
+        ).fetchall()
+        terminal_details: list[tuple[int, dict[str, Any]]] = []
+        for terminal in terminals:
+            try:
+                details = json.loads(terminal["details"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if details.get("parent_ledger_ref") != parent_ref:
+                continue
+            terminal_details.append((int(terminal["id"]), details))
+            if details.get("parent_ledger_ref") == parent_ref and details.get("request_id") == rid:
+                prior_target = details.get("updated_target") or {}
+                prior_status = str(details.get("updated_target_status") or "")
+                if prior_status in {"skipped_unavailable", "skipped_quota"}:
+                    session_key = str(details.get("decision_session_key") or "")
+                    family = str(prior_target.get("target") or "")
+                    if session_key and family:
+                        _FLAGSHIP_AVAILABILITY_LATCHES[(session_key, family)] = {
+                            "status": prior_status,
+                            "reason": str(prior_target.get("error") or prior_status)[:240],
+                            "created_at": utc_now(),
+                        }
+                return {
+                    "parent_ledger_ref": parent_ref,
+                    "terminal_ledger_ref": f"event:{terminal['id']}",
+                    "already_recorded": True,
+                    "terminal_overall_status": details.get("terminal_overall_status"),
+                    "updated_target_status": details.get("updated_target_status"),
+                    "handoff_notices": details.get("handoff_notices") or [],
+                }
+
+        targets = [dict(target) for target in parent_details.get("targets") or []]
+        for _, prior in terminal_details:
+            prior_target = prior.get("updated_target")
+            prior_request_id = str(prior.get("request_id") or "")
+            if not isinstance(prior_target, dict) or not prior_request_id:
+                continue
+            for index, target in enumerate(targets):
+                if str(target.get("request_id") or "") == prior_request_id:
+                    targets[index] = dict(prior_target)
+                    break
+        updated_target = next((target for target in targets if str(target.get("request_id") or "") == rid), None)
+        if updated_target is None:
+            return None
+        raw = {
+            "status": row.get("status"),
+            "response": row.get("response"),
+            "error": row.get("error"),
+        }
+        failure, should_latch = _decision_failure(raw)
+        target_status = "completed" if not failure and canonical_request_state(row.get("status")) == "completed" else (failure or "failed")
+        updated_target["status"] = target_status
+        if target_status == "completed":
+            responder = str(row.get("responder") or "").lower()
+            responder_model = str(row.get("responder_model") or "").lower()
+            attested = (
+                responder in {"codex-cli-worker", "claude-cli-worker"}
+                and responder_model.startswith(("codex:", "claude:"))
+                and "unverified" not in responder_model
+                and "<synthetic>" not in responder_model
+            )
+            updated_target["attestation"] = "verified" if attested else "unverified"
+        else:
+            updated_target["error"] = str(row.get("error") or row.get("response") or target_status)[:600]
+        statuses = [str(target.get("status") or "failed") for target in targets]
+        overall = _decision_overall_status(statuses)
+        notices = list(parent_details.get("handoff_notices") or [])
+        if target_status != "completed":
+            failure_reason = str(updated_target.get("error") or target_status)[:240]
+            notice = (
+                f"Skipped or failed {updated_target.get('target')}:{updated_target.get('resolved_model')} "
+                f"({target_status}): {failure_reason}; include this in the final handoff."
+            )
+            if notice not in notices:
+                notices.append(notice)
+            if should_latch:
+                session_key = str(parent_details.get("decision_session_key") or "")
+                family = str(updated_target.get("target") or "")
+                if session_key and family:
+                    _FLAGSHIP_AVAILABILITY_LATCHES[(session_key, family)] = {
+                        "status": target_status,
+                        "reason": str(updated_target.get("error") or target_status)[:240],
+                        "created_at": utc_now(),
+                    }
+        details = {
+            "parent_ledger_ref": parent_ref,
+            "request_id": rid,
+            "decision_session_key": parent_details.get("decision_session_key"),
+            "session_id": parent_details.get("session_id") or parent_details.get("decision_session_key"),
+            "work_package_id": parent_details.get("work_package_id"),
+            "terminal_overall_status": overall,
+            "updated_target_status": target_status,
+            "updated_target": updated_target,
+            "handoff_notices": notices,
+        }
+        cursor = conn.execute(
+            """
+            INSERT INTO agent_events (project, root_path, topic, agent, event_type, summary, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                parent["project"], parent["root_path"], parent["topic"], "agent-switchboard",
+                "flagship_consultation_terminal",
+                f"{parent_details.get('work_package_id') or 'decision'}: {overall} ({updated_target.get('target')} {target_status})",
+                json.dumps(details, ensure_ascii=False), utc_now(),
+            ),
+        )
+        return {
+            "parent_ledger_ref": parent_ref,
+            "terminal_ledger_ref": f"event:{cursor.lastrowid}",
+            "already_recorded": False,
+            "terminal_overall_status": overall,
+            "updated_target_status": target_status,
+            "handoff_notices": notices,
+        }
 
 
 def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
@@ -7058,6 +7356,8 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
             "policy_version": DECISION_POLICY_VERSION,
             "work_package_id": package_id,
             "host": {"vendor": host_family, "model": host_model},
+            "decision_session_key": session_key,
+            "session_id": session_key,
             "complexity": complexity,
             "complexity_escalated": complexity_escalated,
             "consultations": [],
@@ -7193,21 +7493,14 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
         consultations.append(entry)
 
     statuses = [item["status"] for item in consultations]
-    if statuses and all(status == "completed" for status in statuses):
-        overall = "complete"
-    elif "pending" in statuses:
-        overall = "pending"
-    elif "completed" in statuses:
-        overall = "partial"
-    elif statuses and all(status.startswith("skipped_") for status in statuses):
-        overall = "unavailable"
-    else:
-        overall = "failed"
+    overall = _decision_overall_status(statuses)
     result: dict[str, Any] = {
         "status": overall,
         "policy_version": DECISION_POLICY_VERSION,
         "work_package_id": package_id,
         "host": {"vendor": host_family, "model": host_model},
+        "decision_session_key": session_key,
+        "session_id": session_key,
         "complexity": complexity,
         "complexity_escalated": complexity_escalated,
         "consultations": consultations,
@@ -9159,6 +9452,7 @@ def request_result(request_id: str, wait_seconds: Any = None) -> dict[str, Any]:
     if not polled:
         return {"id": rid, "found": False, "error": "unknown request id"}
     table, row = polled
+    decision_update = _reconcile_terminal_decision_request(rid, row)
     response = row.get("response")
     state = canonical_request_state(row.get("status"))
     created_epoch = _iso_epoch(row.get("created_at"))
@@ -9174,7 +9468,7 @@ def request_result(request_id: str, wait_seconds: Any = None) -> dict[str, Any]:
         if table == "codex_requests" and (effort_label in {"top", "max", "xhigh"} or "max" in str(row.get("target_model") or "")):
             pending_note += "Max/xhigh-effort Codex frontier consults can take several minutes — this is normal, not a hang. "
         pending_note += f'Call request_result(request_id="{rid}", wait_seconds=180) to wait for it.'
-    return {
+    result = {
         "id": rid,
         "found": True,
         "kind": _REQUEST_KIND.get(table, table),
@@ -9187,6 +9481,9 @@ def request_result(request_id: str, wait_seconds: Any = None) -> dict[str, Any]:
         "response": response or None,
         "note": pending_note,
     }
+    if decision_update:
+        result["decision_update"] = decision_update
+    return result
 
 
 def cancel_request(request_id: str, reason: str | None = None) -> dict[str, Any]:
@@ -10394,7 +10691,11 @@ TOOLS = [
                         "family": {"type": "string", "enum": ["codex", "claude"]},
                         "model": {"type": "string", "maxLength": 200},
                         "status": {"type": "string", "enum": ["completed", "unavailable", "failed"]},
-                        "attestation": {"type": "string", "maxLength": 80},
+                        "attestation": {
+                            "type": "string",
+                            "maxLength": 80,
+                            "description": "Runtime identity attestation, at most 80 characters (for example verified or unverified).",
+                        },
                         "agent_id": {"type": "string", "maxLength": 200},
                         "summary": {"type": "string", "maxLength": 3000},
                     },
@@ -13099,7 +13400,38 @@ def _nerve_system_report() -> dict[str, Any]:
     }
 
 
-def broker_doctor() -> dict[str, Any]:
+def _running_switchboard_command(*args: str) -> list[str]:
+    """Resolved local entry command; deliberately independent of PATH."""
+    if getattr(sys, "frozen", False):
+        return [str(Path(sys.executable).resolve()), *args]
+    return [
+        str(Path(sys.executable).resolve()),
+        str(Path(__file__).with_name("agent_broker_entry.py").resolve()),
+        *args,
+    ]
+
+
+def _command_display(argv: list[str]) -> str:
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+
+
+def _resolve_codex_doctor_session(current_session_id: str | None) -> dict[str, str | None]:
+    """Resolve only unambiguous current-session evidence for Codex hook health."""
+    explicit = str(current_session_id or "").strip()
+    if explicit:
+        return {"session_id": explicit, "source": "argument", "diagnostic": None}
+    resolved = routing_gate.resolve_current_session_identity()
+    if resolved.get("session_id") or resolved.get("diagnostic"):
+        return resolved
+    fallback = str(os.environ.get("AGENT_BROKER_SESSION_ID") or "").strip()
+    return {
+        "session_id": fallback or None,
+        "source": "AGENT_BROKER_SESSION_ID" if fallback else None,
+        "diagnostic": None,
+    }
+
+
+def broker_doctor(current_session_id: str | None = None) -> dict[str, Any]:
     """Assemble a read-only, per-surface capability report for this machine."""
     config = load_config()
     detected = detect_agent_surfaces()
@@ -13110,6 +13442,24 @@ def broker_doctor() -> dict[str, Any]:
 
     surfaces: dict[str, Any] = {}
     recommendations: list[str] = []
+    session_resolution = _resolve_codex_doctor_session(current_session_id)
+    codex_hook_health = hierarchy_install.inspect_routing_hook_health(
+        hierarchy_install.HierarchyPaths(Path.home(), BROKER_DIR).codex_hooks,
+        "codex",
+        session_resolution["session_id"],
+        BROKER_DIR / "routing-gate",
+    )
+    codex_hook_health["session_resolution"] = session_resolution
+    switchboard_command = _running_switchboard_command()
+    switchboard = {
+        "executable": switchboard_command[0],
+        "command": switchboard_command,
+        "command_display": _command_display(switchboard_command),
+        "gate_harness_command": _running_switchboard_command("gate-harness"),
+        "gate_harness_command_display": _command_display(
+            _running_switchboard_command("gate-harness")
+        ),
+    }
 
     # --- Codex ---
     codex_cli = _cli_probe(config, "codex")
@@ -13128,6 +13478,7 @@ def broker_doctor() -> dict[str, Any]:
         "routes": codex_routes,
         "reply_path": ("stdout" if codex_full else ("respond_to_request" if codex_ext is not False else "none")),
         "best_quality": ("full" if codex_full else ("partial" if codex_ext is not False else "handoff")),
+        "routing_enforcement": codex_hook_health,
     }
     if codex_cli["found"] and not codex_cli["smoke_ok"]:
         recommendations.append("Codex binary found but `--version` failed; verify the install.")
@@ -13135,6 +13486,19 @@ def broker_doctor() -> dict[str, Any]:
         recommendations.append(
             "Codex CLI not found on PATH - install it for a full headless round-trip "
             "(the extension still delivers, but auto-submit is best-effort)."
+        )
+    if codex_hook_health["status"] == "degraded":
+        recommendations.append(
+            "Codex routing enforcement is degraded; restore the owned hooks in "
+            f"{codex_hook_health['config_path']} and verify with `"
+            f"{_command_display(_running_switchboard_command('routing-report', '--last', '1'))}`."
+        )
+    elif codex_hook_health["status"] == "configured_runtime_unverified":
+        recommendations.append(
+            "Codex routing hooks are structurally configured but runtime invocation is unverified. "
+            "Start a fresh Codex turn, then run `"
+            f"{_command_display(_running_switchboard_command('routing-report', '--last', '1'))}` "
+            "to inspect bounded session evidence."
         )
 
     # --- Claude ---
@@ -13246,11 +13610,14 @@ def broker_doctor() -> dict[str, Any]:
             "(it can then PUSH context, though it still can't be read on disk like Claude Code/Codex)."
         )
 
+    doctor_status = "degraded" if codex_hook_health["status"] == "degraded" else "ok"
     return {
+        "status": doctor_status,
         "broker_version": BROKER_VERSION,
         "bridge_version": bridge_version,
         "version_note": version_note,
         "node": {"found": bool(node_path), "path": node_path, "version": node_ver, "ok": node_ok},
+        "switchboard": switchboard,
         "surfaces": surfaces,
         "debate": debate,
         "nerve_system": nerve,
@@ -13262,8 +13629,16 @@ def render_doctor(report: dict[str, Any]) -> str:
     lines: list[str] = []
     lines.append("Agent Switchboard - doctor (capability report)")
     lines.append("=" * 44)
+    lines.append(f"status         : {report.get('status') or 'unknown'}")
     lines.append(f"broker version : {report['broker_version']}")
     lines.append(f"bridge version : {report.get('bridge_version') or 'unknown'}")
+    switchboard = report.get("switchboard") or {}
+    if switchboard:
+        lines.append(f"switchboard executable: {switchboard.get('executable') or 'unknown'}")
+        lines.append(f"switchboard command   : {switchboard.get('command_display') or 'unknown'}")
+        lines.append(
+            f"gate harness command  : {switchboard.get('gate_harness_command_display') or 'unknown'}"
+        )
     if report.get("version_note"):
         lines.append(f"  ! {report['version_note']}")
     node = report["node"]
@@ -13286,6 +13661,16 @@ def render_doctor(report: dict[str, Any]) -> str:
             ext = s["extension"]
             ext_label = ("yes" if ext is True else ("unknown (not scanned)" if ext is None else ("no" if ext is False else ext)))
             lines.append(f"  extension  : {ext_label}")
+        if fam == "codex" and isinstance(s.get("routing_enforcement"), dict):
+            enforcement = s["routing_enforcement"]
+            lines.append(f"  routing enforcement: {enforcement.get('status')}")
+            lines.append(f"  hooks config: {enforcement.get('config_path')}")
+            resolution = enforcement.get("session_resolution") or {}
+            if resolution.get("diagnostic"):
+                lines.append(f"  runtime diagnostic: {resolution['diagnostic']}")
+            lines.append("  hook events: " + ", ".join(enforcement.get("present_events") or [])
+                         + ("; missing " + ", ".join(enforcement.get("missing_events") or [])
+                            if enforcement.get("missing_events") else ""))
         if fam == "antigravity" and isinstance(s.get("mcp"), dict):
             mcp = s["mcp"]
             lines.append(f"  mcp        : {mcp.get('status')} (host exposure: {mcp.get('host_exposure')})")
