@@ -3131,7 +3131,7 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                 "target_agent": "claude",
                 "target_model": CLAUDE_FLAGSHIP_MODEL,
                 "effort": "xhigh",
-                "rule": "Bare serious Claude consultation uses the moving `fable` alias at the progressive effort ladder (complexity bounded/architecture/critical -> high/xhigh/max, xhigh default; a risk_flags match raises it to max), falls back to `opus` when `fable` is latched unavailable for this session or on explicit model unavailability, and reports the runtime-attested actual model.",
+                "rule": "Bare serious Claude consultation uses the moving `fable` alias at the progressive effort ladder (complexity bounded/architecture/critical -> high/xhigh/max, xhigh default; a risk_flags match raises it to max), and reports the runtime-attested actual model. The Claude flagship chain carries no same-vendor fallback: when `fable` is latched unavailable for this session or on explicit model unavailability, a direct route_agent_task call adds a handoff notice with no model swap (it never falls back to `opus`), while consult_decision crosses straight to the opposite-vendor Astra.",
             },
             "claude_cheap_read_sample_prep": {
                 "target_agent": "claude",
@@ -7265,49 +7265,29 @@ def _model_attested_for_family(family: str, requested: str, actual: str) -> bool
     return normalize_lookup(requested) == normalize_lookup(actual)
 
 
-def _codex_catalog_lists_previous_frontier() -> bool:
-    """True when the previous-generation Codex frontier is still present in the
-    combined static/config/live catalog. This is a safety valve, not a live-only
-    gate: the static catalog seeds it today, so this is normally True; it only
-    goes False if a future catalog revision drops the id entirely."""
-    try:
-        models = discover_codex_models()
-    except Exception:  # noqa: BLE001
-        return False
-    target = normalize_lookup(CODEX_PREVIOUS_FRONTIER_MODEL)
-    for item in models:
-        candidates = {normalize_lookup(item.get("id"))}
-        candidates.update(normalize_lookup(alias) for alias in item.get("aliases") or [])
-        if target in candidates:
-            return True
-    return False
-
-
 def _flagship_chain(family: str, native: bool = False) -> list[str]:
-    """The ordered same-vendor flagship fallback chain for one family.
-
-    For codex, CODEX_PREVIOUS_FRONTIER_MODEL (Sol) is a cross-vendor resilience
-    fallback only -- it is deliberately excluded when native=True, because a
-    codex host's own native flagship escalation must never step down to a
-    weaker same-vendor model; that would not be a "flagship" consultation.
-    Claude's chain (fable -> opus) is the same for native and cross-vendor use,
-    since both entries are genuine flagship tiers."""
+    """The same-vendor flagship chain for one family: exactly one entry, since
+    flagship chains carry no same-vendor fallback model. Claude's chain is
+    Fable only; Codex's is the live frontier role model only. Neither Opus nor
+    CODEX_PREVIOUS_FRONTIER_MODEL (gpt-5.6-sol) is ever offered as a fallback
+    here -- Opus remains a valid direct model choice elsewhere (and still a
+    flagship-tier cost cap in routing_gate.py), and Sol remains a valid direct
+    codex model choice, but neither is a flagship-chain member. Once the
+    single entry is unavailable, callers cross straight to the opposite
+    vendor. The `native` parameter is accepted for call-site compatibility
+    (native vs. cross-vendor use used to differ for codex); it no longer
+    changes the result, since both uses now share the same single-entry
+    chain."""
     if family == "claude":
         try:
             frontier = list(model_roles.select_claude_roles().get("frontier") or [])
         except Exception:  # noqa: BLE001
             frontier = []
         if not frontier:
-            frontier = [CLAUDE_FLAGSHIP_MODEL, "opus"]
+            frontier = [CLAUDE_FLAGSHIP_MODEL]
         return frontier
     if family == "codex":
-        chain = [current_codex_role_model("frontier")]
-        if native:
-            return chain
-        if not any(normalize_lookup(m) == normalize_lookup(CODEX_PREVIOUS_FRONTIER_MODEL) for m in chain):
-            if _codex_catalog_lists_previous_frontier():
-                chain.append(CODEX_PREVIOUS_FRONTIER_MODEL)
-        return chain
+        return [current_codex_role_model("frontier")]
     return []
 
 
@@ -10911,18 +10891,13 @@ def _route_task_risk_flags(value: Any) -> list[str]:
 
 
 def _is_frontier_target(family: str, model: Any) -> bool:
-    """True when `model` is a same-vendor flagship tier for `family`: for codex,
-    the live frontier role model or the previous-generation frontier resilience
-    fallback (CODEX_PREVIOUS_FRONTIER_MODEL); for claude, any model in the
-    fable -> opus chain (_flagship_chain("claude"))."""
-    if family == "codex":
-        candidates = {
-            normalize_lookup(current_codex_role_model("frontier")),
-            normalize_lookup(CODEX_PREVIOUS_FRONTIER_MODEL),
-        }
-        return normalize_lookup(model) in candidates
-    if family == "claude":
-        return any(normalize_lookup(model) == normalize_lookup(m) for m in _flagship_chain("claude"))
+    """True when `model` is the same-vendor flagship tier for `family`: for
+    codex, the live frontier role model; for claude, Fable
+    (_flagship_chain("claude")). Neither family's chain carries a same-vendor
+    fallback any more, so CODEX_PREVIOUS_FRONTIER_MODEL and Opus are never
+    frontier targets here."""
+    if family in ("codex", "claude"):
+        return any(normalize_lookup(model) == normalize_lookup(m) for m in _flagship_chain(family))
     return False
 
 
@@ -10967,11 +10942,18 @@ def _route_task_flagship_fallback(
     current session (the same per-model latches WP-SB1's consult_decision reads
     and writes), resolve to the next non-latched model in the family's flagship
     chain at the same effort. Returns (model, fallback_from, notice).
-    fallback_from is None when no fallback applied (including when every later
-    chain model is also latched: the request proceeds on the original model
-    unchanged, but `notice` is still set so the caller does not silently retry
-    a known-latched model). This is a preflight skip only -- no retry-on-failure
-    logic runs for an async dispatch."""
+    fallback_from is None when no fallback applied. Since neither family's
+    flagship chain carries a same-vendor fallback any more (each chain is
+    exactly one entry -- Fable for claude, the live frontier role model for
+    codex), a latched frontier target always falls straight through to the
+    "every later chain model is also latched" branch below: the request
+    proceeds on the original model unchanged, but `notice` is still set so the
+    caller does not silently retry a known-latched model and can report that a
+    direct route_agent_task call added a notice with no model swap, rather
+    than swapping cross-vendor (a cross-vendor swap here would also change
+    target_agent/CLI, which this preflight-only helper does not do). This is a
+    preflight skip only -- no retry-on-failure logic runs for an async
+    dispatch."""
     if family not in {"claude", "codex"} or not _is_frontier_target(family, model):
         return model, None, None
     chain = _flagship_chain(family)

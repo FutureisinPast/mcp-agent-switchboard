@@ -188,6 +188,12 @@ On Windows, Switchboard-owned bounded subprocesses use hidden-window flags and a
 
 ## Changelog
 
+### v1.0.49 (flagship chains carry no same-vendor fallback)
+- **Fable -> opposite-vendor Astra, Astra -> Fable.** The Claude flagship chain is now Fable-only and the Codex flagship chain is now the live frontier model only. Neither Opus nor the previous-generation Codex frontier (`gpt-5.6-sol`) is ever offered as a flagship fallback any more; when the sole chain member is unavailable, `consult_decision` crosses straight to the opposite vendor at the same ladder effort instead of stepping down same-vendor first.
+- **`route_agent_task`'s direct frontier fallback no longer swaps to Opus.** A latched Fable (or a latched Codex frontier) now proceeds on the original model with a handoff notice only -- no same-vendor model swap, and no cross-vendor swap either (that would also change the target agent/CLI).
+- Opus remains a valid direct model choice and still counts as a flagship-tier cost cap in the routing gate; it is simply never a flagship-chain fallback member.
+- Generated hierarchy text and the internal routing guide were updated to match; see the tests listed in `RELEASE_NOTES_v1.0.49.md` for the exact behavior pinned.
+
 ### v1.0.48 (flagship fallback, smart latches, effort ladder, Flash timeout fixes)
 - **`consult_decision` now has a real fallback chain.** A latched or unavailable native flagship (e.g. Fable blocked on credits) walks the rest of its same-vendor chain, then the opposite-vendor chain, at the same ladder effort, instead of failing outright or asking for the same blocked model again.
 - **Availability latches are smarter.** Credit/plan blocks last the session; quota/rate-limit blocks expire at the parsed reset time or after a bounded default window; both are voided early when the signed-in account changes, so a fresh sign-in is retried automatically.

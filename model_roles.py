@@ -20,10 +20,14 @@ READER_KEYWORDS = ("affordable", "cost-efficient", "cost efficient", "fast", "re
 FRONTIER_KEYWORDS = ("frontier", "flagship", "most capable")
 
 CLAUDE_PEER_ALIASES = {"frontier": "best", "workhorse": "sonnet", "reader": "haiku"}
-# User policy: prefer the moving Fable family at max effort and fall back to
-# the moving Opus family only when Fable is explicitly unavailable. Both are
-# aliases maintained by Claude Code, so future concrete versions need no patch.
-CLAUDE_FRONTIER_FALLBACK_CHAIN = ("fable", "opus")
+# User policy: the Claude flagship chain carries no same-vendor fallback model.
+# A Claude host consults Fable only; when Fable is unavailable the decision
+# crosses straight to the opposite vendor (Astra) rather than stepping down to
+# Opus. Opus remains a valid direct model choice elsewhere (and still counts
+# as a flagship-tier cost cap in routing_gate.py); it is simply never offered
+# as a flagship fallback. Fable is an alias maintained by Claude Code, so
+# future concrete versions need no patch.
+CLAUDE_FRONTIER_FALLBACK_CHAIN = ("fable",)
 
 # Static capability seed used only when the local Codex catalog has not learned about
 # Astra yet. Capability classification, rather than provider priority, keeps this

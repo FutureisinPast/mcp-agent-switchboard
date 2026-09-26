@@ -683,10 +683,10 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
 
         first, _ = self._run(self._args("gemini", "gemini-3.8-flash-high"), outcome)
         second, _ = self._run(self._args("gemini", "gemini-3.8-flash-high"), outcome)
-        # The codex cross-vendor leg now walks its own chain (Astra, then the
-        # previous-frontier Sol) before giving up, so the first run tries codex
-        # twice; both get latched, so the second run skips codex entirely.
-        self.assertEqual(calls, ["codex", "codex", "claude", "claude"])
+        # WP-SB7: the codex flagship chain is the live frontier model only
+        # (no gpt-5.6-sol fallback), so the first run tries codex once, it
+        # gets latched, and the second run skips codex entirely.
+        self.assertEqual(calls, ["codex", "claude", "claude"])
         self.assertEqual(first["consultations"][0]["status"], "skipped_quota")
         self.assertEqual(second["consultations"][0]["attestation"], "not_run")
         self.assertTrue(first["handoff_notices"])
@@ -734,9 +734,9 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
 
         first, _ = self._run(self._args("gemini", "gemini-3.8-flash-high"), outcome)
         second, _ = self._run(self._args("gemini", "gemini-3.8-flash-high"), outcome)
-        # Same chain-walk as the quota test: codex tries Astra then Sol before
-        # giving up, so the first run calls codex twice and both get latched.
-        self.assertEqual(calls, ["codex", "codex", "claude", "claude"])
+        # WP-SB7: same single-attempt shape as the quota test -- codex tries
+        # Astra once and gets latched, so the first run calls codex once.
+        self.assertEqual(calls, ["codex", "claude", "claude"])
         self.assertEqual(first["status"], "partial")
         self.assertEqual(first["consultations"][0]["status"], "skipped_unavailable")
         self.assertEqual(second["consultations"][0]["status"], "skipped_unavailable")
@@ -754,15 +754,15 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         result, _ = self._run(
             self._args("gemini", "gemini-3.8-flash-high", "critical"), unavailable
         )
-        # Each family walks its own chain before giving up: codex tries Astra
-        # then Sol, claude tries Fable then Opus.
-        self.assertEqual(calls, ["codex", "codex", "claude", "claude"])
+        # WP-SB7: each family's flagship chain is a single entry now (no
+        # gpt-5.6-sol, no opus), so each is tried exactly once before giving up.
+        self.assertEqual(calls, ["codex", "claude"])
         self.assertEqual(result["status"], "unavailable")
         self.assertEqual(
             [item["status"] for item in result["consultations"]],
-            ["skipped_unavailable"] * 4,
+            ["skipped_unavailable"] * 2,
         )
-        self.assertEqual(len(result["handoff_notices"]), 4)
+        self.assertEqual(len(result["handoff_notices"]), 2)
 
     def test_unicode_excerpt_budget_is_enforced_before_dispatch(self):
         args = self._args("codex", "gpt-5.6-sol")

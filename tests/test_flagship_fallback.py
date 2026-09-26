@@ -140,18 +140,25 @@ class SonnetHostChainTests(FlagshipFallbackTestCase):
         )
         consult2.assert_not_called()
 
-    def test_sonnet_host_fable_unavailable_offers_opus_at_same_effort(self):
+    def test_sonnet_host_fable_unavailable_no_opus_offer_astra_consulted(self):
+        # WP-SB7: the Claude flagship chain is Fable-only now, so once Fable
+        # is unavailable there is no further native candidate (Opus is never
+        # offered) -- the native chain is exhausted and the decision crosses
+        # straight to the opposite-vendor Astra at the bounded ladder effort.
         result, consult = self._run(
             _args(
                 "claude", "sonnet", "critical",
                 native_consultation=_native("claude", "unavailable"),
             )
         )
-        self.assertEqual(result["status"], "needs_native_consultation")
-        self.assertEqual(result["native_request"]["model"], "opus")
-        self.assertEqual(result["native_request"]["effort"], "max")
-        self.assertEqual(result["native_request"]["fallback_from"], "fable")
-        consult.assert_not_called()
+        self.assertNotEqual(result.get("status"), "needs_native_consultation")
+        self.assertNotIn("native_request", result)
+        self.assertEqual([call.args[0] for call in consult.call_args_list], ["codex"])
+        self.assertEqual(consult.call_args_list[0].args[1]["target_model"], "gpt-6-astra")
+        self.assertEqual(consult.call_args_list[0].args[1]["effort"], "max")
+        self.assertEqual(result["consultations"][0]["lane"], "native_same_vendor")
+        self.assertEqual(result["consultations"][1]["lane"], "switchboard_cross_vendor")
+        self.assertEqual(result["consultations"][1]["status"], "completed")
 
 
 class SecondConsultSkipsLatchTests(FlagshipFallbackTestCase):
@@ -164,7 +171,9 @@ class SecondConsultSkipsLatchTests(FlagshipFallbackTestCase):
         )
         self.assertIn(("session-1", "codex", "gpt 6 astra"), broker._FLAGSHIP_AVAILABILITY_LATCHES)
         first_codex_calls = [c for c in consult1.call_args_list if c.args[0] == "codex"]
-        self.assertEqual(len(first_codex_calls), 2)  # astra, then the previous-frontier sol
+        # WP-SB7: the codex flagship chain is the live frontier model only --
+        # gpt-5.6-sol is never offered as a fallback -- so only astra is tried.
+        self.assertEqual(len(first_codex_calls), 1)
 
         # A second call in the same session must not re-ask either latched model.
         second, consult2 = self._run(
@@ -180,7 +189,7 @@ class RetryUnavailableTests(FlagshipFallbackTestCase):
     def test_retry_unavailable_attempts_latched_model_once_and_clears_on_success(self):
         broker._set_flagship_latch(("session-1", "claude", "fable"), "plan", "skipped_unavailable", "requires usage credits")
         # Host is Astra itself, so no native step applies; only the cross-vendor
-        # claude leg (fable, then opus) runs.
+        # claude leg (fable only -- WP-SB7 removed the opus fallback) runs.
         result, consult = self._run(
             _args("codex", "gpt-6-astra", "architecture", retry_unavailable=True),
             _ok_consult,
@@ -348,7 +357,10 @@ class ClassifierTests(unittest.TestCase):
 
 
 class CrossVendorChainTests(FlagshipFallbackTestCase):
-    def test_codex_host_claude_leg_falls_back_from_fable_to_opus(self):
+    def test_codex_host_claude_leg_fable_unavailable_no_opus_call(self):
+        # WP-SB7: the claude flagship chain is Fable-only -- a codex host's
+        # opposite-vendor leg never steps down to Opus when Fable fails; it is
+        # recorded as a skipped/failed leg with no further same-vendor member.
         def outcome(family, call_args):
             if family == "claude" and call_args["target_model"] == "fable":
                 return {"status": "error", "response": "HTTP 429 too many requests"}
@@ -362,10 +374,10 @@ class CrossVendorChainTests(FlagshipFallbackTestCase):
             outcome,
         )
         claude_calls = [c for c in consult.call_args_list if c.args[0] == "claude"]
-        self.assertEqual([c.args[1]["target_model"] for c in claude_calls], ["fable", "opus"])
-        self.assertEqual(result["consultations"][-1]["resolved_model"], "opus")
-        self.assertEqual(result["consultations"][-1]["status"], "completed")
-        self.assertEqual(result["consultations"][-1]["fallback_from"], "fable")
+        self.assertEqual([c.args[1]["target_model"] for c in claude_calls], ["fable"])
+        self.assertEqual(result["consultations"][-1]["resolved_model"], "fable")
+        self.assertEqual(result["consultations"][-1]["status"], "skipped_quota")
+        self.assertNotIn("fallback_from", result["consultations"][-1])
 
 
 class ExhaustedChainReportTests(FlagshipFallbackTestCase):
@@ -517,9 +529,10 @@ class ReconciliationIgnoresSuccessfulAdviceTextTests(unittest.TestCase):
 
 class NativeChainExcludesPreviousFrontierTests(FlagshipFallbackTestCase):
     def test_codex_host_sol_astra_unavailable_goes_cross_vendor_not_native_sol(self):
-        # gpt-5.6-sol is the cross-vendor resilience fallback, never a native
-        # escalation target: once astra is unavailable, a Sol-hosted session
-        # must not be asked to natively consult Sol (itself, via the chain).
+        # gpt-5.6-sol is never a flagship-chain member any more (WP-SB7): once
+        # astra is unavailable, a Sol-hosted session must not be asked to
+        # natively consult Sol (itself), and the cross-vendor leg goes
+        # straight to Fable with no gpt-5.6-sol call at all.
         first, consult1 = self._run(_args("codex", "gpt-5.6-sol", "bounded"))
         self.assertEqual(first["status"], "needs_native_consultation")
         self.assertEqual(first["native_request"]["model"], "gpt-6-astra")
@@ -532,51 +545,39 @@ class NativeChainExcludesPreviousFrontierTests(FlagshipFallbackTestCase):
             )
         )
         self.assertNotEqual(second.get("status"), "needs_native_consultation")
+        codex_calls = [c for c in consult2.call_args_list if c.args[0] == "codex"]
+        self.assertEqual(codex_calls, [])
         claude_calls = [c for c in consult2.call_args_list if c.args[0] == "claude"]
         self.assertEqual(len(claude_calls), 1)
+        self.assertEqual(claude_calls[0].args[1]["target_model"], "fable")
         self.assertEqual(claude_calls[0].args[1]["effort"], "high")
 
 
-class NativeReportAtOrBelowHostTierTests(FlagshipFallbackTestCase):
-    def test_opus_host_reporting_opus_itself_is_not_counted_native_completed(self):
-        result, consult = self._run(
-            _args(
-                "claude", "opus", "bounded",
-                native_consultation=_native("claude", "completed", model="opus"),
-            )
-        )
-        self.assertEqual(result["consultations"][0]["resolved_model"], "opus")
-        self.assertTrue(
-            any("at or below the host's own tier" in notice for notice in result["handoff_notices"])
-        )
-        # Not counted as native_completed, so the bounded suppression rule
-        # does not apply and the cross-vendor leg still runs.
-        codex_calls = [c for c in consult.call_args_list if c.args[0] == "codex"]
-        self.assertEqual(len(codex_calls), 1)
-        self.assertEqual(result["consultations"][-1]["lane"], "switchboard_cross_vendor")
+class NativeReportRejectsOffChainModelTests(FlagshipFallbackTestCase):
+    """WP-SB7: the claude native/flagship chain is Fable-only now -- Opus is
+    never a valid chain member, so a host reporting a native consultation
+    against Opus (whether reporting on itself, as an Opus host previously
+    could, or as a former second-chain-member fallback a Sonnet host used to
+    be offered) is rejected as invalid input rather than accepted and
+    downgraded."""
 
-
-class FallbackHistoryNoticeTests(FlagshipFallbackTestCase):
-    def test_native_report_carries_forward_earlier_latched_candidate_notice(self):
-        # Simulate a prior turn in this session already having latched fable
-        # (e.g. from an earlier needs_native_consultation round for a Sonnet
-        # host), then the host reports on the next chain member, opus.
-        broker._set_flagship_latch(
-            ("session-1", "claude", "fable"), "plan", "skipped_unavailable", "requires usage credits"
-        )
-        result, consult = self._run(
-            _args(
-                "claude", "sonnet", "architecture",
-                native_consultation=_native("claude", "completed", model="opus"),
+    def test_opus_host_reporting_opus_itself_is_rejected_not_in_chain(self):
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            self._run(
+                _args(
+                    "claude", "opus", "bounded",
+                    native_consultation=_native("claude", "completed", model="opus"),
+                )
             )
-        )
-        self.assertTrue(
-            any(
-                notice.startswith("Skipped claude:fable earlier this session:")
-                for notice in result["handoff_notices"]
-            ),
-            result["handoff_notices"],
-        )
+
+    def test_sonnet_host_reporting_opus_is_rejected_not_in_chain(self):
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            self._run(
+                _args(
+                    "claude", "sonnet", "architecture",
+                    native_consultation=_native("claude", "completed", model="opus"),
+                )
+            )
 
 
 if __name__ == "__main__":

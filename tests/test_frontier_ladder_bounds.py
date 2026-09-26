@@ -197,7 +197,13 @@ class RouteAgentTaskFlagshipFallbackTests(_HomeRedirectedTestCase):
             result = broker.route_agent_task(args)
         return result, consult_mock
 
-    def test_latched_fable_falls_back_to_opus_with_notice(self):
+    def test_latched_fable_uses_original_model_with_notice_only(self):
+        # WP-SB7: the Claude flagship chain carries no same-vendor fallback any
+        # more (Opus is never offered as a fallback), so a direct
+        # route_agent_task call on a latched fable proceeds on fable unchanged
+        # and only adds a handoff notice -- it never swaps to Opus, and it
+        # never swaps cross-vendor either (that would also change
+        # target_agent/CLI, which this preflight-only helper does not do).
         broker._set_flagship_latch(
             ("session-x", "claude", "fable"), "plan", "skipped_unavailable",
             "requires usage credits",
@@ -209,30 +215,42 @@ class RouteAgentTaskFlagshipFallbackTests(_HomeRedirectedTestCase):
             ),
             _resolved("claude_code", "fable", "xhigh"),
         )
-        self.assertEqual(consult.call_args.args[1]["target_model"], "opus")
-        self.assertEqual(result["model_resolution"]["target_model"], "opus")
-        self.assertEqual(result["model_resolution"]["fallback_from"], "fable")
+        self.assertEqual(consult.call_args.args[1]["target_model"], "fable")
+        self.assertEqual(result["model_resolution"]["target_model"], "fable")
+        self.assertNotIn("fallback_from", result["model_resolution"])
+        notices = result["model_resolution"].get("notices") or []
         self.assertTrue(
-            any("fable" in n and "opus" in n for n in result["model_resolution"]["notices"])
+            any("all fallback models are latched" in n.lower() and "fable" in n for n in notices),
+            notices,
         )
-        # Effort is preserved across the fallback.
+        self.assertFalse(any("opus" in n.lower() for n in notices), notices)
+        # Effort is preserved.
         self.assertEqual(consult.call_args.args[1]["effort"], "xhigh")
 
-    def test_latched_codex_frontier_falls_back_to_previous_frontier(self):
+    def test_latched_codex_frontier_uses_original_model_with_notice_only(self):
+        # WP-SB7: the Codex flagship chain is the live frontier role model
+        # only -- CODEX_PREVIOUS_FRONTIER_MODEL (gpt-5.6-sol) is never offered
+        # as a fallback any more, so a latched Astra proceeds on Astra
+        # unchanged with only a handoff notice.
         broker._set_flagship_latch(
             ("session-y", "codex", broker.normalize_lookup("gpt-6-astra")), "quota",
             "skipped_quota", "429 too many requests",
         )
-        with mock.patch.object(broker, "_codex_catalog_lists_previous_frontier", return_value=True):
-            result, consult = self._run(
-                _route_args(
-                    target_agent="codex", surface="cli", target_model="gpt-6-astra",
-                    session_id="session-y", effort="high",
-                ),
-                _resolved("codex_cli", "gpt-6-astra", "high"),
-            )
-        self.assertEqual(consult.call_args.args[1]["target_model"], broker.CODEX_PREVIOUS_FRONTIER_MODEL)
-        self.assertEqual(result["model_resolution"]["fallback_from"], "gpt-6-astra")
+        result, consult = self._run(
+            _route_args(
+                target_agent="codex", surface="cli", target_model="gpt-6-astra",
+                session_id="session-y", effort="high",
+            ),
+            _resolved("codex_cli", "gpt-6-astra", "high"),
+        )
+        self.assertEqual(consult.call_args.args[1]["target_model"], "gpt-6-astra")
+        self.assertNotIn("fallback_from", result["model_resolution"])
+        notices = result["model_resolution"].get("notices") or []
+        self.assertTrue(
+            any("all fallback models are latched" in n.lower() and "gpt-6-astra" in n for n in notices),
+            notices,
+        )
+        self.assertFalse(any(broker.CODEX_PREVIOUS_FRONTIER_MODEL in n for n in notices), notices)
 
     def test_no_latch_leaves_model_unchanged(self):
         result, consult = self._run(
@@ -244,35 +262,6 @@ class RouteAgentTaskFlagshipFallbackTests(_HomeRedirectedTestCase):
         )
         self.assertEqual(consult.call_args.args[1]["target_model"], "fable")
         self.assertNotIn("fallback_from", result["model_resolution"])
-
-    def test_all_chain_models_latched_uses_original_model_with_notice(self):
-        # WP-SB2b(c): fable AND opus (the whole claude chain) are latched for
-        # this session -- the request must still proceed on fable (no silent
-        # unnoticed retry of a known-latched model), and the caller must see a
-        # notice explaining that every fallback was exhausted.
-        broker._set_flagship_latch(
-            ("session-w", "claude", "fable"), "plan", "skipped_unavailable",
-            "requires usage credits",
-        )
-        broker._set_flagship_latch(
-            ("session-w", "claude", "opus"), "quota", "skipped_quota",
-            "429 too many requests",
-        )
-        result, consult = self._run(
-            _route_args(
-                target_agent="claude", surface="cli", target_model="fable",
-                session_id="session-w", effort="xhigh",
-            ),
-            _resolved("claude_code", "fable", "xhigh"),
-        )
-        self.assertEqual(consult.call_args.args[1]["target_model"], "fable")
-        self.assertNotIn("fallback_from", result["model_resolution"])
-        notices = result["model_resolution"].get("notices") or []
-        self.assertTrue(
-            any("all fallback models are latched" in n.lower() and "fable" in n for n in notices),
-            notices,
-        )
-
 
 class FrontierPromptCapTests(_HomeRedirectedTestCase):
     def test_oversized_frontier_prompt_raises(self):

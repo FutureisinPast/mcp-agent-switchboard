@@ -199,9 +199,11 @@ class SelectCodexRolesTests(unittest.TestCase):
 
 
 class SelectClaudeRolesTests(unittest.TestCase):
-    def test_frontier_chain_is_fable_then_opus(self):
+    def test_frontier_chain_is_fable_only(self):
+        # WP-SB7: the Claude flagship chain carries no same-vendor fallback --
+        # Opus is never offered as a fallback member any more.
         out = model_roles.select_claude_roles()
-        self.assertEqual(out["frontier"], ["fable", "opus"])
+        self.assertEqual(out["frontier"], ["fable"])
 
     def test_workhorse_and_reader_aliases(self):
         out = model_roles.select_claude_roles()
