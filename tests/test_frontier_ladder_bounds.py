@@ -197,13 +197,11 @@ class RouteAgentTaskFlagshipFallbackTests(_HomeRedirectedTestCase):
             result = broker.route_agent_task(args)
         return result, consult_mock
 
-    def test_latched_fable_uses_original_model_with_notice_only(self):
-        # WP-SB7: the Claude flagship chain carries no same-vendor fallback any
-        # more (Opus is never offered as a fallback), so a direct
-        # route_agent_task call on a latched fable proceeds on fable unchanged
-        # and only adds a handoff notice -- it never swaps to Opus, and it
-        # never swaps cross-vendor either (that would also change
-        # target_agent/CLI, which this preflight-only helper does not do).
+    def test_latched_fable_returns_skipped_result_without_dispatching(self):
+        # WP-SB8D item 1: a latched target with no available fallback no
+        # longer dispatches silently ("using it anyway") -- it returns a
+        # structured skipped_unavailable/skipped_quota result instead, and
+        # consult() is never called.
         broker._set_flagship_latch(
             ("session-x", "claude", "fable"), "plan", "skipped_unavailable",
             "requires usage credits",
@@ -215,23 +213,17 @@ class RouteAgentTaskFlagshipFallbackTests(_HomeRedirectedTestCase):
             ),
             _resolved("claude_code", "fable", "xhigh"),
         )
-        self.assertEqual(consult.call_args.args[1]["target_model"], "fable")
-        self.assertEqual(result["model_resolution"]["target_model"], "fable")
-        self.assertNotIn("fallback_from", result["model_resolution"])
-        notices = result["model_resolution"].get("notices") or []
-        self.assertTrue(
-            any("all fallback models are latched" in n.lower() and "fable" in n for n in notices),
-            notices,
-        )
-        self.assertFalse(any("opus" in n.lower() for n in notices), notices)
-        # Effort is preserved.
-        self.assertEqual(consult.call_args.args[1]["effort"], "xhigh")
+        consult.assert_not_called()
+        self.assertEqual(result["status"], "skipped_unavailable")
+        self.assertEqual(result["latch_kind"], "plan")
+        self.assertEqual(result["latch_reason"], "requires usage credits")
+        self.assertIn("consult_decision", result["guidance"])
+        self.assertIn("retry_unavailable", result["guidance"])
+        self.assertFalse(any("opus" in str(v).lower() for v in result.values()))
 
-    def test_latched_codex_frontier_uses_original_model_with_notice_only(self):
-        # WP-SB7: the Codex flagship chain is the live frontier role model
-        # only -- CODEX_PREVIOUS_FRONTIER_MODEL (gpt-5.6-sol) is never offered
-        # as a fallback any more, so a latched Astra proceeds on Astra
-        # unchanged with only a handoff notice.
+    def test_latched_codex_frontier_returns_skipped_quota_without_dispatching(self):
+        # WP-SB8D item 1: same for the Codex chain, and the quota kind/expiry
+        # is carried on the skipped result.
         broker._set_flagship_latch(
             ("session-y", "codex", broker.normalize_lookup("gpt-6-astra")), "quota",
             "skipped_quota", "429 too many requests",
@@ -243,14 +235,57 @@ class RouteAgentTaskFlagshipFallbackTests(_HomeRedirectedTestCase):
             ),
             _resolved("codex_cli", "gpt-6-astra", "high"),
         )
-        self.assertEqual(consult.call_args.args[1]["target_model"], "gpt-6-astra")
-        self.assertNotIn("fallback_from", result["model_resolution"])
-        notices = result["model_resolution"].get("notices") or []
-        self.assertTrue(
-            any("all fallback models are latched" in n.lower() and "gpt-6-astra" in n for n in notices),
-            notices,
+        consult.assert_not_called()
+        self.assertEqual(result["status"], "skipped_quota")
+        self.assertEqual(result["latch_kind"], "quota")
+        self.assertIn("expires_at", result)
+        self.assertFalse(any(broker.CODEX_PREVIOUS_FRONTIER_MODEL in str(v) for v in result.values()))
+
+    def test_retry_unavailable_bypasses_latch_and_dispatches(self):
+        # WP-SB8D item 1: retry_unavailable=true forces exactly one dispatch
+        # despite the active latch.
+        broker._set_flagship_latch(
+            ("session-z", "codex", broker.normalize_lookup("gpt-6-astra")), "plan",
+            "skipped_unavailable", "plan does not include this model",
         )
-        self.assertFalse(any(broker.CODEX_PREVIOUS_FRONTIER_MODEL in n for n in notices), notices)
+        result, consult = self._run(
+            _route_args(
+                target_agent="codex", surface="cli", target_model="gpt-6-astra",
+                session_id="session-z", effort="high", retry_unavailable=True,
+            ),
+            _resolved("codex_cli", "gpt-6-astra", "high"),
+            consult_return={"status": "ok", "response": "done"},
+        )
+        consult.assert_called_once()
+        self.assertEqual(consult.call_args.args[1]["target_model"], "gpt-6-astra")
+        notices = result["model_resolution"].get("notices") or []
+        self.assertTrue(any("retry_unavailable" in n for n in notices), notices)
+
+    def test_retry_unavailable_success_clears_the_latch(self):
+        key = ("session-clear", "codex", broker.normalize_lookup("gpt-6-astra"))
+        broker._set_flagship_latch(key, "plan", "skipped_unavailable", "plan does not include this model")
+        self._run(
+            _route_args(
+                target_agent="codex", surface="cli", target_model="gpt-6-astra",
+                session_id="session-clear", effort="high", retry_unavailable=True,
+            ),
+            _resolved("codex_cli", "gpt-6-astra", "high"),
+            consult_return={"status": "ok", "response": "done"},
+        )
+        self.assertNotIn(key, broker._FLAGSHIP_AVAILABILITY_LATCHES)
+
+    def test_retry_unavailable_repeat_failure_refreshes_the_latch(self):
+        key = ("session-refresh", "codex", broker.normalize_lookup("gpt-6-astra"))
+        broker._set_flagship_latch(key, "plan", "skipped_unavailable", "plan does not include this model")
+        self._run(
+            _route_args(
+                target_agent="codex", surface="cli", target_model="gpt-6-astra",
+                session_id="session-refresh", effort="high", retry_unavailable=True,
+            ),
+            _resolved("codex_cli", "gpt-6-astra", "high"),
+            consult_return={"status": "error", "response": "provider unavailable: authentication failed"},
+        )
+        self.assertIn(key, broker._FLAGSHIP_AVAILABILITY_LATCHES)
 
     def test_no_latch_leaves_model_unchanged(self):
         result, consult = self._run(
@@ -536,7 +571,8 @@ class RoutingGateFlagshipCapTests(unittest.TestCase):
         }
 
     def test_oversized_fable_agent_call_is_denied(self):
-        big_prompt = "x" * (routing_gate.FLAGSHIP_PROMPT_MAX_BYTES + 1)
+        # Past BOTH the standard and the extended tier (WP-SB8A item 6).
+        big_prompt = "x" * (routing_gate.FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES + 1)
         result = routing_gate.pre_tool_use(self._payload("fable", big_prompt))
         self.assertEqual(
             result["hookSpecificOutput"]["permissionDecision"], "deny"
@@ -544,7 +580,7 @@ class RoutingGateFlagshipCapTests(unittest.TestCase):
         self.assertIn("bounded", result["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_oversized_claude_opus_5_5_agent_call_is_denied(self):
-        big_prompt = "x" * (routing_gate.FLAGSHIP_PROMPT_MAX_BYTES + 1)
+        big_prompt = "x" * (routing_gate.FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES + 1)
         result = routing_gate.pre_tool_use(self._payload("claude-opus-5-5", big_prompt))
         self.assertEqual(
             result["hookSpecificOutput"]["permissionDecision"], "deny"
@@ -554,23 +590,32 @@ class RoutingGateFlagshipCapTests(unittest.TestCase):
         result = routing_gate.pre_tool_use(self._payload("fable", "a short bounded prompt"))
         self.assertNotIn("hookSpecificOutput", result)
 
+    def test_extended_tier_fable_prompt_is_allowed_but_flagged(self):
+        # WP-SB8A item 6: between the standard and extended cap the call is
+        # allowed, not denied, with a permission-allow output naming the tier.
+        prompt = "x" * (routing_gate.FLAGSHIP_PROMPT_MAX_BYTES + 1000)
+        result = routing_gate.pre_tool_use(self._payload("fable", prompt))
+        output = result["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "allow")
+        self.assertIn("extended budget", output["permissionDecisionReason"])
+
     def test_oversized_prompt_with_no_model_is_allowed(self):
-        big_prompt = "x" * (routing_gate.FLAGSHIP_PROMPT_MAX_BYTES + 1)
+        big_prompt = "x" * (routing_gate.FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES + 1)
         result = routing_gate.pre_tool_use(self._payload(None, big_prompt))
         self.assertNotIn("hookSpecificOutput", result)
 
     def test_oversized_prompt_with_sonnet_is_allowed(self):
-        big_prompt = "x" * (routing_gate.FLAGSHIP_PROMPT_MAX_BYTES + 1)
+        big_prompt = "x" * (routing_gate.FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES + 1)
         result = routing_gate.pre_tool_use(self._payload("sonnet", big_prompt))
         self.assertNotIn("hookSpecificOutput", result)
 
     def test_oversized_prompt_with_haiku_is_allowed(self):
-        big_prompt = "x" * (routing_gate.FLAGSHIP_PROMPT_MAX_BYTES + 1)
+        big_prompt = "x" * (routing_gate.FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES + 1)
         result = routing_gate.pre_tool_use(self._payload("haiku", big_prompt))
         self.assertNotIn("hookSpecificOutput", result)
 
     def test_non_delegation_tool_with_flagship_model_is_unaffected(self):
-        big_prompt = "x" * (routing_gate.FLAGSHIP_PROMPT_MAX_BYTES + 1)
+        big_prompt = "x" * (routing_gate.FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES + 1)
         result = routing_gate.pre_tool_use(
             self._payload("fable", big_prompt, tool_name="Read")
         )
@@ -589,9 +634,14 @@ class RoutingGateFlagshipCapTests(unittest.TestCase):
         }
 
     def test_codex_spawn_agent_oversized_astra_message_is_denied(self):
-        big_message = "x" * (routing_gate.FLAGSHIP_PROMPT_MAX_BYTES + 1)
+        big_message = "x" * (routing_gate.FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES + 1)
         result = routing_gate.pre_tool_use(self._spawn_agent_payload("gpt-6-astra", big_message))
         self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_codex_spawn_agent_extended_astra_message_is_allowed(self):
+        message = "x" * (routing_gate.FLAGSHIP_PROMPT_MAX_BYTES + 1000)
+        result = routing_gate.pre_tool_use(self._spawn_agent_payload("gpt-6-astra", message))
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "allow")
 
     def test_codex_spawn_agent_small_astra_message_is_allowed(self):
         result = routing_gate.pre_tool_use(
@@ -600,12 +650,12 @@ class RoutingGateFlagshipCapTests(unittest.TestCase):
         self.assertNotIn("hookSpecificOutput", result)
 
     def test_codex_spawn_agent_oversized_sol_message_is_allowed(self):
-        big_message = "x" * (routing_gate.FLAGSHIP_PROMPT_MAX_BYTES + 1)
+        big_message = "x" * (routing_gate.FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES + 1)
         result = routing_gate.pre_tool_use(self._spawn_agent_payload("gpt-6-sol", big_message))
         self.assertNotIn("hookSpecificOutput", result)
 
     def test_codex_spawn_agent_oversized_luna_message_is_allowed(self):
-        big_message = "x" * (routing_gate.FLAGSHIP_PROMPT_MAX_BYTES + 1)
+        big_message = "x" * (routing_gate.FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES + 1)
         result = routing_gate.pre_tool_use(self._spawn_agent_payload("gpt-6-luna", big_message))
         self.assertNotIn("hookSpecificOutput", result)
 

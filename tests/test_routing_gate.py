@@ -429,16 +429,19 @@ class RoutingGateTests(unittest.TestCase):
         output = denied["hookSpecificOutput"]
         self.assertEqual(output["permissionDecision"], "deny")
         reason = output["permissionDecisionReason"]
-        # New message: still reports the exact count and allowance, and still
-        # names the override command -- same guarantee, new wording.
+        # WP-SB8A item 5: the message now reports the CURRENT BLOCK count (labelled
+        # as such) plus a labelled session total, and still names the override
+        # command -- same guarantee, new wording.
         self.assertIn(
-            "Routing gate: 3 direct brain labour calls since the last delegation or override",
+            "Routing gate: 3 direct labour calls in this block",
             reason,
         )
+        self.assertIn("Session total since start:", reason)
         self.assertIn("the allowance is 3", reason)
         self.assertIn("routing-override", reason)
         state = routing_gate._read_state("session-1")
         self.assertEqual(state["direct_labour_counts"]["reads"], 3)
+        self.assertEqual(state["direct_labour_block_counts"]["reads"], 3)
 
     def _read_log_entries(self, session_id: str = "session-1") -> list[dict]:
         path = routing_gate._session_log_path(session_id)

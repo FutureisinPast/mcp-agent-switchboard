@@ -374,7 +374,7 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
             self._research_package("What changed?", " what changed? ")
         with self.assertRaisesRegex(ValueError, "nonempty"):
             self._research_package(" ")
-        with self.assertRaisesRegex(ValueError, "at most 500"):
+        with self.assertRaisesRegex(ValueError, "item 1 is 501 characters; the limit is 500"):
             self._research_package("x" * 501)
 
     def test_research_accepts_mcp_iterable_proxy_and_json_array_string(self):
@@ -442,7 +442,7 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
         self.assertIn("surface summary", prompt)
         self.assertIn("competing explanation", prompt)
         self.assertIn("Never invent line numbers for web sources", prompt)
-        self.assertIn("8,000 characters", prompt)
+        self.assertIn("no length limit on your answer", prompt)
         self.assertLess(prompt.index(questions[0]), prompt.index(questions[1]))
         for name in ("consult_antigravity", "route_agent_task"):
             tool = next(item for item in broker.TOOLS if item["name"] == name)

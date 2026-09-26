@@ -122,10 +122,24 @@ DELEGATION_TOOL_NAMES = {"agent", "task", "spawn_agent"}
 # DECISION_PROVIDER_PROMPT_MAX_BYTES is set equal to this constant where
 # import order allows (see WP-SB2), with a pinning test either way.
 FLAGSHIP_PROMPT_MAX_BYTES = 14_000
+# WP-SB8A item 6: a tiered cap. Up to FLAGSHIP_PROMPT_MAX_BYTES is allowed silently as
+# before; between that and FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES is allowed but logged and
+# flagged in the permission reason so the extended budget is visible, not silent; past
+# the extended cap the call is denied exactly as before, with both limits named.
+FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES = 42_000
 SWITCHBOARD_CONTROL_SUFFIXES = {
     "consult_decision", "consult_codex", "consult_claude", "consult_gemini", "consult_antigravity",
     "queue_codex_request", "queue_claude_request", "request_status",
     "request_result", "route_agent_task",
+}
+# WP-SB8A item 3: these mcp__agent_switchboard__ tools are broker-probe/read-only
+# lookups (evidence retrieval, status/result polling, catalog listing) rather than
+# labour the gate should count as "evidence". Matched against the tool segment AFTER
+# the mcp__agent_switchboard__ prefix (normalize_tool_name already folds the
+# hyphenated Claude spelling to the same underscore form as Codex's).
+SWITCHBOARD_EVIDENCE_EXEMPT_TOOLS = {
+    "run_evidence_probe", "retrieve_shared_context", "resolve_model_request",
+    "request_status", "request_result", "compact_topic",
 }
 # WP-SB6: the narrower set of Switchboard tools a delegated child (a codex/claude CLI
 # subprocess the broker itself launched, AGENT_BROKER_CHILD=1) is never allowed to call --
@@ -177,8 +191,7 @@ ROUTING_OVERRIDE_COMMAND_RE = re.compile(
     r"^\s*(?:&\s*)?(?:"
     r"(?:\"[^\"\r\n]*agent-switchboard(?:\.exe)?\"|\S*agent-switchboard(?:\.exe)?)"
     r"|(?:\"?\S*python(?:\.exe)?\"?\s+\"?[^\r\n]*agent_broker_entry\.py\"?)"
-    r")\s+routing-override\s+--session\s+\S+\s+--package\s+WP[A-Za-z0-9_.-]+"
-    r"\s+--reason\s+.+$",
+    r")\s+routing-override(?:\s+[^;&|\r\n]*)?\s*$",
     re.IGNORECASE,
 )
 # Match ``agy`` only where a shell would treat it as the command being
@@ -473,6 +486,12 @@ def reserve_direct_labour(
             return
         counts = state.setdefault("direct_labour_counts", {})
         counts[category] = int(counts.get(category) or 0) + 1
+        # Session-total counts (direct_labour_counts) never reset -- the audit floor
+        # check depends on them staying monotonic for the whole session. The block
+        # counts below are a separate, parallel tally that resets with every relief,
+        # so the deny message can show what happened in THIS block (WP-SB8A item 5).
+        block_counts = state.setdefault("direct_labour_block_counts", {})
+        block_counts[category] = int(block_counts.get(category) or 0) + 1
         state["direct_labour_count"] = int(state.get("direct_labour_count") or 0) + 1
         state["direct_labour_since_relief"] = since_relief + 1
         if tool_use_id:
@@ -565,6 +584,13 @@ def subagent_start(payload: dict) -> dict:
     """Record a host-issued native agent id/type without trusting prose output."""
     sweep_stale()
     session_id = str(payload.get("session_id") or "").strip()
+    if os.environ.get("AGENT_BROKER_CHILD") == "1":
+        # WP-SB8D item 3: a guarded child cannot legitimately reach this event
+        # (PreToolUse denies the spawn that would trigger it); skip its
+        # bookkeeping rather than crediting a labour-relief reset that has no
+        # meaning for a depth-1 worker.
+        log_gate_decision(session_id, "SubagentStart", "-", None, "child-no-block")
+        return {}
     agent_id = str(payload.get("agent_id") or "").strip()
     agent_type = str(payload.get("agent_type") or "").strip()
     if not session_id or not agent_id or not agent_type:
@@ -582,6 +608,7 @@ def subagent_start(payload: dict) -> dict:
         }
         if _normalized_agent_type(agent_type) in NATIVE_CHEAP_AGENT_TYPES:
             state["direct_labour_since_relief"] = 0
+            state["direct_labour_block_counts"] = {}
             state["labour_relief_sequence"] = int(
                 state.get("labour_relief_sequence") or 0
             ) + 1
@@ -599,6 +626,12 @@ def subagent_stop(payload: dict) -> dict:
     """Mark a native receipt complete from the host lifecycle event."""
     sweep_stale()
     session_id = str(payload.get("session_id") or "").strip()
+    if os.environ.get("AGENT_BROKER_CHILD") == "1":
+        # WP-SB8D item 3: never block, and never record a flagship-consultation
+        # receipt, for a Switchboard child -- it cannot spawn/consult anything
+        # (PreToolUse already denies that), so there is nothing here to credit.
+        log_gate_decision(session_id, "SubagentStop", "-", None, "child-no-block")
+        return {}
     agent_id = str(payload.get("agent_id") or "").strip()
     agent_type = str(payload.get("agent_type") or "").strip()
     if not session_id or not agent_id or not agent_type:
@@ -802,6 +835,18 @@ def _direct_labour_category(tool_name: object, tool_input: object) -> str | None
         name.endswith(suffix) for suffix in SWITCHBOARD_CONTROL_SUFFIXES
     ):
         return None
+    # WP-SB8A item 3: broker probe/read/list tools are not labour either -- a
+    # get_* / list_* lookup or an explicit exempt tool (evidence probe, shared
+    # context retrieval, status/result polling, catalog compaction) is the gate
+    # checking its own ledger, not the brain doing work.
+    if name.startswith("mcp__agent_switchboard__"):
+        tool_segment = name[len("mcp__agent_switchboard__"):]
+        if (
+            tool_segment in SWITCHBOARD_EVIDENCE_EXEMPT_TOOLS
+            or tool_segment.startswith("get_")
+            or tool_segment.startswith("list_")
+        ):
+            return None
     if name in READ_TOOL_NAMES:
         return "reads"
     if name in SEARCH_TOOL_NAMES:
@@ -810,7 +855,11 @@ def _direct_labour_category(tool_name: object, tool_input: object) -> str | None
         return "evidence"
     text = _tool_input_text(tool_input)
     if name in SHELL_TOOL_NAMES or "shell" in name:
-        if ROUTING_OVERRIDE_COMMAND_RE.search(text):
+        # WP-SB8A item 4: any routing-override invocation (including a bare
+        # `--help`) is exempt; a shell separator neutralized here only inside a
+        # quoted string, so a chained command after the invocation (`;`, `&&`,
+        # `|`) still fails to match and gets no free pass.
+        if ROUTING_OVERRIDE_COMMAND_RE.search(_neutralize_quoted_separators(text)):
             return None
         return "tests" if TEST_COMMAND_RE.search(text) else "other"
     if name in MUTATING_TOOL_NAMES:
@@ -822,6 +871,21 @@ def user_prompt_submit(payload: dict) -> dict:
     sweep_stale()
     session_id = str(payload.get("session_id") or "").strip()
     reset_turn_state(session_id)
+    if os.environ.get("AGENT_BROKER_CHILD") == "1":
+        # WP-SB8D item 3: never inject the brain's delegation/routing policy
+        # into a Switchboard child -- it cannot delegate (PreToolUse denies
+        # that) and re-injecting "you have a standing request to delegate"
+        # into a depth-1 worker is exactly the recursive-consult defect this
+        # fixes. One short reminder of its own role instead.
+        log_gate_decision(session_id, "UserPromptSubmit", "-", None, "child-context")
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": (
+                    "You are a Switchboard child: answer the request; do not delegate or consult."
+                ),
+            }
+        }
     explicit_kind = str(payload.get("task_kind") or payload.get("work_kind") or "").strip().lower()
     prompt_text = " ".join(
         str(payload.get(key) or "") for key in ("prompt", "user_prompt", "message")
@@ -937,6 +1001,7 @@ def register_brain_override(session_id: str, package_id: str, reason: str) -> bo
             "registered_at": time.time(),
         }
         state["direct_labour_since_relief"] = 0
+        state["direct_labour_block_counts"] = {}
         state["labour_relief_sequence"] = int(
             state.get("labour_relief_sequence") or 0
         ) + 1
@@ -1365,6 +1430,41 @@ def _routing_override_command(session_id: str) -> str:
     )
 
 
+_RESEARCH_CATEGORIES = {"reads", "searches", "evidence"}
+
+
+def _suggested_dispatch_snippet(category: str) -> str:
+    """A copy-pasteable route_agent_task call, shaped to the pending work.
+
+    WP-SB8A item 5: a research-shaped block (reads/searches/evidence) should
+    never suggest task_kind='quick_check' -- that lane skips the mandatory
+    research_questions coverage/depth contract. tests/docs/other map to the
+    implementation or quick_check lane instead.
+    """
+    if category in _RESEARCH_CATEGORIES:
+        return (
+            "route_agent_task {target_agent:'antigravity', surface:'cli', "
+            "target_model:'gemini flash', effort:'high', mode:'plan', task_kind:'research', "
+            "research_questions:['<1-3 exact questions>'], work_package_id:'WP-<id>', "
+            "prompt:'<one bounded package>'}"
+        )
+    kind = "implementation" if category in {"tests", "docs"} else "quick_check"
+    return (
+        "route_agent_task {target_agent:'antigravity', surface:'cli', "
+        f"target_model:'gemini flash', effort:'high', mode:'plan', task_kind:'{kind}', "
+        "work_package_id:'WP-<id>', prompt:'<one bounded package>'}\n"
+        "   (add mode:'accept-edits' + allowed_files + acceptance_criteria to implement)"
+    )
+
+
+def _labour_counts_text(counts: dict, limit: int) -> str:
+    return ", ".join(
+        f"{name}={int(counts.get(name) or 0)}"
+        for name in DIRECT_BRAIN_LABOUR_CATEGORIES
+        if int(counts.get(name) or 0) > 0
+    ) or f"total={limit}"
+
+
 def pre_tool_use(payload: dict) -> dict:
     """Deny the next direct labour call after the threshold until delegation.
 
@@ -1380,22 +1480,35 @@ def pre_tool_use(payload: dict) -> dict:
     # launched -- AGENT_BROKER_CHILD=1 in its env) is a depth-1 adviser/worker, never a
     # brain: it must not spawn its own agents or open another consultation. Checked first
     # and independent of session/warn-mode state; without the env var this is a no-op.
-    if os.environ.get("AGENT_BROKER_CHILD") == "1" and _is_child_guarded_tool(
-        payload.get("tool_name")
-    ):
-        log_gate_decision(
-            session_id, "PreToolUse", normalized_tool, None, "deny",
-            extra={"reason": "switchboard_child_guard"},
-        )
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": (
-                    "Switchboard children may not spawn agents or start consultations"
-                ),
+    if os.environ.get("AGENT_BROKER_CHILD") == "1":
+        # WP-SB8D item 3: a Switchboard child loads the owner's config and
+        # therefore this hook, but it is a depth-1 adviser/worker on exactly one
+        # bounded package -- never a brain. It gets ONLY this guard: deny an
+        # agent-spawn/consult/route/queue attempt, allow everything else with no
+        # further checks. Brain-only mechanisms (the direct-labour counter/gate,
+        # the flagship prompt-budget cap, the Claude-unavailable circuit breaker,
+        # the direct-agy-shell block) never apply to a child -- they exist to
+        # keep the BRAIN from over-delegating or over-spending, which is
+        # meaningless for a worker that cannot delegate at all once guarded.
+        if _is_child_guarded_tool(payload.get("tool_name")):
+            log_gate_decision(
+                session_id, "PreToolUse", normalized_tool, None, "deny",
+                extra={"reason": "switchboard_child_guard"},
+            )
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        "Switchboard children may not spawn agents or start consultations"
+                    ),
+                }
             }
-        }
+        log_gate_decision(
+            session_id, "PreToolUse", normalized_tool, None, "allow",
+            extra={"child": True},
+        )
+        return {}
     claude_unavailable = _claude_unavailable_reason(session_id)
     if claude_unavailable and _is_claude_consult_route(
         payload.get("tool_name"), payload.get("tool_input") or {}
@@ -1448,7 +1561,7 @@ def pre_tool_use(payload: dict) -> dict:
         if _is_flagship_agent_model(tool_input.get("model")):
             prompt_text = _delegation_prompt_text(tool_input)
             prompt_bytes = len(prompt_text.encode("utf-8"))
-            if prompt_bytes > FLAGSHIP_PROMPT_MAX_BYTES:
+            if prompt_bytes > FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES:
                 log_gate_decision(
                     session_id, "PreToolUse", normalized_tool, None, "deny",
                     extra={"reason": "flagship_prompt_oversize", "bytes": prompt_bytes},
@@ -1459,9 +1572,27 @@ def pre_tool_use(payload: dict) -> dict:
                         "permissionDecision": "deny",
                         "permissionDecisionReason": (
                             f"Prompt exceeds the flagship bounded-request cap "
-                            f"({prompt_bytes}/{FLAGSHIP_PROMPT_MAX_BYTES} UTF-8 bytes). Send a bounded "
-                            "brief plus file paths instead (the agent can read files itself), or use "
-                            "consult_decision for a full flagship decision consultation."
+                            f"({prompt_bytes}/{FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES} UTF-8 bytes; "
+                            f"standard cap {FLAGSHIP_PROMPT_MAX_BYTES}, extended cap "
+                            f"{FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES}). Send a bounded brief plus file "
+                            "paths instead (the agent can read files itself), or use consult_decision "
+                            "for a full flagship decision consultation."
+                        ),
+                    }
+                }
+            if prompt_bytes > FLAGSHIP_PROMPT_MAX_BYTES:
+                log_gate_decision(
+                    session_id, "PreToolUse", normalized_tool, None, "flagship_prompt_extended",
+                    extra={"reason": "flagship_prompt_extended", "bytes": prompt_bytes},
+                )
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "permissionDecisionReason": (
+                            f"Flagship prompt used the extended budget ({prompt_bytes}/"
+                            f"{FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES} UTF-8 bytes; standard cap "
+                            f"{FLAGSHIP_PROMPT_MAX_BYTES})."
                         ),
                     }
                 }
@@ -1488,26 +1619,27 @@ def pre_tool_use(payload: dict) -> dict:
     if allowed:
         log_gate_decision(session_id, "PreToolUse", normalized_tool, category, "reserve")
         return {}
-    counts = state.get("direct_labour_counts") or {}
-    observed = ", ".join(
-        f"{name}={int(counts.get(name) or 0)}"
-        for name in DIRECT_BRAIN_LABOUR_CATEGORIES
-        if int(counts.get(name) or 0) > 0
-    ) or f"total={effective_direct_labour_limit()}"
+    limit = effective_direct_labour_limit()
+    block_counts = state.get("direct_labour_block_counts") or {}
+    since_relief = int(state.get("direct_labour_since_relief") or 0)
+    block_observed = _labour_counts_text(block_counts, limit)
+    session_counts = state.get("direct_labour_counts") or {}
+    session_observed = _labour_counts_text(session_counts, limit)
     # Lead with the cheapest lane and give it as a copy-pasteable call. The old message
     # named only the native roles and the override syntax, so a blocked brain reached
     # for a native subagent (or an override) and never discovered the workhorse that is
     # a tenth of the price -- the gate was quietly teaching the expensive habit.
+    # WP-SB8A item 5: the primary count is THIS block (resets on every relief); the
+    # session-wide total is shown too but labelled, so it is never mistaken for the
+    # current block. The suggested dispatch is shaped to the category that was
+    # actually blocked, so research work is never pointed at the quick_check lane.
     reason = (
-        f"Routing gate: {int(state.get('direct_labour_since_relief') or 0)} direct brain "
-        f"labour calls since the last delegation or override ({observed}); the allowance is "
-        f"{effective_direct_labour_limit()}. The next {category} call is blocked. Pick a lane:\n"
+        f"Routing gate: {since_relief} direct labour calls in this block ({block_observed}); "
+        f"the allowance is {limit}. Session total since start: {session_observed}. The next "
+        f"{category} call is blocked. Pick a lane:\n"
         "1. DEFAULT — dispatch the bounded package to the Flash workhorse (~1/10 the cost of "
         "the native workhorse, several times faster):\n"
-        "   route_agent_task {target_agent:'antigravity', surface:'cli', "
-        "target_model:'gemini flash', effort:'high', mode:'plan', task_kind:'quick_check', "
-        "work_package_id:'WP-<id>', prompt:'<one bounded package>'}\n"
-        "   (add mode:'accept-edits' + allowed_files + acceptance_criteria to implement)\n"
+        f"   {_suggested_dispatch_snippet(category)}\n"
         "2. Native cheap role (Agent/Task) when the package needs host-only tools or session "
         "state Flash cannot see — then state the flash_skip reason in the audit.\n"
         "3. Brain-retained package — register it exactly:\n"
@@ -1790,6 +1922,43 @@ def _store_context_evidence(payload: dict, serialized_response: str) -> Path | N
         return None
 
 
+INGRESS_PROJECTION_MAX_CHARS = 1_500
+_INGRESS_PROJECTION_SCALAR_FIELDS = (
+    "status", "outcome", "accepted", "credit_eligible", "worker_status", "disposition",
+    "receipt", "work_package_id", "attested_model", "attestation", "response_ref",
+    "elapsed_seconds",
+)
+
+
+def _ingress_projection(payload: dict) -> str:
+    """A compact scalar projection of a quarantined MCP response, for the notice.
+
+    WP-SB8A item 2: the brain loses the whole body to quarantine, but a handful of
+    top-level scalars (status/outcome/receipt/... ) are cheap and often enough to
+    decide the next step without opening the file. Reuses `_extract_dispatch_result`
+    (itself built on `_coerce_json_dict`) so a JSON body nested inside a text-content
+    envelope is still read. Returns "" when nothing parses -- the notice degrades to
+    its plain-text form."""
+    parsed = _extract_dispatch_result(payload)
+    if not isinstance(parsed, dict):
+        parsed = _coerce_json_dict(payload.get("tool_response"))
+    if not isinstance(parsed, dict):
+        return ""
+    parts = []
+    for field in _INGRESS_PROJECTION_SCALAR_FIELDS:
+        if field in parsed and not isinstance(parsed[field], (dict, list)):
+            parts.append(f"{field}={parsed[field]}")
+    structured = parsed.get("structured_output")
+    if isinstance(structured, dict):
+        for field in ("summary", "next_action"):
+            value = structured.get(field)
+            if value is not None:
+                parts.append(f"structured_output.{field}={str(value)[:300]}")
+    if not parts:
+        return ""
+    return ("projection: " + " | ".join(parts))[:INGRESS_PROJECTION_MAX_CHARS]
+
+
 def _context_ingress_feedback(payload: dict) -> dict | None:
     if not _is_mcp_tool(payload.get("tool_name")) or "tool_response" not in payload:
         return None
@@ -1802,16 +1971,18 @@ def _context_ingress_feedback(payload: dict) -> dict | None:
     evidence_path = _store_context_evidence(payload, serialized)
     if evidence_path is None:
         return None
+    # WP-SB8A item 2: shortened from the original wording (kept the same instructions,
+    # dropped the restatement) to make room for the projection below.
     feedback = (
         f"Brain-context ingress gate replaced an oversized MCP response "
-        f"({len(serialized)} characters; limit {CONTEXT_INGRESS_MAX_CHARS}). "
-        f"Raw evidence plus the original query is quarantined at {evidence_path}. "
-        "Do not read the whole file into the brain context. Delegate extraction to the "
-        "native reader or re-run/filter with an explicit field projection and output cap. "
-        "If a claim could change the patch, risk classification, or release decision, first "
-        "state: decision premise | what changes if false | bounded primary evidence; then "
-        "inspect only that minimal evidence range."
+        f"({len(serialized)} chars; limit {CONTEXT_INGRESS_MAX_CHARS}). Raw evidence quarantined "
+        f"at {evidence_path}. Do not read the whole file; delegate extraction or re-run with a "
+        "field projection and output cap. For a decision premise, first state: premise | what "
+        "changes if false | bounded primary evidence."
     )
+    projection = _ingress_projection(payload)
+    if projection:
+        feedback += f" {projection}"
     if str(payload.get("_switchboard_host") or "").strip().lower() == "claude":
         return {
             "hookSpecificOutput": {
@@ -1822,16 +1993,57 @@ def _context_ingress_feedback(payload: dict) -> dict | None:
     return {"decision": "block", "reason": feedback}
 
 
+def _hook_output_text(result: dict | None) -> str:
+    """Pull the human-facing text out of a hook result dict, for merging."""
+    if not isinstance(result, dict):
+        return ""
+    output = result.get("hookSpecificOutput")
+    if isinstance(output, dict):
+        text = output.get("additionalContext") or output.get("updatedToolOutput")
+        return str(text or "")
+    if result.get("decision") == "block":
+        return str(result.get("reason") or "")
+    return ""
+
+
 def post_tool_use(payload: dict) -> dict:
     sweep_stale()
     session_id = str(payload.get("session_id") or "").strip()
     tool_input = payload.get("tool_input") or {}
     normalized_tool = normalize_tool_name(payload.get("tool_name"))
+    if os.environ.get("AGENT_BROKER_CHILD") == "1":
+        # WP-SB8D item 3: a Switchboard child keeps ONLY the ingress quarantine
+        # (context protection against an oversized tool result) -- no labour
+        # checkpoint notice and no credit/decision-receipt bookkeeping, both of
+        # which exist only for the brain's own delegation/spend accounting.
+        ingress_feedback = _context_ingress_feedback(payload)
+        log_gate_decision(
+            session_id, "PostToolUse", normalized_tool, None,
+            "deny" if ingress_feedback is not None else "allow",
+            extra={"child": True},
+        )
+        if ingress_feedback is not None:
+            return _merge_post_tool_context(ingress_feedback, None)
+        return {}
     mutated = _is_mutating(payload.get("tool_name"), tool_input)
     if session_id and mutated and not _payload_is_cheap_native_call(payload):
         mark_mutated(session_id)
     claude_failure = _record_claude_unavailable(payload)
     claude_context = CLAUDE_CIRCUIT_CONTEXT if claude_failure else None
+
+    # WP-SB8A item 1: credit/decision-receipt must be computed from the ORIGINAL
+    # payload BEFORE any ingress replacement is considered. The old order returned
+    # on ingress_feedback first, so a completed Flash dispatch whose own response
+    # was over the ingress cap never reached _credit_switchboard_dispatch at all --
+    # the quarantine ate the relief. Both credit paths are read-only lookups keyed
+    # off a server-issued receipt/ledger ref, so computing them unconditionally is
+    # safe and idempotent (each is single-use via its own dedup check).
+    decision_receipt = _credit_decision_consultation(session_id, normalized_tool, payload)
+    credit = _credit_switchboard_dispatch(session_id, normalized_tool, payload)
+    relief_text = " ".join(
+        text for text in (_hook_output_text(decision_receipt), _hook_output_text(credit)) if text
+    ).strip() or None
+
     ingress_feedback = _context_ingress_feedback(payload)
     log_gate_decision(
         session_id,
@@ -1839,14 +2051,19 @@ def post_tool_use(payload: dict) -> dict:
         normalized_tool,
         None,
         "deny" if ingress_feedback is not None else "allow",
-        extra={"mutated": bool(mutated)},
+        extra={
+            "mutated": bool(mutated),
+            **({"credited": True} if relief_text else {}),
+        },
     )
     if ingress_feedback is not None:
-        return _merge_post_tool_context(ingress_feedback, claude_context)
-    decision_receipt = _credit_decision_consultation(session_id, normalized_tool, payload)
+        # The replacement text still must carry any credit/receipt notice earned
+        # from the original (pre-replacement) payload above -- otherwise the
+        # relief happened but the brain is never told its block just reopened.
+        merged_context = " ".join(x for x in (claude_context, relief_text) if x) or None
+        return _merge_post_tool_context(ingress_feedback, merged_context)
     if decision_receipt is not None:
         return _merge_post_tool_context(decision_receipt, claude_context)
-    credit = _credit_switchboard_dispatch(session_id, normalized_tool, payload)
     if credit is not None:
         return _merge_post_tool_context(credit, claude_context)
     if session_id:
@@ -1868,15 +2085,20 @@ def post_tool_use(payload: dict) -> dict:
 
         state = _update_state(session_id, update)
         if state and notify["value"]:
+            block_observed = _labour_counts_text(
+                state.get("direct_labour_block_counts") or {}, effective_direct_labour_limit()
+            )
             checkpoint = {
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",
                     "additionalContext": (
-                        f"Routing checkpoint: {effective_direct_labour_limit()} direct brain "
-                        "labour calls since the last delegation or override. The next eligible "
-                        "labour call will be denied. Cheapest next move: dispatch the bounded "
-                        "package with route_agent_task (target_agent='antigravity', "
-                        "surface='cli', target_model='gemini flash', effort='high', mode='plan')."
+                        f"Routing checkpoint: {effective_direct_labour_limit()} direct labour "
+                        f"calls in this block ({block_observed}). The next eligible labour call "
+                        "will be denied. Cheapest next move: dispatch the bounded package with "
+                        "route_agent_task (target_agent='antigravity', surface='cli', "
+                        "target_model='gemini flash', effort='high', mode='plan'); use "
+                        "task_kind='research' with 1-3 research_questions for reads/searches/"
+                        "evidence, or task_kind='implementation'/'quick_check' for tests/other."
                     ),
                 }
             }
@@ -2111,6 +2333,7 @@ def _credit_switchboard_dispatch(session_id: str, normalized_tool: str, payload:
             return  # one-use: a replayed receipt buys nothing
         credited.append(receipt)
         state["direct_labour_since_relief"] = 0
+        state["direct_labour_block_counts"] = {}
         state["labour_relief_sequence"] = int(state.get("labour_relief_sequence") or 0) + 1
         dispatches = state.setdefault("switchboard_dispatches", [])
         dispatches.append({"receipt": receipt, "work_package_id": work_package, "outcome": outcome})
@@ -2316,6 +2539,13 @@ def audit_mode() -> str:
 def stop(payload: dict) -> dict:
     sweep_stale()
     session_id = str(payload.get("session_id") or "").strip()
+    if os.environ.get("AGENT_BROKER_CHILD") == "1":
+        # WP-SB8D item 3: a Switchboard child never needs a flagship-consultation
+        # receipt or a routing audit before it can finish -- that requirement is
+        # recursive (it would demand the child itself spawn/consult another
+        # agent, which the PreToolUse guard just denied). Never block a child.
+        log_gate_decision(session_id, "Stop", "-", None, "child-no-block")
+        return {}
     if not session_id:
         return {}
     if payload.get("stop_hook_active"):

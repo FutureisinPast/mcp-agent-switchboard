@@ -9,7 +9,10 @@ Covers:
     to every prompt consult_codex/consult_claude actually dispatch;
   - the generated hierarchy block's child rule, first in the block;
   - the Claude child's ``--disallowedTools`` flag;
-  - the Codex child's ``--ignore-user-config``/``--disable multi_agent`` flags;
+  - the Codex child's ``-c mcp_servers.agent_switchboard.enabled=false``/
+    ``--disable multi_agent`` flags (WP-SB8C: replaced --ignore-user-config,
+    which also skipped the project's config.toml trust_level and blocked
+    read-only shell commands for the child);
   - routing_gate.py's PreToolUse child guard.
 
 Standard-library only. Makes zero real Claude or Codex model calls -- every CLI
@@ -160,7 +163,15 @@ class ChildPromptMarkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db_path = Path(tmpdir) / "state.sqlite"
             with mock.patch.object(broker, "DB_PATH", db_path), \
-                 mock.patch.object(broker, "BROKER_DIR", Path(tmpdir)):
+                 mock.patch.object(broker, "BROKER_DIR", Path(tmpdir)), \
+                 mock.patch.object(broker, "start_codex_request_worker", return_value={"started": False}):
+                # start_codex_request_worker is mocked out: autorun=True below would
+                # otherwise spawn a REAL detached subprocess (subprocess.Popen) whose
+                # log file lives under this test's own TemporaryDirectory, which is
+                # deleted a few lines later while that process may still hold the
+                # file open -- a genuine (pre-existing, environment-timing-dependent)
+                # Windows flake, not something this test needs a live worker for since
+                # it drives run_codex_request_worker directly afterward anyway.
                 broker.init_db()
                 queued = broker.queue_codex_request(tmpdir, "Do the thing.", None, "gpt-6-luna", False, "consult", None, "low", True)
                 rid = queued["id"]
@@ -241,10 +252,13 @@ class ClaudeChildDisallowedToolsTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Criterion 6: Codex children get --ignore-user-config and --disable multi_agent.
+# Criterion 6: Codex children get -c mcp_servers.agent_switchboard.enabled=false
+# and --disable multi_agent, and NEVER --ignore-user-config (WP-SB8C: that flag
+# also skipped the project's trust_level in config.toml, blocking even read-only
+# shell commands for the child -- verified regression, see agent_broker_mcp.py).
 # ---------------------------------------------------------------------------
 class CodexChildFlagsTests(unittest.TestCase):
-    def test_ignore_user_config_and_disable_multi_agent_present(self):
+    def test_switchboard_mcp_disabled_and_multi_agent_disabled_present(self):
         with tempfile.TemporaryDirectory() as tmpdir, \
              mock.patch.object(broker, "load_config", return_value={}), \
              mock.patch.object(broker, "discover_codex", return_value="codex"), \
@@ -253,7 +267,10 @@ class CodexChildFlagsTests(unittest.TestCase):
              mock.patch.object(broker, "run_process", return_value=(0, codex_stream("ok"), "")) as run:
             broker.consult_codex(tmpdir, "check", "read-only", None, None, 30)
         command = run.call_args.args[0]
-        self.assertIn("--ignore-user-config", command)
+        self.assertNotIn("--ignore-user-config", command)
+        self.assertIn("-c", command)
+        c_values = [command[i + 1] for i, arg in enumerate(command) if arg == "-c"]
+        self.assertIn("mcp_servers.agent_switchboard.enabled=false", c_values)
         self.assertIn("--disable", command)
         self.assertEqual(command[command.index("--disable") + 1], "multi_agent")
 

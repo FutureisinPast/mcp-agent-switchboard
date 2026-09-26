@@ -220,6 +220,26 @@ DECISION_PROVIDER_PROMPT_MAX_BYTES = routing_gate.FLAGSHIP_PROMPT_MAX_BYTES
 DECISION_PROVIDER_PROMPT_MAX_TOKENS = 3_500
 DECISION_ADVICE_MAX_CHARS = 3_000
 DECISION_COMBINED_MAX_BYTES = 8_000
+
+# WP-SB8B item 2: the opt-in "extended" prompt_budget tier. Standard is the
+# cheap default everywhere above; extended multiplies every byte/token budget
+# by 3 (except the fixed count limits -- questions/options/evidence_refs stay
+# put). The provider prompt bytes/tokens single source of truth stays
+# routing_gate.FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES so the PreToolUse delegation
+# gate and this in-process cap never disagree about what "extended" means.
+PROMPT_BUDGET_EXTENDED_MULTIPLIER = 3
+DECISION_PROVIDER_PROMPT_EXTENDED_MAX_BYTES = routing_gate.FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES
+DECISION_PROVIDER_PROMPT_EXTENDED_MAX_TOKENS = DECISION_PROVIDER_PROMPT_MAX_TOKENS * PROMPT_BUDGET_EXTENDED_MULTIPLIER
+DECISION_BRIEF_EXTENDED_MAX_BYTES = DECISION_BRIEF_MAX_BYTES * PROMPT_BUDGET_EXTENDED_MULTIPLIER
+DECISION_BRIEF_EXTENDED_MAX_TOKENS = DECISION_BRIEF_MAX_TOKENS * PROMPT_BUDGET_EXTENDED_MULTIPLIER
+DECISION_EVIDENCE_EXCERPT_EXTENDED_MAX_BYTES = DECISION_EVIDENCE_EXCERPT_MAX_BYTES * PROMPT_BUDGET_EXTENDED_MULTIPLIER
+DECISION_COMBINED_EXTENDED_MAX_BYTES = DECISION_COMBINED_MAX_BYTES * PROMPT_BUDGET_EXTENDED_MULTIPLIER
+BUDGET_REASON_MAX_CHARS = 200
+# WP-SB8B item 1: the bounded response-envelope budget applied to every
+# route_agent_task/consult result (separate from the raw-response truncation
+# above, which only ever bounded the "response" string -- structured_output
+# and its duplicate copy inside "response" could still blow the cap wide open).
+RESPONSE_ENVELOPE_DEFAULT_CHARS = 6_000
 DECISION_QUOTA_LATCH_DEFAULT_MINUTES = 30
 # Keyed (session_key, family, normalized_model). Each value carries
 # kind ("plan"|"quota"), status, reason, created_at, expires_at (quota only),
@@ -4176,12 +4196,15 @@ def _bounded_research_questions(value: Any) -> list[str]:
         raise ValueError("Flash research requires 1-3 research_questions")
     questions: list[str] = []
     seen: set[str] = set()
-    for raw in raw_items:
+    for index, raw in enumerate(raw_items, 1):
         if not isinstance(raw, str) or not raw.strip():
             raise ValueError("every research_questions item must be a nonempty string")
         question = raw.strip()
         if len(question) > 500:
-            raise ValueError("every research_questions item must be at most 500 characters")
+            raise ValueError(
+                f"research_questions item {index} is {len(question)} characters; the limit is 500. "
+                "Split it into smaller, more specific questions."
+            )
         key = question.casefold()
         if key in seen:
             raise ValueError("research_questions must be unique")
@@ -4366,7 +4389,12 @@ def flash_workhorse_output_schema(package: dict[str, Any]) -> dict[str, Any]:
                     "properties": {
                         "question": {"type": "string", "enum": research_questions},
                         "status": {"type": "string", "enum": ["answered", "not_found", "blocked"]},
-                        "answer": {"type": "string", "maxLength": 2000},
+                        # WP-SB8B item 3: no length pressure on Flash's free-text answer.
+                        # A worker once burned its whole sync timeout writing a script to
+                        # trim its own output to fit a maxLength; the broker stores and
+                        # trims the full result itself (see apply_response_envelope_budget),
+                        # so the schema only needs a structural, not a quality-degrading, cap.
+                        "answer": {"type": "string", "maxLength": 20_000},
                         "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
                         "evidence": {
                             "type": "array",
@@ -4458,7 +4486,7 @@ Research questions (preserve this exact order in research_coverage):
 {questions}
 
 Stop with status=blocked at the first ambiguity, plan mismatch, required out-of-scope change, or failed fix that needs diagnosis. Never continue to the next plan step/package. A failed check means status=failed unless the approved package explicitly expects that failure.
-Never stop at the first plausible result or provide only a surface summary. Cover the full declared scope and check a competing explanation when relevant. For research, answer every declared question with compact primary citations; use NOT FOUND only after reporting the searched boundary and gaps. Never invent line numbers for web sources. Block rather than infer when required evidence is unavailable. Keep the full report within 8,000 characters where possible.
+Never stop at the first plausible result or provide only a surface summary. Cover the full declared scope and check a competing explanation when relevant. For research, answer every declared question with compact primary citations; use NOT FOUND only after reporting the searched boundary and gaps. Never invent line numbers for web sources. Block rather than infer when required evidence is unavailable. There is no length limit on your answer; the broker stores the full result. Do not measure, trim or shorten your output.
 Separate observed facts from inference and assumptions. Any claim that behavior is intentional/by design must be basis=observed and cite an explicit spec, test, or code comment as file:line evidence; otherwise label it assumption and keep the investigation open.
 Your schema-enforced report is evidence for the sender brain, never approval. The brain will independently inspect cited lines, the actual diff, and check output before accepting this package or dispatching another.
 </flash_workhorse_contract>
@@ -5371,16 +5399,29 @@ def consult_codex(
         "--sandbox",
         sandbox,
         "--skip-git-repo-check",
-        # WP-SB6: verified against `codex exec --help` and one real dry run
-        # (gpt-6-luna/low, exit 0, no config-key error). --ignore-user-config skips
-        # ~/.codex/config.toml entirely -- auth still resolves through CODEX_HOME --
-        # which is where the owner's [mcp_servers.agent_switchboard] entry lives, so a
-        # consult child never sees the Switchboard MCP server. --disable multi_agent
-        # (equivalent to -c features.multi_agent=false) turns off the live
-        # `multi_agent` feature flag (confirmed present and stable via
-        # `codex features list`) that lets Codex spawn its own sub-agents. Never
-        # written to config.toml -- both are per-invocation only.
-        "--ignore-user-config",
+        # WP-SB8C: WP-SB6's --ignore-user-config was a regression -- it also skips
+        # ~/.codex/config.toml's [projects.'<path>'] trust_level, so every consult/
+        # worker child became untrusted and even read-only shell commands (e.g.
+        # `git log`) were blocked by policy. Verified with real dry runs
+        # (gpt-6-luna/low, --sandbox read-only --skip-git-repo-check --json):
+        #   1. Old flags (--ignore-user-config + --disable multi_agent): `git log`
+        #      blocked by policy; only built-in tools (image_gen, web.run, resource
+        #      tools) listed -- confirms the regression.
+        #   2. New flags (below): `git log -1 --oneline` ran and its real output
+        #      appeared in the JSON event stream; the MCP tool list came back full
+        #      of the owner's other servers (Canva, GitHub, Gmail, Hotline, plugin
+        #      management, Sites, Node REPL, OpenAI docs) with NO agent_switchboard_*
+        #      tool present anywhere.
+        # `-c mcp_servers.agent_switchboard.enabled=false` is a documented per-server
+        # config key (confirmed via `codex mcp get agent_switchboard` -> `enabled:
+        # true`); overriding it per-invocation force-disables just that one server
+        # while leaving the rest of config.toml -- including project trust_level --
+        # intact. `--disable multi_agent` (equivalent to -c features.multi_agent=
+        # false) still turns off the live `multi_agent` feature flag that lets Codex
+        # spawn its own sub-agents. Neither flag is ever written to config.toml --
+        # both are per-invocation only.
+        "-c",
+        "mcp_servers.agent_switchboard.enabled=false",
         "--disable",
         "multi_agent",
         "--json",
@@ -6805,7 +6846,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     # covered upstream by _route_agent_task_impl's own check; this is a no-op
     # there). Exempts consult_decision's own _decision_internal_token-carrying
     # calls, whose assembled prompt is already bounded by _decision_prompt.
-    _enforce_frontier_prompt_cap(model, resolved_model, prompt, args)
+    prompt_budget, budget_reason = _enforce_frontier_prompt_cap(model, resolved_model, prompt, args)
     if model == "antigravity":
         if not resolved_model:
             catalog = list_agent_models("antigravity").get("catalogs", {}).get("antigravity", {})
@@ -7133,11 +7174,292 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
                 result["note"] = "Long error response was stored with safety redaction; use retrieve_shared_context(response_ref, query) for details."
             else:
                 result["note"] = "Long consultation response was stored locally without redaction; use retrieve_shared_context(response_ref, query) for exact details."
+        result["prompt_budget"] = prompt_budget
+        if budget_reason:
+            result["budget_reason"] = budget_reason
+        result = apply_response_envelope_budget(
+            result, args.get("max_response_chars"), project_info.name, topic_arg, f"consult:{consulted_name}"
+        )
         return result
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
         store_consultation(project_info, model, mode, prompt, "", "error", error, started_at)
         raise
+
+
+def _resolve_prompt_budget(args: Mapping[str, Any]) -> tuple[str, str | None]:
+    """WP-SB8B item 2: validate the optional prompt_budget/budget_reason pair.
+
+    'standard' (the cheap default) needs nothing extra. 'extended' requires a
+    nonempty, <=200-character budget_reason -- an explicit opt-in trail for
+    "sometimes it needs to be bigger", never a silent escalation.
+    """
+    raw = args.get("prompt_budget")
+    tier = normalize_lookup(raw).replace(" ", "_") if raw not in (None, "") else "standard"
+    if tier not in ("standard", "extended"):
+        raise ValueError("prompt_budget must be 'standard' or 'extended'")
+    reason_raw = args.get("budget_reason")
+    reason = str(reason_raw).strip() if reason_raw is not None else ""
+    if tier == "extended":
+        if not reason:
+            raise ValueError(
+                "budget_reason is required and must be nonempty when prompt_budget='extended'"
+            )
+        if len(reason) > BUDGET_REASON_MAX_CHARS:
+            raise ValueError(f"budget_reason must be at most {BUDGET_REASON_MAX_CHARS} characters")
+        return tier, reason
+    return tier, (reason or None)
+
+
+def _prompt_budget_provider_limits(prompt_budget: str) -> tuple[int, int]:
+    if prompt_budget == "extended":
+        return DECISION_PROVIDER_PROMPT_EXTENDED_MAX_BYTES, DECISION_PROVIDER_PROMPT_EXTENDED_MAX_TOKENS
+    return DECISION_PROVIDER_PROMPT_MAX_BYTES, DECISION_PROVIDER_PROMPT_MAX_TOKENS
+
+
+def _prompt_budget_decision_limits(prompt_budget: str) -> dict[str, int]:
+    """The full set of consult_decision preflight budgets for a tier. Extended
+    multiplies every byte/token budget by PROMPT_BUDGET_EXTENDED_MULTIPLIER;
+    the fixed count limits (questions/options/evidence_refs) never change."""
+    if prompt_budget == "extended":
+        return {
+            "brief_bytes": DECISION_BRIEF_EXTENDED_MAX_BYTES,
+            "brief_tokens": DECISION_BRIEF_EXTENDED_MAX_TOKENS,
+            "evidence_excerpt_bytes": DECISION_EVIDENCE_EXCERPT_EXTENDED_MAX_BYTES,
+            "provider_prompt_bytes": DECISION_PROVIDER_PROMPT_EXTENDED_MAX_BYTES,
+            "provider_prompt_tokens": DECISION_PROVIDER_PROMPT_EXTENDED_MAX_TOKENS,
+            "combined_bytes": DECISION_COMBINED_EXTENDED_MAX_BYTES,
+        }
+    return {
+        "brief_bytes": DECISION_BRIEF_MAX_BYTES,
+        "brief_tokens": DECISION_BRIEF_MAX_TOKENS,
+        "evidence_excerpt_bytes": DECISION_EVIDENCE_EXCERPT_MAX_BYTES,
+        "provider_prompt_bytes": DECISION_PROVIDER_PROMPT_MAX_BYTES,
+        "provider_prompt_tokens": DECISION_PROVIDER_PROMPT_MAX_TOKENS,
+        "combined_bytes": DECISION_COMBINED_MAX_BYTES,
+    }
+
+
+def _prompt_budget_opt_in_hint(prompt_budget: str) -> str:
+    if prompt_budget == "extended":
+        return ""
+    return (
+        " To opt into a larger bounded budget, pass prompt_budget='extended' with a "
+        "nonempty budget_reason (<=200 characters)."
+    )
+
+
+def _envelope_header_fields(result: Mapping[str, Any]) -> dict[str, Any]:
+    header: dict[str, Any] = {}
+    for key in (
+        "status", "outcome", "accepted", "credit_eligible", "worker_status", "disposition",
+        "receipt", "work_package_id", "model", "attested_model", "attestation", "model_attested",
+        "elapsed_seconds", "native_handoff", "caveats", "response_ref", "truncated",
+    ):
+        if key in result:
+            header[key] = result[key]
+    return header
+
+
+# WP-SB8D item 2: the header used to be kept whole, so a large native_handoff
+# (or any other bulky header object/string) could push the final serialized
+# result past max_response_chars with no guarantee re-check. These bound each
+# header field individually before the size math below runs.
+_NATIVE_HANDOFF_HEADER_KEYS = ("family", "role", "model", "flash_skip_reason", "action")
+# The minimum set apply_response_envelope_budget guarantees survives even a
+# pathological every-field-is-huge result, per WP-SB8D item 2.
+_ENVELOPE_ESSENTIAL_KEYS = (
+    "status", "outcome", "accepted", "credit_eligible", "receipt",
+    "work_package_id", "response_ref", "truncated",
+)
+_HEADER_OBJECT_CONDENSE_CHARS = 300
+_HEADER_STRING_CAP_CHARS = 500
+
+
+def _condense_header_value(key: str, value: Any) -> Any:
+    """Reduce one bulky header-field value to something small and bounded.
+    native_handoff keeps only its essential scalar keys (family/role/model/
+    flash_skip_reason/action); any other header object (e.g. caveats) or long
+    string over the small condense cap collapses to a short stub or is
+    truncated -- the full value is always still reachable via response_ref."""
+    if key == "native_handoff" and isinstance(value, Mapping):
+        # native_handoff_for_flash_outcome nests family/role/model under a
+        # "native" sub-object; pull them up to top-level scalars either way so
+        # the essential-keys contract holds regardless of shape.
+        nested = value.get("native") if isinstance(value.get("native"), Mapping) else {}
+        condensed: dict[str, Any] = {}
+        for essential_key in _NATIVE_HANDOFF_HEADER_KEYS:
+            if essential_key in value:
+                condensed[essential_key] = value[essential_key]
+            elif essential_key in nested:
+                condensed[essential_key] = nested[essential_key]
+        return condensed or {"note": "condensed; see response_ref"}
+    if isinstance(value, (dict, list)):
+        if len(json.dumps(value, ensure_ascii=False, default=str)) > _HEADER_OBJECT_CONDENSE_CHARS:
+            return {"note": "condensed; see response_ref"}
+        return value
+    if isinstance(value, str) and len(value) > _HEADER_STRING_CAP_CHARS:
+        return _trim_long_strings(value, _HEADER_STRING_CAP_CHARS)
+    return value
+
+
+def _bounded_header_fields(result: Mapping[str, Any]) -> dict[str, Any]:
+    header = _envelope_header_fields(result)
+    return {key: _condense_header_value(key, value) for key, value in header.items()}
+
+
+def _enforce_envelope_size_guarantee(final: dict[str, Any], budget: int) -> dict[str, Any]:
+    """Last-mile guarantee for apply_response_envelope_budget: len(json.dumps(
+    final)) <= budget in every case, even a pathological result where every
+    field (header included) is huge. Drops non-essential keys first (largest
+    first), then shrinks remaining string values, then -- only if the budget
+    is too small even for the essential keys alone -- drops down to status/
+    truncated."""
+    def _size(obj: Mapping[str, Any]) -> int:
+        return len(json.dumps(obj, ensure_ascii=False, default=str))
+
+    if _size(final) <= budget:
+        return final
+
+    droppable = [k for k in final if k not in _ENVELOPE_ESSENTIAL_KEYS]
+    droppable.sort(key=lambda k: len(json.dumps(final[k], ensure_ascii=False, default=str)), reverse=True)
+    for drop_key in droppable:
+        final.pop(drop_key, None)
+        if _size(final) <= budget:
+            return final
+
+    per_field_cap = 200
+    for _ in range(8):
+        for key, value in list(final.items()):
+            if isinstance(value, str) and len(value) > per_field_cap:
+                final[key] = _trim_long_strings(value, per_field_cap)
+            elif isinstance(value, (dict, list)):
+                final[key] = {"note": "condensed; see response_ref"}
+        if _size(final) <= budget or per_field_cap <= 20:
+            break
+        per_field_cap = max(20, per_field_cap // 2)
+
+    if _size(final) <= budget:
+        return final
+
+    # Absolute last resort: the budget is too small even for the essential
+    # keys shrunk to per_field_cap. Keep only status/truncated -- still a
+    # valid, budget-fitting result.
+    minimal = {k: final[k] for k in ("status", "truncated") if k in final}
+    if _size(minimal) <= budget:
+        return minimal
+    return {"status": "truncated"}
+
+
+_ENVELOPE_TRUNCATION_MARKER = "…[truncated; full text in response_ref]"
+
+
+def _trim_long_strings(value: Any, per_string_budget: int) -> Any:
+    """Recursively shrink long string leaves to at most per_string_budget chars,
+    each marked with _ENVELOPE_TRUNCATION_MARKER. Structure (keys/list shape) is
+    preserved so a caller can still read status/confidence/etc. fields whole."""
+    if isinstance(value, str):
+        if len(value) > per_string_budget:
+            keep = max(0, per_string_budget - len(_ENVELOPE_TRUNCATION_MARKER))
+            return value[:keep] + _ENVELOPE_TRUNCATION_MARKER
+        return value
+    if isinstance(value, list):
+        return [_trim_long_strings(item, per_string_budget) for item in value]
+    if isinstance(value, dict):
+        return {k: _trim_long_strings(v, per_string_budget) for k, v in value.items()}
+    return value
+
+
+def _condense_bulky_diagnostics(working: dict[str, Any]) -> dict[str, Any]:
+    """Drop/condense known-bulky diagnostic blocks to their essentials before
+    the proportional string trimmer runs, so budget is spent on the actual
+    payload (structured_output/response) rather than model_resolution.catalog_status
+    or a verbose progress/containment block."""
+    model_resolution = working.get("model_resolution")
+    if isinstance(model_resolution, Mapping) and "catalog_status" in model_resolution:
+        condensed = dict(model_resolution)
+        condensed.pop("catalog_status", None)
+        working["model_resolution"] = condensed
+    progress = working.get("progress")
+    if isinstance(progress, Mapping) and len(json.dumps(progress, ensure_ascii=False, default=str)) > 400:
+        working["progress"] = {"status": progress.get("status"), "note": "condensed; see response_ref"}
+    containment = working.get("containment")
+    if isinstance(containment, Mapping) and len(json.dumps(containment, ensure_ascii=False, default=str)) > 400:
+        working["containment"] = {"status": containment.get("status"), "note": "condensed; see response_ref"}
+    return working
+
+
+def apply_response_envelope_budget(
+    result: dict[str, Any],
+    max_response_chars: Any,
+    project: str | None = None,
+    topic: str | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """WP-SB8B item 1: fit the FINAL serialized MCP result within max_response_chars
+    (default RESPONSE_ENVELOPE_DEFAULT_CHARS=6000 when unset), keeping a compact
+    header intact first. When structured_output is present, the duplicated raw
+    "response" string is dropped (response_ref covers it). The full untrimmed
+    result is always retrievable through response_ref/retrieve_shared_context."""
+    if not isinstance(result, dict):
+        return result
+    try:
+        budget = int(max_response_chars) if max_response_chars not in (None, "") else RESPONSE_ENVELOPE_DEFAULT_CHARS
+    except (TypeError, ValueError):
+        budget = RESPONSE_ENVELOPE_DEFAULT_CHARS
+    budget = max(800, min(budget, MAX_CONSULT_RESPONSE_CHARS))
+
+    serialized = json.dumps(result, ensure_ascii=False, default=str)
+    if len(serialized) <= budget:
+        result.setdefault("truncated", False)
+        return result
+
+    has_structured = result.get("structured_output") is not None
+    working = dict(result)
+    if has_structured:
+        # The raw response string is a duplicate of structured_output; keep only
+        # the ref. This is exactly the "answer duplicated a second time as the
+        # response JSON string" defect the envelope budget exists to close.
+        working.pop("response", None)
+
+    try:
+        redact = str(result.get("status")) not in ("ok", "completed")
+        stored = store_shared_context(
+            project, topic, serialized, source or "response_envelope",
+            "response_envelope", None, redact=redact,
+        )
+        working["response_ref"] = stored.get("ref")
+    except Exception as exc:  # noqa: BLE001
+        log(f"response envelope stash failed: {exc}")
+        working.setdefault("response_ref", result.get("response_ref"))
+    working["truncated"] = True
+
+    working = _condense_bulky_diagnostics(working)
+    # WP-SB8D item 2: header fields are now individually bounded (a bulky
+    # native_handoff/caveats object or an oversized string can no longer push
+    # the result past budget on its own).
+    header = _bounded_header_fields(working)
+    header_len = len(json.dumps(header, ensure_ascii=False, default=str))
+    remaining = max(200, budget - header_len - 80)
+
+    body = {k: v for k, v in working.items() if k not in header}
+    body_serialized = json.dumps(body, ensure_ascii=False, default=str)
+    if len(body_serialized) > remaining:
+        per_string_cap = 4000
+        trimmed_body = body
+        for _ in range(10):
+            trimmed_body = {k: _trim_long_strings(v, per_string_cap) for k, v in body.items()}
+            if len(json.dumps(trimmed_body, ensure_ascii=False, default=str)) <= remaining or per_string_cap <= 40:
+                break
+            per_string_cap = max(40, per_string_cap // 2)
+        body = trimmed_body
+
+    final = dict(header)
+    final.update(body)
+    # WP-SB8D item 2: this is the guarantee itself -- len(json.dumps(final))
+    # <= budget in every case, including a pathological result where every
+    # field (header included) is still huge after the steps above.
+    return _enforce_envelope_size_guarantee(final, budget)
 
 
 def _decision_string_list(
@@ -7159,7 +7481,14 @@ def _decision_string_list(
     return items
 
 
-def _normalized_decision_brief(value: Any) -> dict[str, Any]:
+def _normalized_decision_brief(
+    value: Any,
+    *,
+    brief_max_bytes: int = DECISION_BRIEF_MAX_BYTES,
+    brief_max_tokens: int = DECISION_BRIEF_MAX_TOKENS,
+    evidence_excerpt_max_bytes: int = DECISION_EVIDENCE_EXCERPT_MAX_BYTES,
+    prompt_budget: str = "standard",
+) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("brief must be an object")
     decision = str(value.get("decision") or "").strip()
@@ -7200,10 +7529,10 @@ def _normalized_decision_brief(value: Any) -> dict[str, Any]:
             raise ValueError("brief evidence ref/claim/excerpt exceeds its field limit")
         excerpt_bytes += len(excerpt.encode("utf-8"))
         evidence.append({"ref": ref, "claim": claim, "excerpt": excerpt})
-    if excerpt_bytes > DECISION_EVIDENCE_EXCERPT_MAX_BYTES:
+    if excerpt_bytes > evidence_excerpt_max_bytes:
         raise ValueError(
             f"brief evidence excerpts use {excerpt_bytes} UTF-8 bytes; "
-            f"maximum is {DECISION_EVIDENCE_EXCERPT_MAX_BYTES}"
+            f"maximum is {evidence_excerpt_max_bytes}" + _prompt_budget_opt_in_hint(prompt_budget)
         )
 
     brief = {
@@ -7218,11 +7547,11 @@ def _normalized_decision_brief(value: Any) -> dict[str, Any]:
     serialized = json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
     byte_count = len(serialized.encode("utf-8"))
     token_count = estimate_tokens(serialized)
-    if byte_count > DECISION_BRIEF_MAX_BYTES or token_count > DECISION_BRIEF_MAX_TOKENS:
+    if byte_count > brief_max_bytes or token_count > brief_max_tokens:
         raise ValueError(
             "decision brief exceeds the preflight budget: "
-            f"{byte_count}/{DECISION_BRIEF_MAX_BYTES} UTF-8 bytes, "
-            f"~{token_count}/{DECISION_BRIEF_MAX_TOKENS} tokens"
+            f"{byte_count}/{brief_max_bytes} UTF-8 bytes, "
+            f"~{token_count}/{brief_max_tokens} tokens" + _prompt_budget_opt_in_hint(prompt_budget)
         )
     return brief
 
@@ -7559,7 +7888,15 @@ _DECISION_ADVISER_INSTRUCTIONS = (
 )
 
 
-def _decision_prompt(package_id: str, complexity: str, brief: dict[str, Any]) -> str:
+def _decision_prompt(
+    package_id: str,
+    complexity: str,
+    brief: dict[str, Any],
+    *,
+    max_bytes: int = DECISION_PROVIDER_PROMPT_MAX_BYTES,
+    max_tokens: int = DECISION_PROVIDER_PROMPT_MAX_TOKENS,
+    prompt_budget: str = "standard",
+) -> str:
     prompt = (
         _DECISION_ADVISER_INSTRUCTIONS + " "
         f"Lineage: {package_id}; complexity: {complexity}.\n\n"
@@ -7568,11 +7905,11 @@ def _decision_prompt(package_id: str, complexity: str, brief: dict[str, Any]) ->
     )
     byte_count = len(prompt.encode("utf-8"))
     token_count = estimate_tokens(prompt)
-    if byte_count > DECISION_PROVIDER_PROMPT_MAX_BYTES or token_count > DECISION_PROVIDER_PROMPT_MAX_TOKENS:
+    if byte_count > max_bytes or token_count > max_tokens:
         raise ValueError(
             "assembled flagship request exceeds the provider budget: "
-            f"{byte_count}/{DECISION_PROVIDER_PROMPT_MAX_BYTES} UTF-8 bytes, "
-            f"~{token_count}/{DECISION_PROVIDER_PROMPT_MAX_TOKENS} tokens"
+            f"{byte_count}/{max_bytes} UTF-8 bytes, "
+            f"~{token_count}/{max_tokens} tokens" + _prompt_budget_opt_in_hint(prompt_budget)
         )
     return prompt
 
@@ -7663,17 +8000,17 @@ def _decision_session_key(args: dict[str, Any], host_family: str) -> str:
     )
 
 
-def _cap_decision_result(result: dict[str, Any]) -> None:
+def _cap_decision_result(result: dict[str, Any], *, max_bytes: int = DECISION_COMBINED_MAX_BYTES) -> None:
     def size() -> int:
         return len(json.dumps(result, ensure_ascii=False, default=str).encode("utf-8"))
 
-    if size() <= DECISION_COMBINED_MAX_BYTES:
+    if size() <= max_bytes:
         return
     for item in result.get("consultations") or []:
         advice = item.get("advice")
         if isinstance(advice, str) and len(advice) > 1000:
             item["advice"] = advice[:985].rstrip() + " ... [truncated]"
-    if size() > DECISION_COMBINED_MAX_BYTES:
+    if size() > max_bytes:
         for item in result.get("consultations") or []:
             error = item.get("error")
             if isinstance(error, str) and len(error) > 300:
@@ -7718,6 +8055,8 @@ def _record_decision_result(
                     ],
                     "native_request": result.get("native_request"),
                     "handoff_notices": result["handoff_notices"],
+                    "prompt_budget": result.get("prompt_budget"),
+                    "budget_reason": result.get("budget_reason"),
                 },
                 ensure_ascii=False,
             ),
@@ -7935,8 +8274,24 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
         complexity_escalated = complexity != "critical"
         complexity = "critical"
     effort = DECISION_COMPLEXITY_EFFORT[complexity]
-    brief = _normalized_decision_brief(args.get("brief"))
-    prompt = _decision_prompt(package_id, complexity, brief)
+    # WP-SB8B item 2: opt-in extended budget tier -- multiplies every byte/token
+    # preflight budget by PROMPT_BUDGET_EXTENDED_MULTIPLIER (count limits below
+    # are untouched: options/evidence_refs/questions stay at 4/8/3).
+    prompt_budget, budget_reason = _resolve_prompt_budget(args)
+    decision_limits = _prompt_budget_decision_limits(prompt_budget)
+    brief = _normalized_decision_brief(
+        args.get("brief"),
+        brief_max_bytes=decision_limits["brief_bytes"],
+        brief_max_tokens=decision_limits["brief_tokens"],
+        evidence_excerpt_max_bytes=decision_limits["evidence_excerpt_bytes"],
+        prompt_budget=prompt_budget,
+    )
+    prompt = _decision_prompt(
+        package_id, complexity, brief,
+        max_bytes=decision_limits["provider_prompt_bytes"],
+        max_tokens=decision_limits["provider_prompt_tokens"],
+        prompt_budget=prompt_budget,
+    )
     try:
         response_chars = int(args.get("max_response_chars") or 2400)
     except (TypeError, ValueError):
@@ -7961,7 +8316,7 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
             "work_package_id": package_id,
             "max_summary_chars": DECISION_ADVICE_MAX_CHARS,
             "adviser_instructions": _DECISION_ADVISER_INSTRUCTIONS,
-            "max_prompt_bytes": DECISION_PROVIDER_PROMPT_MAX_BYTES,
+            "max_prompt_bytes": decision_limits["provider_prompt_bytes"],
             "return_contract": {
                 "family": candidate["family"],
                 "model": candidate["model"],
@@ -7994,9 +8349,12 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
             "completion_notice": "Native same-vendor flagship consultation is required before dispatch continues.",
             "authoritative": False,
             "decision_owner": "host",
+            "prompt_budget": prompt_budget,
         }
+        if budget_reason:
+            result["budget_reason"] = budget_reason
         _record_decision_result(args, result, [item["status"] for item in consultations] or ["needs_native_consultation"])
-        _cap_decision_result(result)
+        _cap_decision_result(result, max_bytes=decision_limits["combined_bytes"])
         return result
 
     native_completed = False
@@ -8196,9 +8554,12 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
         ),
         "authoritative": False,
         "decision_owner": "host",
+        "prompt_budget": prompt_budget,
     }
+    if budget_reason:
+        result["budget_reason"] = budget_reason
     _record_decision_result(args, result, statuses)
-    _cap_decision_result(result)
+    _cap_decision_result(result, max_bytes=decision_limits["combined_bytes"])
     return result
 
 
@@ -9136,8 +9497,18 @@ def queue_codex_request(
         clean_prompt = model_guard_text(model_label, strict=bool(strict_flag)) + clean_prompt
     with db_connect() as conn:
         conn.row_factory = sqlite3.Row
+        # WP-SB8C: a resend (e.g. an outbound-screen-held request the owner approved
+        # and re-sent with outbound_reviewed=true) must never dedupe against a prior
+        # FAILED/errored/cancelled/expired request -- that swallowed the resend as
+        # "already terminal" and it never ran. Only pending/running/completed rows
+        # are eligible, and outbound_reviewed is part of the dedup key so a resend
+        # carrying a different reviewed flag than the stored row is treated as a
+        # distinct request rather than matched to the stale one.
+        failure_states_sql = ", ".join(
+            f"'{state}'" for state in TERMINAL_REQUEST_STATES if state != "completed"
+        )
         existing = conn.execute(
-            """
+            f"""
             SELECT id, project, root_path, topic, status, created_by, created_at, notified_at,
                    completed_at, target_model, strict_model, task_kind, token_budget, effort,
                    worker_pid, worker_started_at, worker_completed_at, mode, outbound_reviewed
@@ -9146,10 +9517,20 @@ def queue_codex_request(
               AND ((topic IS NULL AND ? IS NULL) OR topic = ?)
               AND prompt = ?
               AND COALESCE(mode, 'read-only') = ?
+              AND COALESCE(outbound_reviewed, 0) = ?
+              AND status NOT IN ({failure_states_sql})
             ORDER BY created_at DESC
             LIMIT 1
             """,
-            (project_info.name, project_info.root_path, topic, topic, clean_prompt, stored_mode),
+            (
+                project_info.name,
+                project_info.root_path,
+                topic,
+                topic,
+                clean_prompt,
+                stored_mode,
+                outbound_reviewed_flag,
+            ),
         ).fetchone()
         if existing:
             result = dict(existing)
@@ -10914,58 +11295,77 @@ def _frontier_effort_ladder(complexity: str | None, risk_flags: list[str]) -> tu
     return DECISION_COMPLEXITY_EFFORT[resolved_complexity], resolved_complexity
 
 
-def _enforce_frontier_prompt_cap(family: str, model: str, prompt: str, args: dict[str, Any]) -> None:
+def _enforce_frontier_prompt_cap(family: str, model: str, prompt: str, args: dict[str, Any]) -> tuple[str, str | None]:
     """A direct frontier request (route_agent_task target is a codex/claude
     flagship) must stay bounded, same as a consult_decision-assembled prompt.
     Exempt only consult_decision's own internal dispatch, which carries the
-    unforgeable _decision_internal_token and always supplies explicit effort."""
+    unforgeable _decision_internal_token and always supplies explicit effort.
+
+    WP-SB8B item 2: always validates the optional prompt_budget/budget_reason
+    pair (even for a non-frontier or exempt call, so a bad value is caught at
+    the same place regardless of target) and returns it so the caller can echo
+    it in the result. The byte/token cap itself only applies standard vs.
+    extended limits for an actual frontier target."""
+    prompt_budget, budget_reason = _resolve_prompt_budget(args)
     if args.get("_decision_internal_token") is _DECISION_INTERNAL_TOKEN:
-        return
+        return prompt_budget, budget_reason
     if not _is_frontier_target(family, model):
-        return
+        return prompt_budget, budget_reason
+    max_bytes, max_tokens = _prompt_budget_provider_limits(prompt_budget)
     byte_count = len(prompt.encode("utf-8"))
     token_count = estimate_tokens(prompt)
-    if byte_count > DECISION_PROVIDER_PROMPT_MAX_BYTES or token_count > DECISION_PROVIDER_PROMPT_MAX_TOKENS:
+    if byte_count > max_bytes or token_count > max_tokens:
         raise ValueError(
             "Direct frontier request exceeds the provider budget: "
-            f"{byte_count}/{DECISION_PROVIDER_PROMPT_MAX_BYTES} UTF-8 bytes, "
-            f"~{token_count}/{DECISION_PROVIDER_PROMPT_MAX_TOKENS} tokens. Send a bounded brief plus "
+            f"{byte_count}/{max_bytes} UTF-8 bytes, "
+            f"~{token_count}/{max_tokens} tokens. Send a bounded brief plus "
             "file paths instead (the target can read files itself), or use consult_decision for a "
-            "full flagship decision consultation."
+            "full flagship decision consultation." + _prompt_budget_opt_in_hint(prompt_budget)
         )
+    return prompt_budget, budget_reason
 
 
 def _route_task_flagship_fallback(
-    family: str, model: str, args: dict[str, Any]
-) -> tuple[str, str | None, str | None]:
+    family: str, model: str, args: dict[str, Any], retry_unavailable: bool = False
+) -> tuple[str, str | None, str | None, dict[str, Any] | None, tuple[str, str, str] | None]:
     """When `model` is a claude/codex frontier target actively latched for the
     current session (the same per-model latches WP-SB1's consult_decision reads
     and writes), resolve to the next non-latched model in the family's flagship
-    chain at the same effort. Returns (model, fallback_from, notice).
+    chain at the same effort. Returns
+    (model, fallback_from, notice, skip_result, retry_latch_key).
     fallback_from is None when no fallback applied. Since neither family's
     flagship chain carries a same-vendor fallback any more (each chain is
     exactly one entry -- Fable for claude, the live frontier role model for
     codex), a latched frontier target always falls straight through to the
-    "every later chain model is also latched" branch below: the request
-    proceeds on the original model unchanged, but `notice` is still set so the
-    caller does not silently retry a known-latched model and can report that a
-    direct route_agent_task call added a notice with no model swap, rather
-    than swapping cross-vendor (a cross-vendor swap here would also change
-    target_agent/CLI, which this preflight-only helper does not do). This is a
-    preflight skip only -- no retry-on-failure logic runs for an async
-    dispatch."""
+    "every later chain model is also latched" branch below.
+
+    WP-SB8D item 1: a latched target with no available fallback no longer
+    dispatches silently ("using it anyway"). Instead skip_result is a
+    structured skipped_unavailable/skipped_quota payload the caller must
+    return immediately -- unless retry_unavailable is True, in which case the
+    latch is bypassed for exactly this one call: retry_latch_key is returned
+    so the caller can clear the latch on a successful dispatch or refresh it
+    on a fresh availability failure. This is a preflight skip/bypass only --
+    no retry-on-failure loop runs here for an async dispatch."""
     if family not in {"claude", "codex"} or not _is_frontier_target(family, model):
-        return model, None, None
+        return model, None, None, None, None
     chain = _flagship_chain(family)
     if not any(normalize_lookup(model) == normalize_lookup(m) for m in chain):
-        return model, None, None
+        return model, None, None, None, None
     session_key = _decision_session_key(args, family)
     key = (session_key, family, normalize_lookup(model))
     active, _void_notice = _latch_active(key)
     if not active:
-        return model, None, None
+        return model, None, None, None, None
     latch = _FLAGSHIP_AVAILABILITY_LATCHES.get(key) or {}
     reason = latch.get("reason") or "provider unavailable for this session"
+    kind = latch.get("kind") or "plan"
+    if retry_unavailable:
+        notice = (
+            f"{family}:{model} is latched for this session ({reason}); "
+            "retry_unavailable=true forced one retry despite the latch."
+        )
+        return model, None, notice, None, key
     candidate = _chain_model_after(chain, model)
     while candidate is not None:
         candidate_key = (session_key, family, normalize_lookup(candidate))
@@ -10975,12 +11375,44 @@ def _route_task_flagship_fallback(
                 f"{family}:{model} is latched for this session ({reason}); "
                 f"falling back to {family}:{candidate}."
             )
-            return candidate, model, notice
+            return candidate, model, notice, None, None
         candidate = _chain_model_after(chain, candidate)
-    exhausted_notice = (
-        f"All fallback models are latched for this session ({reason}); using {family}:{model} anyway."
-    )
-    return model, None, exhausted_notice
+    status = "skipped_quota" if kind == "quota" else "skipped_unavailable"
+    skip_result: dict[str, Any] = {
+        "status": status,
+        "outcome": status,
+        "accepted": False,
+        "target_agent": family,
+        "target_model": model,
+        "latch_kind": kind,
+        "latch_reason": reason,
+        "guidance": (
+            "Every model in this family's flagship chain is latched unavailable for this "
+            "session. Use consult_decision for the cross-vendor fallback, or pass "
+            "retry_unavailable=true on route_agent_task after switching accounts or "
+            "topping up to force one retry."
+        ),
+    }
+    expires_at = latch.get("expires_at")
+    if kind == "quota" and expires_at is not None:
+        skip_result["expires_at"] = expires_at
+    return model, None, None, skip_result, None
+
+
+def _apply_retry_latch_outcome(retry_latch_key: tuple[str, str, str] | None, result: dict[str, Any]) -> None:
+    """WP-SB8D item 1: after a retry_unavailable dispatch that bypassed an
+    active latch, clear it on a genuine success (or pending/async handoff) and
+    refresh it on a fresh availability failure, using the same classifier
+    consult_decision's own retry path uses."""
+    if retry_latch_key is None or not isinstance(result, dict):
+        return
+    failure_status, should_latch, kind = _decision_failure_kind(result)
+    if not failure_status:
+        _FLAGSHIP_AVAILABILITY_LATCHES.pop(retry_latch_key, None)
+        return
+    if should_latch:
+        error = str(result.get("error") or result.get("response") or failure_status)
+        _set_flagship_latch(retry_latch_key, kind or "plan", failure_status, error)
 
 
 def route_agent_task(args: dict[str, Any]) -> dict[str, Any]:
@@ -10994,6 +11426,14 @@ def route_agent_task(args: dict[str, Any]) -> dict[str, Any]:
                 result["prompt_notice"] = notice
     except Exception as exc:  # noqa: BLE001
         log(f"route_agent_task prompt guard failed: {exc}")
+    if isinstance(result, dict) and result.get("status") not in (None, "needs_model_selection"):
+        # WP-SB8B item 1: applies uniformly to every route_agent_task result,
+        # including paths that never call consult() (queued codex/claude
+        # inbox/app handoffs). A result consult() already fit within budget is
+        # a fast no-op here (re-serializes under budget and returns as-is).
+        result = apply_response_envelope_budget(
+            result, args.get("max_response_chars"), args.get("project"), args.get("topic"), "route_agent_task"
+        )
     return result
 
 
@@ -11108,6 +11548,14 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         # must enforce the same native-first boundary as consult_* and queue_*.
         enforce_native_first_broker_fallback(args, family)
 
+    # WP-SB8B item 2: resolve+echo prompt_budget/budget_reason for every
+    # route_agent_task call, whether or not the target ends up being a direct
+    # frontier request (the byte/token cap below only applies to that case).
+    prompt_budget, budget_reason = _resolve_prompt_budget(args)
+    model_resolution["prompt_budget"] = prompt_budget
+    if budget_reason:
+        model_resolution["budget_reason"] = budget_reason
+
     # WP-SB2: bounded payload cap + progressive effort ladder + latched-fable
     # skip for a direct frontier (codex/claude flagship) route_agent_task call.
     if family in {"codex", "claude"} and _is_frontier_target(family, target_model):
@@ -11120,7 +11568,14 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
             model_resolution["effort"] = ladder_effort
             model_resolution["effort_source"] = "ladder"
             model_resolution["complexity"] = ladder_complexity
-        fallback_model, fallback_from, fallback_notice = _route_task_flagship_fallback(family, target_model, args)
+        retry_unavailable = truthy(args.get("retry_unavailable"))
+        fallback_model, fallback_from, fallback_notice, skip_result, retry_latch_key = _route_task_flagship_fallback(
+            family, target_model, args, retry_unavailable
+        )
+        if skip_result is not None:
+            skip_result["work_package_id"] = args.get("work_package_id")
+            skip_result["model_resolution"] = model_resolution
+            return skip_result
         if fallback_from:
             target_model = fallback_model
             model_resolution["target_model"] = target_model
@@ -11128,6 +11583,8 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         if fallback_notice:
             model_resolution.setdefault("notices", [])
             model_resolution["notices"].append(fallback_notice)
+    else:
+        retry_latch_key = None
     surface_note: str | None = None
     ide_host = resolve_ide_host(args, target_agent)
     cfg = load_config()
@@ -11397,6 +11854,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "timeout_seconds": args.get("timeout_seconds"),
             },
         )
+        _apply_retry_latch_outcome(retry_latch_key, result)
         result["route"] = "codex_cli"
         result["surface"] = surface
         if surface_note:
@@ -11422,6 +11880,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "force_sync": args.get("force_sync") or args.get("sync") or args.get("direct") or args.get("use_cli"),
             },
         )
+        _apply_retry_latch_outcome(retry_latch_key, result)
         result["route"] = "claude_inbox" if result.get("async") else "claude_code"
         result["surface"] = "extension" if result.get("async") else surface
         if surface_note:
@@ -11581,6 +12040,20 @@ TOOLS = [
                 },
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 3000},
                 "outbound_reviewed": {"type": "boolean"},
+                "prompt_budget": {
+                    "type": "string",
+                    "enum": ["standard", "extended"],
+                    "description": (
+                        "Cheap default 'standard' (14,000 provider-prompt bytes) or opt-in "
+                        "'extended' (3x every byte/token preflight budget: brief, evidence "
+                        "excerpts, provider prompt, combined result). Extended requires budget_reason."
+                    ),
+                },
+                "budget_reason": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "description": "Required and nonempty when prompt_budget='extended'; ignored otherwise.",
+                },
                 "retry_unavailable": {
                     "type": "boolean",
                     "description": (
@@ -11614,6 +12087,8 @@ TOOLS = [
                 "target_model": {"type": "string", "description": "Model only — keep reasoning effort out of this string; use the 'effort' field. e.g. 'gpt-5.5', 'gpt-5.4-mini'."},
                 "effort": {"type": "string", "description": "Single-agent reasoning effort: minimal|low|medium|high|xhigh|max. Omit for max (default); Ultra is an orchestration/delegation mode rather than a deeper single-agent consult tier."},
                 "outbound_reviewed": {"type": "boolean", "description": "Explicit operator opt-in that lets a payload the outbound screen classified needs_owner_review proceed. Never overrides a block verdict."},
+                "prompt_budget": {"type": "string", "enum": ["standard", "extended"], "description": "Cheap default 'standard' (14,000 provider-prompt bytes) or opt-in 'extended' (42,000 bytes); extended requires budget_reason."},
+                "budget_reason": {"type": "string", "maxLength": 200, "description": "Required and nonempty when prompt_budget='extended'; ignored otherwise."},
             },
             "required": ["prompt"],
         },
@@ -11640,6 +12115,8 @@ TOOLS = [
                 "async": {"type": "boolean", "description": "Queue through the Claude inbox and return a request id immediately instead of waiting synchronously."},
                 "force_sync": {"type": "boolean", "description": "Force the direct Claude CLI path even for work that would normally queue to avoid the MCP timeout."},
                 "new_chat": {"type": "boolean", "description": "For async inbox delivery, request a fresh Claude session instead of reusing the project/topic session."},
+                "prompt_budget": {"type": "string", "enum": ["standard", "extended"], "description": "Cheap default 'standard' (14,000 provider-prompt bytes) or opt-in 'extended' (42,000 bytes); extended requires budget_reason."},
+                "budget_reason": {"type": "string", "maxLength": 200, "description": "Required and nonempty when prompt_budget='extended'; ignored otherwise."},
             },
             "required": ["prompt"],
         },
@@ -11843,8 +12320,14 @@ TOOLS = [
                 "model_policy": {"type": "string", "description": "Explicit cost policy for Codex or Claude. 'cheap_read' selects the live Codex reader (Luna)/low or Haiku (no effort); 'balanced'/'efficient'/'lower_effort' selects the live Codex workhorse (Sol)/medium or Sonnet/medium. Omit for a frontier target: it follows the complexity ladder (bounded/architecture/critical -> high/xhigh/max, default xhigh; a risk flag raises it to max)."},
                 "complexity": {"type": "string", "enum": ["bounded", "architecture", "critical"], "description": "For a direct codex/claude frontier target with no explicit effort/model_policy: sets the progressive effort ladder (high/xhigh/max). Omit for the xhigh default."},
                 "risk_flags": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 80}, "description": "For a direct frontier target: any flag matching a critical-risk keyword (e.g. security, payment, migration, irreversible) raises the effort ladder to max."},
+                "retry_unavailable": {
+                    "type": "boolean",
+                    "description": "For a direct codex/claude frontier target actively latched unavailable/quota-limited for this session: force one retry despite the latch instead of receiving a skipped_unavailable/skipped_quota result. Use after switching accounts or topping up. Success clears the latch; a fresh availability failure refreshes it.",
+                },
                 "native_unavailable_reason": {"type": "string", "description": "Required for same-vendor Codex/Claude MCP fallback after native subagent startup/access failure."},
                 "outbound_reviewed": {"type": "boolean", "description": "For a Codex target, explicit operator opt-in that lets a payload the outbound screen classified needs_owner_review proceed. Never overrides a block verdict."},
+                "prompt_budget": {"type": "string", "enum": ["standard", "extended"], "description": "For a direct codex/claude frontier target: cheap default 'standard' (14,000 provider-prompt bytes) or opt-in 'extended' (42,000 bytes); extended requires budget_reason."},
+                "budget_reason": {"type": "string", "maxLength": 200, "description": "Required and nonempty when prompt_budget='extended'; ignored otherwise."},
                 "prompt": {"type": "string"},
             },
             "required": ["prompt"],
@@ -12135,6 +12618,9 @@ TOOLS = [
                 "mode": {"type": "string"},
                 "outbound_reviewed": {"type": "boolean", "description": "Explicit operator opt-in that lets a payload the outbound screen classified needs_owner_review proceed once the async worker actually dispatches it. Never overrides a block verdict."},
                 "native_unavailable_reason": {"type": "string", "minLength": 12},
+                "prompt_budget": {"type": "string", "enum": ["standard", "extended"], "description": "Cheap default 'standard' (14,000 provider-prompt bytes) or opt-in 'extended' (42,000 bytes); extended requires budget_reason."},
+                "budget_reason": {"type": "string", "maxLength": 200, "description": "Required and nonempty when prompt_budget='extended'; ignored otherwise."},
+                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
             },
             "required": ["prompt"],
         },
@@ -12172,6 +12658,9 @@ TOOLS = [
                     "enum": ["plan", "default", "acceptEdits", "bypassPermissions"],
                 },
                 "native_unavailable_reason": {"type": "string", "minLength": 12},
+                "prompt_budget": {"type": "string", "enum": ["standard", "extended"], "description": "Cheap default 'standard' (14,000 provider-prompt bytes) or opt-in 'extended' (42,000 bytes); extended requires budget_reason."},
+                "budget_reason": {"type": "string", "maxLength": 200, "description": "Required and nonempty when prompt_budget='extended'; ignored otherwise."},
+                "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
             },
             "required": ["prompt"],
         },
@@ -13951,11 +14440,11 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         # WP-SB2b: this MCP tool queues the caller-supplied prompt directly,
         # bypassing consult()'s own cap -- resolve the (possibly generic/alias)
         # target_model the same way consult() would, then apply the same cap.
-        _enforce_frontier_prompt_cap(
+        _codex_prompt_budget, _codex_budget_reason = _enforce_frontier_prompt_cap(
             "codex", pick_cli_model("codex", args.get("target_model")),
             str(args.get("prompt") or ""), args,
         )
-        return text_content(queue_codex_request(
+        _codex_queue_result = queue_codex_request(
             args.get("project"),
             str(args.get("prompt") or ""),
             args.get("topic"),
@@ -13967,17 +14456,25 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             args.get("autorun"),
             args.get("mode"),
             outbound_reviewed=args.get("outbound_reviewed"),
-        ))
+        )
+        if isinstance(_codex_queue_result, dict):
+            _codex_queue_result["prompt_budget"] = _codex_prompt_budget
+            if _codex_budget_reason:
+                _codex_queue_result["budget_reason"] = _codex_budget_reason
+            _codex_queue_result = apply_response_envelope_budget(
+                _codex_queue_result, args.get("max_response_chars"), args.get("project"), args.get("topic"), "queue_codex_request"
+            )
+        return text_content(_codex_queue_result)
     if name == "get_codex_requests":
         return text_content(get_codex_requests(args.get("project"), int(args.get("limit") or 20)))
     if name == "queue_claude_request":
         enforce_native_first_broker_fallback(args, "claude")
         # WP-SB2b: same bypass concern as queue_codex_request above.
-        _enforce_frontier_prompt_cap(
+        _claude_prompt_budget, _claude_budget_reason = _enforce_frontier_prompt_cap(
             "claude", pick_cli_model("claude", args.get("target_model")),
             str(args.get("prompt") or ""), args,
         )
-        return text_content(queue_claude_request(
+        _claude_queue_result = queue_claude_request(
             args.get("project"),
             str(args.get("prompt") or ""),
             args.get("topic"),
@@ -13990,7 +14487,15 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             args.get("cli_model"),
             args.get("autorun"),
             args.get("mode"),
-        ))
+        )
+        if isinstance(_claude_queue_result, dict):
+            _claude_queue_result["prompt_budget"] = _claude_prompt_budget
+            if _claude_budget_reason:
+                _claude_queue_result["budget_reason"] = _claude_budget_reason
+            _claude_queue_result = apply_response_envelope_budget(
+                _claude_queue_result, args.get("max_response_chars"), args.get("project"), args.get("topic"), "queue_claude_request"
+            )
+        return text_content(_claude_queue_result)
     if name == "get_claude_requests":
         return text_content(get_claude_requests(args.get("project"), int(args.get("limit") or 20)))
     if name == "respond_to_request":
