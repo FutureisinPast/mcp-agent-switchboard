@@ -190,7 +190,9 @@ class ConsultCodexWiringTests(unittest.TestCase):
         result, run, _ = self._consult_codex(payload)
         run.assert_called_once()
         sent_prompt = run.call_args.args[2]
-        self.assertEqual(sent_prompt, broker.sanitize_prompt(payload))
+        # WP-SB6: the dispatched text now leads with the Switchboard child marker,
+        # ahead of sanitize_prompt's own boilerplate wrapper.
+        self.assertEqual(sent_prompt, broker._with_child_marker(broker.sanitize_prompt(payload)))
         self.assertEqual(result.response, "ok")
 
     def test_reworded_payload_dispatches_with_substitution_and_wrapper(self):

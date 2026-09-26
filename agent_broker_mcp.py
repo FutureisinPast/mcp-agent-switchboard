@@ -160,6 +160,13 @@ CODEX_FLAGSHIP_MODEL = "gpt-6-astra"
 CODEX_PREVIOUS_FRONTIER_MODEL = "gpt-5.6-sol"
 CODEX_BALANCED_MODEL = "gpt-5.6-terra"
 CODEX_CHEAP_MODEL = "gpt-5.6-luna"
+# Used ONLY when live role selection cannot resolve a workhorse/reader at all
+# (discovery failed or returned nothing usable). The live Codex generation is
+# gpt-6-*: falling back to the previous-generation gpt-5.6-terra/luna names
+# here silently downgraded every brain that hit this path. gpt-5.6-* stays
+# selectable by explicit request (aliases below, STATIC_CODEX_MODELS).
+CODEX_WORKHORSE_FALLBACK_MODEL = "gpt-6-sol"
+CODEX_READER_FALLBACK_MODEL = "gpt-6-luna"
 CLAUDE_FLAGSHIP_MODEL = "fable"
 CLAUDE_BALANCED_MODEL = "sonnet"
 CLAUDE_CHEAP_MODEL = "haiku"
@@ -206,11 +213,18 @@ DECISION_CRITICAL_RISK_FLAGS = {
 DECISION_BRIEF_MAX_BYTES = 12_000
 DECISION_BRIEF_MAX_TOKENS = 3_000
 DECISION_EVIDENCE_EXCERPT_MAX_BYTES = 4_000
-DECISION_PROVIDER_PROMPT_MAX_BYTES = 14_000
+# Single source of truth with routing_gate.FLAGSHIP_PROMPT_MAX_BYTES (import
+# order allows it: routing_gate is imported above, before this module-level
+# assignment runs). A pinning test keeps the two names equal either way.
+DECISION_PROVIDER_PROMPT_MAX_BYTES = routing_gate.FLAGSHIP_PROMPT_MAX_BYTES
 DECISION_PROVIDER_PROMPT_MAX_TOKENS = 3_500
 DECISION_ADVICE_MAX_CHARS = 3_000
 DECISION_COMBINED_MAX_BYTES = 8_000
-_FLAGSHIP_AVAILABILITY_LATCHES: dict[tuple[str, str], dict[str, str]] = {}
+DECISION_QUOTA_LATCH_DEFAULT_MINUTES = 30
+# Keyed (session_key, family, normalized_model). Each value carries
+# kind ("plan"|"quota"), status, reason, created_at, expires_at (quota only),
+# and account_hash (see _account_identity_hash).
+_FLAGSHIP_AVAILABILITY_LATCHES: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 MODEL_ALIASES = {
     "gemini 3.6 flash": "Gemini 3.6 Flash (High)",
@@ -249,6 +263,14 @@ MODEL_ALIASES = {
     "gpt-5.6-luna": CODEX_CHEAP_MODEL,
     "gpt 5.6 lunar": CODEX_CHEAP_MODEL,
     "gpt-5.6-lunar": CODEX_CHEAP_MODEL,
+    "gpt 6 sol": CODEX_WORKHORSE_FALLBACK_MODEL,
+    "gpt-6-sol": CODEX_WORKHORSE_FALLBACK_MODEL,
+    "gpt 6 solar": CODEX_WORKHORSE_FALLBACK_MODEL,
+    "gpt-6-solar": CODEX_WORKHORSE_FALLBACK_MODEL,
+    "gpt 6 luna": CODEX_READER_FALLBACK_MODEL,
+    "gpt-6-luna": CODEX_READER_FALLBACK_MODEL,
+    "gpt 6 lunar": CODEX_READER_FALLBACK_MODEL,
+    "gpt-6-lunar": CODEX_READER_FALLBACK_MODEL,
 }
 
 GENERIC_MODEL_REQUESTS = {
@@ -443,6 +465,16 @@ STATIC_CODEX_MODELS = [
             "gpt-5.6-luna", "gpt 5.6 luna", "luna", "lunar",
             "5.6 luna", "5.6 lunar", "cheap codex", "fast codex",
         ],
+    },
+    {
+        "id": CODEX_WORKHORSE_FALLBACK_MODEL,
+        "display": "GPT-6 Sol (live workhorse)",
+        "aliases": ["gpt-6-sol", "gpt 6 sol", "6 sol", "gpt-6-solar", "gpt 6 solar"],
+    },
+    {
+        "id": CODEX_READER_FALLBACK_MODEL,
+        "display": "GPT-6 Luna (live fast/cheap reader)",
+        "aliases": ["gpt-6-luna", "gpt 6 luna", "6 luna", "gpt-6-lunar", "gpt 6 lunar"],
     },
     {
         "id": "gpt-5.5",
@@ -2453,8 +2485,8 @@ def codex_roles_from_models(models: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "frontier": role(selected.frontier, CODEX_FLAGSHIP_MODEL),
-        "workhorse": role(selected.workhorse, CODEX_BALANCED_MODEL),
-        "reader": role(selected.reader, CODEX_CHEAP_MODEL),
+        "workhorse": role(selected.workhorse, CODEX_WORKHORSE_FALLBACK_MODEL),
+        "reader": role(selected.reader, CODEX_READER_FALLBACK_MODEL),
         "source": "codex-debug" if selected.frontier else "static-fallback",
     }
 
@@ -2473,8 +2505,8 @@ def current_codex_role_model(role: str) -> str:
     selected = current_codex_roles().get(role) or {}
     fallback = {
         "frontier": CODEX_FLAGSHIP_MODEL,
-        "workhorse": CODEX_BALANCED_MODEL,
-        "reader": CODEX_CHEAP_MODEL,
+        "workhorse": CODEX_WORKHORSE_FALLBACK_MODEL,
+        "reader": CODEX_READER_FALLBACK_MODEL,
     }
     return str(selected.get("id") or fallback[role])
 
@@ -3023,8 +3055,8 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
     codex_catalog = catalog.get("catalogs", {}).get("codex", {})
     codex_roles = codex_catalog.get("roles") or current_codex_roles()
     codex_frontier = str((codex_roles.get("frontier") or {}).get("id") or CODEX_FLAGSHIP_MODEL)
-    codex_workhorse = str((codex_roles.get("workhorse") or {}).get("id") or CODEX_BALANCED_MODEL)
-    codex_reader = str((codex_roles.get("reader") or {}).get("id") or CODEX_CHEAP_MODEL)
+    codex_workhorse = str((codex_roles.get("workhorse") or {}).get("id") or CODEX_WORKHORSE_FALLBACK_MODEL)
+    codex_reader = str((codex_roles.get("reader") or {}).get("id") or CODEX_READER_FALLBACK_MODEL)
     antigravity_catalog = catalog.get("catalogs", {}).get("antigravity", {})
     antigravity_roles = antigravity_catalog.get("roles") or antigravity_roles_from_models(
         discover_antigravity_models()
@@ -3080,8 +3112,8 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
             "consult_audit_review_debate": {
                 "target_agent": "codex",
                 "target_model": codex_frontier,
-                "effort": CODEX_DEFAULT_EFFORT,
-                "rule": "Bare 'consult Codex', 'co-op with Codex', 'audit', 'review', 'debate', or 'talk to Codex' should use the flagship/highest route. Accidental lower efforts are upgraded to max unless the caller makes the downshift explicit.",
+                "effort": "xhigh",
+                "rule": "Bare 'consult Codex', 'co-op with Codex', 'audit', 'review', 'debate', or 'talk to Codex' uses the flagship route at the progressive effort ladder: pass complexity (bounded/architecture/critical) for high/xhigh/max, or omit it for the xhigh default. A risk_flags match (security, payment, migration, irreversible, etc.) raises it to max regardless of complexity.",
             },
             "cheap_read_sample_prep": {
                 "target_agent": "codex",
@@ -3098,8 +3130,8 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
             "claude_consult_audit_review_debate": {
                 "target_agent": "claude",
                 "target_model": CLAUDE_FLAGSHIP_MODEL,
-                "effort": "max",
-                "rule": "Bare serious Claude consultation uses the moving `fable` alias at max, falls back to `opus` only on explicit model unavailability, and reports the runtime-attested actual model.",
+                "effort": "xhigh",
+                "rule": "Bare serious Claude consultation uses the moving `fable` alias at the progressive effort ladder (complexity bounded/architecture/critical -> high/xhigh/max, xhigh default; a risk_flags match raises it to max), falls back to `opus` when `fable` is latched unavailable for this session or on explicit model unavailability, and reports the runtime-attested actual model.",
             },
             "claude_cheap_read_sample_prep": {
                 "target_agent": "claude",
@@ -3169,7 +3201,7 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                     "task_kind": "co_audit",
                     "prompt": "Audit this change and report concrete issues.",
                 },
-                "broker_resolves_to": {"target_model": codex_frontier, "effort": CODEX_DEFAULT_EFFORT},
+                "broker_resolves_to": {"target_model": codex_frontier, "effort": "xhigh", "effort_source": "ladder"},
             },
             "cheap_reader": {
                 "tool": "route_agent_task",
@@ -3663,7 +3695,10 @@ def apply_codex_model_policy(
     # or by naming a cheaper model/effort directly. We do NOT guess "this is a cheap read" from
     # prompt keywords — that silently mis-routed real consults (e.g. a destructive-deletion
     # review) to Luna/low and produced hedged, untrustworthy answers. A consult defaults to the
-    # flagship at max; the caller keeps full control by passing model_policy/target_model/effort.
+    # flagship at the progressive effort ladder (complexity bounded/architecture/critical ->
+    # high/xhigh/max, xhigh when unrated; a risk_flags match forces max) -- see
+    # _frontier_effort_ladder in route_agent_task. The caller keeps full control by passing
+    # model_policy/target_model/effort, which always wins over the ladder.
     policy = normalize_lookup(str(args.get("model_policy") or args.get("semantic_lane") or args.get("native_lane") or ""))
     if policy in {"cheap read", "cheap_read", "cheap reader", "cheap", "reader", "native reader", "explorer"} and not str(raw_model or "").strip():
         return current_codex_role_model("reader"), raw_effort or CODEX_CHEAP_EFFORT, "cheap_read"
@@ -3678,8 +3713,10 @@ def apply_claude_model_policy(
     raw_effort: Any,
 ) -> tuple[Any, Any, str | None]:
     """Apply only an explicit Claude cost policy. Serious consultations stay on
-    the moving ``fable`` frontier alias at max; prompt keywords never guess a
-    cheaper tier."""
+    the moving ``fable`` frontier alias at the progressive effort ladder
+    (complexity bounded/architecture/critical -> high/xhigh/max, xhigh when
+    unrated; a risk_flags match forces max) -- see _frontier_effort_ladder in
+    route_agent_task; prompt keywords never guess a cheaper tier."""
     policy = normalize_lookup(str(args.get("model_policy") or args.get("semantic_lane") or args.get("native_lane") or ""))
     if policy in {"cheap read", "cheap_read", "cheap reader", "cheap", "reader", "native reader", "explore"} and not str(raw_model or "").strip():
         # Haiku does not support Claude's adaptive effort parameter. Drop an inherited
@@ -5131,11 +5168,16 @@ class ClaudeConsultResult:
 
 
 def consult_timeout_message(agent: str, timeout: int, partial: str | None = None) -> str:
+    """Never hardcode a specific caller's name here: this message fires for any MCP
+    client (Codex, Claude, or another host) that hits the synchronous call limit."""
     lines = [
-        f"{agent} timed out after {timeout} seconds before Codex's MCP tool-call limit.",
+        f"{agent} timed out after {timeout} seconds (synchronous MCP call limit).",
         "The request reached the CLI, but it did not finish quickly enough for a synchronous MCP response.",
         "Use a smaller/batched prompt for direct consults, or route the work asynchronously through the extension/inbox path.",
     ]
+    caller = str(os.environ.get("AGENT_BROKER_CALLER") or _MCP_CLIENT_NAME or "").strip()
+    if caller:
+        lines.insert(1, f"Caller: {caller}.")
     if partial and partial.strip():
         lines.extend(["", "Partial response before timeout:", "", partial.strip()])
     return "\n".join(lines)
@@ -5270,6 +5312,32 @@ class CodexConsultResult:
     model_attested: bool
 
 
+# WP-SB6: prefixed onto every prompt sent to a codex or claude CLI CHILD -- the
+# consult() dispatch, a queued request a worker executes, and consult_decision's
+# cross-vendor legs all fall through to consult_codex/consult_claude exactly once at
+# the point the CLI command is assembled, so prefixing here covers every path without
+# touching Flash/antigravity (which has its own worker contract). Placed downstream of
+# every prompt-size cap (WP-SB2's DECISION_PROVIDER_PROMPT_MAX_BYTES / FLAGSHIP_PROMPT_MAX_BYTES,
+# and _decision_prompt's own budget check) so those caps still measure the caller's prompt,
+# not this marker.
+CHILD_PROMPT_MARKER = (
+    "[Switchboard child · depth 1] You are answering one delegated request. "
+    "Do not spawn or dispatch agents, do not start consultations, and do not call "
+    "Agent Switchboard tools."
+)
+
+
+def _with_child_marker(prompt: str) -> str:
+    """Idempotent: never double-prefix a prompt that already carries the marker
+    anywhere in it (not just at position 0 -- consult_codex wraps the marked text in
+    sanitize_prompt's own boilerplate afterwards, which would otherwise defeat a plain
+    startswith check on a prompt that was already marked upstream)."""
+    text = str(prompt or "")
+    if CHILD_PROMPT_MARKER in text:
+        return text
+    return f"{CHILD_PROMPT_MARKER}\n\n{text}"
+
+
 def consult_codex(
     project: str | None,
     prompt: str,
@@ -5303,6 +5371,18 @@ def consult_codex(
         "--sandbox",
         sandbox,
         "--skip-git-repo-check",
+        # WP-SB6: verified against `codex exec --help` and one real dry run
+        # (gpt-6-luna/low, exit 0, no config-key error). --ignore-user-config skips
+        # ~/.codex/config.toml entirely -- auth still resolves through CODEX_HOME --
+        # which is where the owner's [mcp_servers.agent_switchboard] entry lives, so a
+        # consult child never sees the Switchboard MCP server. --disable multi_agent
+        # (equivalent to -c features.multi_agent=false) turns off the live
+        # `multi_agent` feature flag (confirmed present and stable via
+        # `codex features list`) that lets Codex spawn its own sub-agents. Never
+        # written to config.toml -- both are per-invocation only.
+        "--ignore-user-config",
+        "--disable",
+        "multi_agent",
         "--json",
         "-",
     ]
@@ -5372,7 +5452,15 @@ def consult_codex(
         substitutions=screen["substitutions"], original_payload=prompt,
         action=dispatch_action, final_payload=outbound_prompt,
     )
-    code, stdout, stderr = run_process(command, project_info.root_path, sanitize_prompt(outbound_prompt), timeout=timeout)
+    # WP-SB6: the marker goes on AFTER outbound screening (which screens the caller's
+    # actual content, not broker-added boilerplate) and after every prompt-size cap has
+    # already run against the caller's prompt -- this is the last step before the CLI
+    # child actually receives it. Applied OUTSIDE sanitize_prompt so the marker is
+    # literally the first line of the dispatched text, ahead of sanitize_prompt's own
+    # boilerplate wrapper.
+    code, stdout, stderr = run_process(
+        command, project_info.root_path, _with_child_marker(sanitize_prompt(outbound_prompt)), timeout=timeout
+    )
     parsed = parse_codex_stream_output(stdout)
     actual_model: str | None = None
     actual_effort: str | None = None
@@ -5454,6 +5542,13 @@ def consult_claude(
         "--strict-mcp-config",
         "--mcp-config",
         str(claude_empty_mcp_config_path()),
+        # WP-SB6: a consult child must never spawn its own subagent. --disallowedTools
+        # (confirmed against `claude --help`: "Comma or space-separated list of tool
+        # names to deny") blocks Agent/Task at the CLI layer, on top of --strict-mcp-config
+        # already emptying the Switchboard MCP server out of the child's config (see
+        # claude_empty_mcp_config_path below).
+        "--disallowedTools",
+        "Agent,Task",
         "--no-chrome",
         "--no-session-persistence",
         "--output-format",
@@ -5483,8 +5578,11 @@ def consult_claude(
         if candidate:
             command.extend(["--model", candidate])
             attempts.append(candidate)
+        # WP-SB6: marker goes on last, after every prompt-size cap has already run
+        # against the caller's prompt, and OUTSIDE sanitize_prompt's own boilerplate
+        # wrapper so the marker is literally the first line of the dispatched text.
         code, stdout, stderr = run_process(
-            command, run_cwd, sanitize_prompt(prompt), timeout=timeout
+            command, run_cwd, _with_child_marker(sanitize_prompt(prompt)), timeout=timeout
         )
         parsed = parse_claude_stream_output(stdout)
         if code == 124:
@@ -5536,6 +5634,171 @@ def consult_claude(
     raise AssertionError("Claude frontier candidate list must not be empty")
 
 
+def _antigravity_cli_home() -> Path:
+    """Root of the local agy CLI's own state (brain sessions, transcripts).
+
+    Env override exists so tests never touch a real user's home directory.
+    """
+    override = os.environ.get("AGENT_BROKER_AGY_HOME")
+    if override:
+        return Path(override)
+    return Path.home() / ".gemini" / "antigravity-cli"
+
+
+# Bounds on how much of a timed-out run's transcript this reads: the first
+# line (which must carry the package id marker) is capped separately from
+# the full per-line scan used to count steps and recover the last action.
+FLASH_TIMEOUT_FIRST_LINE_CAP_BYTES = 64 * 1024
+FLASH_TIMEOUT_TRANSCRIPT_LINE_CAP = 5000
+FLASH_TIMEOUT_TRANSCRIPT_BYTE_CAP = 1_000_000
+FLASH_TIMEOUT_LAST_ACTION_CHARS = 200
+# failure_kind values that mean "the subprocess actually launched and only
+# worker_execution timed out" -- as opposed to a genuine model-resolution
+# failure such as the CLI not being found at all.
+FLASH_TIMEOUT_FAILURE_KINDS = {"timeout_during_execution", "startup_stall", "timeout"}
+
+
+def _find_flash_timeout_transcript(package_id: str, launched_at: float) -> Path | None:
+    """Locate the agy brain session transcript for a run that just timed out.
+
+    Candidate session folders are those modified at or after launch time minus
+    a small grace window; the match is confirmed by the transcript's first
+    line naming this exact work package. Returns None when nothing matches --
+    that is a normal outcome (the worker may never have started at all), not
+    an error.
+    """
+    brain = _antigravity_cli_home() / "brain"
+    if not brain.exists():
+        return None
+    marker = f"Package ID: {package_id}"
+    cutoff = launched_at - 5.0
+    candidates = sorted(
+        (p for p in brain.iterdir() if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for session_dir in candidates:
+        try:
+            if session_dir.stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            continue
+        transcript = session_dir / ".system_generated" / "logs" / "transcript.jsonl"
+        if not transcript.exists():
+            continue
+        with transcript.open("r", encoding="utf-8", errors="replace") as f:
+            first_line = f.readline(FLASH_TIMEOUT_FIRST_LINE_CAP_BYTES)
+        if marker in first_line:
+            return transcript
+    return None
+
+
+def _read_flash_timeout_transcript_steps(transcript: Path) -> tuple[int, str]:
+    """Count non-blank transcript lines AFTER the first (bounded), and recover
+    the last parseable line's toolAction/toolSummary, capped to 200 chars.
+
+    The first line is the run header carrying the 'Package ID: <id>' marker
+    already matched in _find_flash_timeout_transcript -- it is not a model
+    step, so a transcript that never got past its own header line correctly
+    counts as zero steps (startup_stall), not one.
+    """
+    steps = 0
+    last_parsed: dict[str, Any] | None = None
+    bytes_read = 0
+    with transcript.open("r", encoding="utf-8", errors="replace") as f:
+        first_line = True
+        for raw in f:
+            bytes_read += len(raw.encode("utf-8", errors="replace"))
+            if first_line:
+                first_line = False
+                continue
+            text = raw.strip()
+            if text:
+                steps += 1
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    data = None
+                if isinstance(data, dict):
+                    last_parsed = data
+            if bytes_read >= FLASH_TIMEOUT_TRANSCRIPT_BYTE_CAP or steps >= FLASH_TIMEOUT_TRANSCRIPT_LINE_CAP:
+                break
+    last_action = ""
+    if last_parsed:
+        action = last_parsed.get("toolAction") or last_parsed.get("toolSummary")
+        if action:
+            last_action = str(action)[:FLASH_TIMEOUT_LAST_ACTION_CHARS]
+    return steps, last_action
+
+
+def _classify_flash_timeout(package_id: str, launched_at: float) -> dict[str, Any]:
+    """Classify an agy exit-124 timeout from its transcript, per the outcome table:
+
+    >=1 model step observed  -> failed_pre_mutation / timeout_during_execution
+    missing, or 0 steps      -> unavailable_pre_mutation / startup_stall
+    transcript lookup error  -> failed_pre_mutation / timeout
+
+    Never raises: every path here is best-effort diagnosis of a timeout that
+    already happened, not a condition to fail loudly on.
+    """
+    try:
+        transcript = _find_flash_timeout_transcript(package_id, launched_at)
+    except Exception:
+        return {"failure_kind": "timeout", "outcome": "failed_pre_mutation"}
+    if transcript is None:
+        return {"failure_kind": "startup_stall", "outcome": "unavailable_pre_mutation"}
+    try:
+        steps, last_action = _read_flash_timeout_transcript_steps(transcript)
+    except Exception:
+        return {"failure_kind": "timeout", "outcome": "failed_pre_mutation"}
+    if steps >= 1:
+        return {
+            "failure_kind": "timeout_during_execution",
+            "outcome": "failed_pre_mutation",
+            "timeout_evidence": {
+                "transcript": str(transcript),
+                "steps": steps,
+                "last_action": last_action,
+            },
+        }
+    return {"failure_kind": "startup_stall", "outcome": "unavailable_pre_mutation"}
+
+
+# Matches agy's transcript line recording an in-session model switch, e.g.
+# 'changed setting `Model Selection` from Gemini 3.5 Flash (High) to Gemini 3.8 Flash (High).'
+_ANTIGRAVITY_MODEL_SELECTION_RE = re.compile(
+    # display is matched greedily up to the LAST period on the line (not the
+    # non-greedy first one): a version like "3.6" embeds its own period, so a
+    # lazy match truncated the display name at "Gemini 3" every time.
+    r"changed setting `Model Selection` from .*? to (?P<display>.+?)\.(?:\s|$)", re.IGNORECASE
+)
+
+
+def _attest_flash_model_from_transcript(conversation_id: str) -> str | None:
+    """When agy's own JSON omits the model, recover it from its transcript's
+    'changed setting `Model Selection` ... to <Display>.' line and map that
+    display name to a catalog model id. Best-effort; never raises."""
+    try:
+        transcript = _antigravity_cli_home() / "brain" / str(conversation_id) / ".system_generated" / "logs" / "transcript.jsonl"
+        if not transcript.exists():
+            return None
+        with transcript.open("r", encoding="utf-8", errors="replace") as f:
+            text = f.read(FLASH_TIMEOUT_FIRST_LINE_CAP_BYTES)
+        match = _ANTIGRAVITY_MODEL_SELECTION_RE.search(text)
+        if not match:
+            return None
+        display = match.group("display").strip()
+        if not display:
+            return None
+        target = normalize_lookup(display)
+        for item in discover_antigravity_models():
+            if normalize_lookup(item.get("display")) == target:
+                return str(item.get("id") or "") or None
+        return None
+    except Exception:
+        return None
+
+
 def consult_antigravity_cli(
     project: str | None,
     prompt: str,
@@ -5544,6 +5807,7 @@ def consult_antigravity_cli(
     effort: str | None = None,
     timeout: int = SYNC_CONSULT_TIMEOUT_SECONDS,
     work_package: dict[str, Any] | None = None,
+    timeout_meta_out: dict[str, Any] | None = None,
 ) -> str:
     config = load_config()
     agy = discover_antigravity_cli(config)
@@ -5624,6 +5888,7 @@ def consult_antigravity_cli(
     )
     apply_report: dict[str, Any] | None = None
     staging_changes: dict[str, Any] | None = None
+    flash_launch_epoch = time.time()
     try:
         code, stdout, stderr = run_process(
             command,
@@ -5686,6 +5951,10 @@ def consult_antigravity_cli(
         )
 
     if code == 124:
+        if timeout_meta_out is not None:
+            timeout_meta_out.update(
+                _classify_flash_timeout(str(package.get("package_id") or ""), flash_launch_epoch)
+            )
         return consult_timeout_message("Antigravity CLI", timeout, stdout)
     if code != 0:
         return f"Antigravity CLI exited with code {code}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}".strip()
@@ -5727,6 +5996,13 @@ def consult_antigravity_cli(
             + stderr_note + _quarantine_suffix(quarantine)
         )
     attested_model = outer.get("model") or outer.get("model_id") or None
+    attestation_source = "backend" if attested_model else "none"
+    conversation_id = outer.get("conversation_id")
+    if not attested_model and conversation_id:
+        transcript_attested = _attest_flash_model_from_transcript(str(conversation_id))
+        if transcript_attested:
+            attested_model = transcript_attested
+            attestation_source = "transcript"
     conflict = attested_model_conflict(model_name, attested_model)
     if conflict:
         quarantine = _quarantine_rejected(
@@ -5760,7 +6036,11 @@ def consult_antigravity_cli(
             "usage": outer.get("usage"),
             "model": attested_model,
             "requested_model": model_name,
-            "attestation": "backend" if attested_model else "none",
+            "attestation": attestation_source,
+            "model_attested": bool(
+                attested_model and model_name
+                and normalize_lookup(attested_model) == normalize_lookup(model_name)
+            ),
         },
         "containment": containment_report,
     }
@@ -6021,7 +6301,19 @@ def classify_flash_outcome(
     response: str,
     status: str,
     structured: dict[str, Any] | None,
+    failure_kind: str | None = None,
 ) -> str:
+    # A structured timeout classification (from the agy transcript) is checked
+    # BEFORE the text-prefix heuristics below, so an execution timeout is never
+    # miscounted as plain infrastructure unavailability -- that misclassification
+    # is what made native_handoff_for_flash_outcome hand out flash-unavailable
+    # for a worker that actually ran for minutes.
+    if failure_kind == "timeout_during_execution":
+        return "failed_pre_mutation"
+    if failure_kind == "startup_stall":
+        return "unavailable_pre_mutation"
+    if failure_kind == "timeout":
+        return "failed_pre_mutation"
     text = str(response or "")
     if text.startswith(FLASH_INFRASTRUCTURE_PREFIXES):
         return "unavailable_pre_mutation"
@@ -6048,6 +6340,7 @@ def flash_terminal_progress(
     *,
     elapsed_seconds: float | int | None = None,
     worker_executed: bool | None = None,
+    failure_kind: str | None = None,
 ) -> dict[str, Any]:
     """Return a terminal-only Flash progress receipt for synchronous stdio calls.
 
@@ -6065,11 +6358,25 @@ def flash_terminal_progress(
     rejected = outcome == "rejected"
     if worker_executed is None:
         worker_executed = not unavailable and not staging_failed
+    # A code-124 timeout means the subprocess DID launch -- the model was
+    # already resolved and the package already staged by the time it ran --
+    # so only worker_execution is the failing phase. model_resolution is
+    # marked failed only for a genuine resolution failure (e.g. agy missing).
+    is_timeout = failure_kind in FLASH_TIMEOUT_FAILURE_KINDS or text.startswith("Antigravity CLI timed out after")
 
     def phase(name: str, status: str) -> dict[str, str]:
         return {"phase": name, "status": status}
 
-    if unavailable:
+    if unavailable and is_timeout:
+        state, current_phase = "unavailable_pre_mutation", "worker_execution"
+        phases = [
+            phase("model_resolution", "completed"),
+            phase("containment_staging", "completed"),
+            phase("worker_execution", "timed_out"),
+            phase("structured_validation", "not_started"),
+            phase("workspace_apply", "not_started" if implementation else "not_applicable"),
+        ]
+    elif unavailable:
         state, current_phase = "unavailable_pre_mutation", "model_resolution"
         phases = [
             phase("model_resolution", "failed"),
@@ -6095,6 +6402,15 @@ def flash_terminal_progress(
             phase("worker_execution", "completed"),
             phase("structured_validation", "completed"),
             phase("workspace_apply", "completed" if implementation else "not_applicable"),
+        ]
+    elif is_timeout:
+        state, current_phase = str(outcome or "failed"), "worker_execution"
+        phases = [
+            phase("model_resolution", "completed"),
+            phase("containment_staging", "completed"),
+            phase("worker_execution", "timed_out"),
+            phase("structured_validation", "not_started"),
+            phase("workspace_apply", "not_started" if implementation else "not_applicable"),
         ]
     else:
         state, current_phase = str(outcome or "failed"), "worker_execution"
@@ -6483,6 +6799,13 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     resolved_model, effort = resolve_cli_model_and_effort(
         model, requested_model, requested_effort, codex_default_effort
     )
+    # WP-SB2b: consult() is the single choke point every codex/claude dispatch
+    # reduces to -- the consult_codex/consult_claude MCP tools call it directly,
+    # and route_agent_task's codex_cli/claude_code paths call it too (already
+    # covered upstream by _route_agent_task_impl's own check; this is a no-op
+    # there). Exempts consult_decision's own _decision_internal_token-carrying
+    # calls, whose assembled prompt is already bounded by _decision_prompt.
+    _enforce_frontier_prompt_cap(model, resolved_model, prompt, args)
     if model == "antigravity":
         if not resolved_model:
             catalog = list_agent_models("antigravity").get("catalogs", {}).get("antigravity", {})
@@ -6596,6 +6919,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         antigravity_envelope = None
         antigravity_structured = None
         flash_elapsed_seconds = None
+        flash_timeout_meta: dict[str, Any] = {}
         if model == "codex":
             codex_outcome = _run_codex_consult(
                 project_info, prompt, mode, resolved_model, effort,
@@ -6631,7 +6955,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             flash_call_started = time.monotonic()
             response = consult_antigravity_cli(
                 project_info.root_path, prompt, mode, resolved_model, effort, timeout_seconds,
-                flash_package,
+                flash_package, timeout_meta_out=flash_timeout_meta,
             )
             flash_elapsed_seconds = round(max(0.0, time.monotonic() - flash_call_started), 3)
             if not response.startswith(CONSULT_FAILURE_PREFIXES):
@@ -6659,7 +6983,9 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         if model == "antigravity":
             if isinstance(antigravity_envelope, dict):
                 flash_cli_meta = antigravity_envelope.get("cli") or {}
-            flash_outcome = classify_flash_outcome(response, status, antigravity_structured)
+            flash_outcome = classify_flash_outcome(
+                response, status, antigravity_structured, flash_timeout_meta.get("failure_kind")
+            )
             consult_request_id = str(uuid.uuid4())
         if not already_stored:
             store_consultation(
@@ -6754,17 +7080,20 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             result["requested_model"] = resolved_model
             result["resolved_model"] = resolved_model
             result["attested_model"] = flash_cli_meta.get("model")
-            result["model_attested"] = bool(flash_cli_meta.get("model"))
+            result["model_attested"] = bool(flash_cli_meta.get("model_attested"))
             result["attestation"] = flash_cli_meta.get("attestation", "none")
             result["elapsed_seconds"] = flash_cli_meta.get("duration_seconds")
             if result["elapsed_seconds"] is None:
                 result["elapsed_seconds"] = flash_elapsed_seconds
             result["usage"] = flash_cli_meta.get("usage")
+            if flash_timeout_meta.get("timeout_evidence"):
+                result["timeout_evidence"] = flash_timeout_meta["timeout_evidence"]
             result["progress"] = flash_terminal_progress(
                 flash_outcome,
                 mode,
                 response,
                 elapsed_seconds=result["elapsed_seconds"],
+                failure_kind=flash_timeout_meta.get("failure_kind"),
             )
             if flash_outcome == "unavailable_pre_mutation":
                 result["fallback_advice"] = (
@@ -6928,15 +7257,180 @@ def _decision_same_model(host_family: str, host_model: str, family: str, model: 
     return normalize_lookup(host_name) == normalize_lookup(model)
 
 
+def _model_attested_for_family(family: str, requested: str, actual: str) -> bool:
+    if family == "codex":
+        return codex_model_attested(requested, actual)
+    if family == "claude":
+        return claude_model_attested(requested, actual)
+    return normalize_lookup(requested) == normalize_lookup(actual)
+
+
+def _codex_catalog_lists_previous_frontier() -> bool:
+    """True when the previous-generation Codex frontier is still present in the
+    combined static/config/live catalog. This is a safety valve, not a live-only
+    gate: the static catalog seeds it today, so this is normally True; it only
+    goes False if a future catalog revision drops the id entirely."""
+    try:
+        models = discover_codex_models()
+    except Exception:  # noqa: BLE001
+        return False
+    target = normalize_lookup(CODEX_PREVIOUS_FRONTIER_MODEL)
+    for item in models:
+        candidates = {normalize_lookup(item.get("id"))}
+        candidates.update(normalize_lookup(alias) for alias in item.get("aliases") or [])
+        if target in candidates:
+            return True
+    return False
+
+
+def _flagship_chain(family: str, native: bool = False) -> list[str]:
+    """The ordered same-vendor flagship fallback chain for one family.
+
+    For codex, CODEX_PREVIOUS_FRONTIER_MODEL (Sol) is a cross-vendor resilience
+    fallback only -- it is deliberately excluded when native=True, because a
+    codex host's own native flagship escalation must never step down to a
+    weaker same-vendor model; that would not be a "flagship" consultation.
+    Claude's chain (fable -> opus) is the same for native and cross-vendor use,
+    since both entries are genuine flagship tiers."""
+    if family == "claude":
+        try:
+            frontier = list(model_roles.select_claude_roles().get("frontier") or [])
+        except Exception:  # noqa: BLE001
+            frontier = []
+        if not frontier:
+            frontier = [CLAUDE_FLAGSHIP_MODEL, "opus"]
+        return frontier
+    if family == "codex":
+        chain = [current_codex_role_model("frontier")]
+        if native:
+            return chain
+        if not any(normalize_lookup(m) == normalize_lookup(CODEX_PREVIOUS_FRONTIER_MODEL) for m in chain):
+            if _codex_catalog_lists_previous_frontier():
+                chain.append(CODEX_PREVIOUS_FRONTIER_MODEL)
+        return chain
+    return []
+
+
+def _chain_model_after(chain: list[str], current: str) -> str | None:
+    try:
+        idx = next(i for i, model in enumerate(chain) if normalize_lookup(model) == normalize_lookup(current))
+    except StopIteration:
+        return None
+    if idx + 1 < len(chain):
+        return chain[idx + 1]
+    return None
+
+
+def _account_identity_hash(family: str) -> str | None:
+    """A short, non-secret fingerprint of the signed-in account, used only to
+    void a stale latch when the account changes. Never returns or logs the raw
+    value; swallows every error (missing file, bad JSON, missing field)."""
+    try:
+        if family == "claude":
+            path = Path.home() / ".claude.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            value = (data.get("oauthAccount") or {}).get("accountUuid")
+        elif family == "codex":
+            codex_home = os.environ.get("CODEX_HOME")
+            base = Path(codex_home) if codex_home else (Path.home() / ".codex")
+            data = json.loads((base / "auth.json").read_text(encoding="utf-8"))
+            value = (data.get("tokens") or {}).get("account_id")
+        else:
+            return None
+        if not value:
+            return None
+        return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _parse_quota_latch_expiry(text: str) -> float:
+    """Best-effort quota reset time as epoch seconds, from free-text provider
+    errors; falls back to AGENT_BROKER_QUOTA_LATCH_MINUTES (default 30)."""
+    now = time.time()
+    match = re.search(r"try again in\s+(\d+)\s*(hour|hr|minute|min)s?", text, re.I)
+    if match:
+        amount = int(match.group(1))
+        seconds = amount * 3600 if match.group(2).lower().startswith("h") else amount * 60
+        return now + seconds
+    match = re.search(r"retry after\s+(\d+)\s*(second|sec|minute|min|hour|hr)?s?", text, re.I)
+    if match:
+        amount = int(match.group(1))
+        unit = (match.group(2) or "second").lower()
+        if unit.startswith("h"):
+            seconds = amount * 3600
+        elif unit.startswith("m"):
+            seconds = amount * 60
+        else:
+            seconds = amount
+        return now + seconds
+    match = re.search(r"resets?\s+at\s+(\d{1,2}):(\d{2})", text, re.I)
+    if match:
+        hour, minute = int(match.group(1)), int(match.group(2))
+        local_now = time.localtime(now)
+        candidate = (
+            local_now.tm_year, local_now.tm_mon, local_now.tm_mday,
+            hour, minute, 0, 0, 0, -1,
+        )
+        try:
+            candidate_epoch = time.mktime(candidate)
+        except (OverflowError, ValueError):
+            candidate_epoch = now
+        if candidate_epoch <= now:
+            candidate_epoch += 86400
+        return candidate_epoch
+    try:
+        minutes = float(os.environ.get("AGENT_BROKER_QUOTA_LATCH_MINUTES") or DECISION_QUOTA_LATCH_DEFAULT_MINUTES)
+    except (TypeError, ValueError):
+        minutes = float(DECISION_QUOTA_LATCH_DEFAULT_MINUTES)
+    return now + minutes * 60
+
+
+def _set_flagship_latch(key: tuple[str, str, str], kind: str, status: str, reason: str) -> None:
+    entry: dict[str, Any] = {
+        "kind": kind,
+        "status": status,
+        "reason": str(reason or status)[:240],
+        "created_at": utc_now(),
+        "account_hash": _account_identity_hash(key[1]),
+    }
+    if kind == "quota":
+        entry["expires_at"] = _parse_quota_latch_expiry(reason or "")
+    _FLAGSHIP_AVAILABILITY_LATCHES[key] = entry
+
+
+def _latch_active(key: tuple[str, str, str]) -> tuple[bool, str | None]:
+    """True plus None when the latch still blocks this model; False plus a
+    notice when it was voided (expired or the signed-in account changed) --
+    the dead latch is removed either way."""
+    latch = _FLAGSHIP_AVAILABILITY_LATCHES.get(key)
+    if not latch:
+        return False, None
+    _session, family, model = key
+    stored_hash = latch.get("account_hash")
+    current_hash = _account_identity_hash(family)
+    if stored_hash and current_hash and stored_hash != current_hash:
+        del _FLAGSHIP_AVAILABILITY_LATCHES[key]
+        return False, f"retrying {family}:{model}: signed-in account changed"
+    if latch.get("kind") == "quota":
+        expires_at = latch.get("expires_at")
+        if expires_at is not None and time.time() >= float(expires_at):
+            del _FLAGSHIP_AVAILABILITY_LATCHES[key]
+            return False, f"retrying {family}:{model}: quota window passed"
+    return True, None
+
+
 def decision_consult_targets(host_family: str, host_model: str, complexity: str) -> list[dict[str, str]]:
-    codex = {"family": "codex", "model": current_codex_role_model("frontier")}
-    claude = {"family": "claude", "model": CLAUDE_FLAGSHIP_MODEL}
+    codex_chain = _flagship_chain("codex")
+    claude_chain = _flagship_chain("claude")
+    codex = {"family": "codex", "model": codex_chain[0]} if codex_chain else None
+    claude = {"family": "claude", "model": claude_chain[0]} if claude_chain else None
     if host_family == "gemini":
-        candidates = [codex, claude]
+        candidates = [item for item in (codex, claude) if item]
     elif host_family == "codex":
-        candidates = [claude]
+        candidates = [claude] if claude else []
     else:
-        candidates = [codex]
+        candidates = [codex] if codex else []
 
     selected: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -6951,21 +7445,75 @@ def decision_consult_targets(host_family: str, host_model: str, complexity: str)
     return selected
 
 
-def _decision_native_requirement(host_family: str, host_model: str) -> dict[str, str] | None:
-    if host_family == "codex":
-        model = current_codex_role_model("frontier")
-    elif host_family == "claude":
-        model = CLAUDE_FLAGSHIP_MODEL
-    else:
+def _chain_candidates_for_host(chain: list[str], host_family: str, host_model: str) -> list[str]:
+    """Only chain entries strictly stronger than (ordered before) the host's own
+    tier are ever valid native-flagship candidates -- a host never gets asked to
+    natively consult a same-vendor model at or below its own tier. If the host
+    does not match any chain entry, the whole chain is eligible."""
+    for idx, model in enumerate(chain):
+        if _decision_same_model(host_family, host_model, host_family, model):
+            return chain[:idx]
+    return list(chain)
+
+
+def _next_chain_candidate(
+    host_family: str,
+    host_model: str,
+    session_key: str | None,
+    retry_unavailable: bool,
+    start_after: str | None = None,
+) -> dict[str, str] | None:
+    """Walk the host family's own flagship chain (restricted to entries stronger
+    than the host's own tier) for the next usable native candidate, skipping
+    (unless retry_unavailable) any actively latched model. Returns None once the
+    chain is exhausted."""
+    if host_family not in {"codex", "claude"}:
         return None
-    if _decision_same_model(host_family, host_model, host_family, model):
-        return None
-    return {"family": host_family, "model": model}
+    candidates = _chain_candidates_for_host(_flagship_chain(host_family, native=True), host_family, host_model)
+    started = start_after is None
+    for model in candidates:
+        if not started:
+            if normalize_lookup(model) == normalize_lookup(start_after):
+                started = True
+            continue
+        if session_key:
+            key = (session_key, host_family, normalize_lookup(model))
+            active, _notice = _latch_active(key)
+            if active and not retry_unavailable:
+                continue
+        return {"family": host_family, "model": model}
+    return None
+
+
+def _decision_native_requirement(
+    host_family: str,
+    host_model: str,
+    session_key: str | None = None,
+    retry_unavailable: bool = False,
+) -> dict[str, str] | None:
+    return _next_chain_candidate(host_family, host_model, session_key, retry_unavailable)
+
+
+def _classify_native_unavailable_kind(summary: str) -> str:
+    """Credit/plan wording is checked before quota wording, because real
+    provider text (e.g. Fable's) contains both. Unrecognised text defaults to
+    the session-lasting 'plan' kind rather than the short quota window."""
+    text = normalize_lookup(summary)
+    if _DECISION_PLAN_TEXT_PATTERN.search(text):
+        return "plan"
+    if _DECISION_QUOTA_TEXT_PATTERN.search(text):
+        return "quota"
+    return "plan"
 
 
 def _normalized_native_consultation(
-    value: Any, expected: Mapping[str, str], effort: str
+    value: Any, host_family: str, chain: list[str], effort: str
 ) -> dict[str, Any]:
+    """Accepts a report for ANY model in the host family's own flagship chain
+    (not only the one most recently requested) -- the host may be reporting on
+    a chain member asked for in a prior turn, including one the chain has since
+    exhausted. resolved_model records the matched chain entry; actual_model
+    records the string the host actually reported."""
     if not isinstance(value, Mapping):
         raise ValueError("native_consultation must be an object")
     family = normalize_lookup(value.get("family"))
@@ -6976,15 +7524,16 @@ def _normalized_native_consultation(
     agent_id = str(value.get("agent_id") or "").strip()
     if status not in {"completed", "unavailable", "failed"}:
         raise ValueError("native_consultation.status must be completed, unavailable, or failed")
-    if family != expected["family"]:
-        raise ValueError(f"native_consultation.family must be {expected['family']}")
-    model_matches = (
-        codex_model_attested(expected["model"], model)
-        if family == "codex"
-        else claude_model_attested(expected["model"], model)
+    if family != host_family:
+        raise ValueError(f"native_consultation.family must be {host_family}")
+    matched_model = next(
+        (candidate for candidate in chain if _model_attested_for_family(family, candidate, model)),
+        None,
     )
-    if not model_matches:
-        raise ValueError(f"native_consultation.model must attest {expected['model']}")
+    if matched_model is None:
+        raise ValueError(
+            f"native_consultation.model must be one of the {family} chain models it was asked to consult"
+        )
     if not attestation or len(attestation) > 80:
         raise ValueError("native_consultation.attestation is required and must be at most 80 characters")
     if len(summary) > DECISION_ADVICE_MAX_CHARS:
@@ -6998,7 +7547,7 @@ def _normalized_native_consultation(
     entry: dict[str, Any] = {
         "target": family,
         "lane": "native_same_vendor",
-        "resolved_model": expected["model"],
+        "resolved_model": matched_model,
         "actual_model": model,
         "requested_effort": effort,
         "effective_effort": None,
@@ -7015,14 +7564,24 @@ def _normalized_native_consultation(
     return entry
 
 
+# The exact depth-1 adviser contract text. Shared by _decision_prompt (which
+# assembles the real provider prompt) and consult_decision's native_request
+# (needs_native_consultation.native_request.adviser_instructions), which tells
+# the host what to send its own native child agent -- both must say the same
+# thing, so this is the single copy.
+_DECISION_ADVISER_INSTRUCTIONS = (
+    "You are one bounded flagship decision adviser. This is consultation depth 1; "
+    "do not call tools, dispatch agents, read files, browse, or initiate another consultation. "
+    "Use only the decision brief. Do not repeat the brief. Return a compact JSON object with "
+    "recommendation (string), reasons (max 4 strings), risks (max 4 strings), "
+    "missing_evidence (max 3 strings), and evidence_refs (max 8 strings). "
+    "If the evidence is insufficient, say exactly what bounded evidence is missing."
+)
+
+
 def _decision_prompt(package_id: str, complexity: str, brief: dict[str, Any]) -> str:
     prompt = (
-        "You are one bounded flagship decision adviser. This is consultation depth 1; "
-        "do not call tools, dispatch agents, read files, browse, or initiate another consultation. "
-        "Use only the decision brief. Do not repeat the brief. Return a compact JSON object with "
-        "recommendation (string), reasons (max 4 strings), risks (max 4 strings), "
-        "missing_evidence (max 3 strings), and evidence_refs (max 8 strings). "
-        "If the evidence is insufficient, say exactly what bounded evidence is missing. "
+        _DECISION_ADVISER_INSTRUCTIONS + " "
         f"Lineage: {package_id}; complexity: {complexity}.\n\n"
         "Decision brief:\n"
         + json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
@@ -7038,23 +7597,73 @@ def _decision_prompt(package_id: str, complexity: str, brief: dict[str, Any]) ->
     return prompt
 
 
-def _decision_failure(result: dict[str, Any]) -> tuple[str | None, bool]:
+# Credit/plan wording is checked before quota wording everywhere it is used,
+# because real provider text (e.g. Fable's "requires usage credits ... HTTP 429")
+# contains both. Kept as module-level compiled patterns so the classifier and
+# the native-report classifier (_classify_native_unavailable_kind) agree.
+_DECISION_PLAN_TEXT_PATTERN = re.compile(
+    r"requires usage credits|usage credits|insufficient credits|credit balance|payment required|"
+    r"\b402\b|not available on your plan|upgrade your plan|plan does not include"
+)
+_DECISION_QUOTA_TEXT_PATTERN = re.compile(
+    r"\b429\b|too many requests|rate ?limit|usage limit|quota"
+)
+
+
+# Non-failure statuses. A result carrying one of these (or an ``async`` flag)
+# is never classified as a failure, no matter what its advice text discusses --
+# discussing quotas/credits/429s is not the same as hitting one.
+_DECISION_NONFAILURE_STATUSES = {
+    "ok", "completed", "success", "answered", "done",
+    "pending", "queued", "running",
+}
+# Only these fields can carry an actual provider error; advice/response text on
+# a SUCCESSFUL result is never scanned (see _DECISION_NONFAILURE_STATUSES
+# above), and even on a failure, fields like "prompt"/"brief" are excluded so a
+# decision brief that merely discusses quotas never triggers a false latch.
+_DECISION_FAILURE_TEXT_FIELDS = ("error", "stderr", "response", "message")
+
+
+def _decision_failure_text(result: dict[str, Any]) -> str:
+    parts = [str(result.get(field) or "") for field in _DECISION_FAILURE_TEXT_FIELDS]
+    return normalize_lookup(" ".join(part for part in parts if part))
+
+
+def _decision_failure_kind(result: dict[str, Any]) -> tuple[str | None, bool, str | None]:
+    """Like _decision_failure, plus the latch kind ("plan"/"quota") to use when
+    should_latch is True. kind is always None when should_latch is False.
+
+    Only scans error-bearing fields (error/stderr/response/message), and only
+    when the result is not already a success -- a completed/pending result is
+    never reclassified as a failure by its own advice text."""
     status = normalize_lookup(result.get("status"))
     if status == "needs model selection":
-        return "needs_model_selection", False
-    text = normalize_lookup(json.dumps(result, ensure_ascii=False, default=str))
-    if re.search(r"\b(?:quota|usage limit|rate limit)\b.{0,80}\b(?:exceeded|exhausted|reached|limited|depleted)\b", text):
-        return "skipped_quota", True
+        return "needs_model_selection", False, None
+    if status in _DECISION_NONFAILURE_STATUSES or truthy(result.get("async")):
+        return None, False, None
+    text = _decision_failure_text(result)
+    if _DECISION_PLAN_TEXT_PATTERN.search(text):
+        return "skipped_unavailable", True, "plan"
+    if re.search(
+        r"\b(?:quota|usage limit|rate limit)\b.{0,80}\b(?:exceeded|exhausted|reached|limited|depleted)\b", text
+    ) or _DECISION_QUOTA_TEXT_PATTERN.search(text):
+        return "skipped_quota", True, "quota"
     model_specific = bool(re.search(r"\b(?:model|alias)\b.{0,80}\b(?:not found|unknown|unsupported|unavailable)\b", text))
     if re.search(
         r"\b(?:http\s*)?403\b|\b(?:cli was not found|authentication failed|unauthorized|subscription|entitlement|"
         r"access denied|provider unavailable|connection refused|network unreachable)\b",
         text,
     ):
-        return "skipped_unavailable", not model_specific
+        should_latch = not model_specific
+        return "skipped_unavailable", should_latch, ("plan" if should_latch else None)
     if status in {"error", "failed", "blocked"}:
-        return "failed", False
-    return None, False
+        return "failed", False, None
+    return None, False, None
+
+
+def _decision_failure(result: dict[str, Any]) -> tuple[str | None, bool]:
+    status, should_latch, _kind = _decision_failure_kind(result)
+    return status, should_latch
 
 
 def _decision_session_key(args: dict[str, Any], host_family: str) -> str:
@@ -7212,12 +7821,11 @@ def _reconcile_terminal_decision_request(request_id: str, row: Mapping[str, Any]
                 if prior_status in {"skipped_unavailable", "skipped_quota"}:
                     session_key = str(details.get("decision_session_key") or "")
                     family = str(prior_target.get("target") or "")
-                    if session_key and family:
-                        _FLAGSHIP_AVAILABILITY_LATCHES[(session_key, family)] = {
-                            "status": prior_status,
-                            "reason": str(prior_target.get("error") or prior_status)[:240],
-                            "created_at": utc_now(),
-                        }
+                    model = str(prior_target.get("resolved_model") or "")
+                    reason = str(prior_target.get("error") or prior_status)
+                    if session_key and family and model:
+                        kind = "quota" if prior_status == "skipped_quota" else _classify_native_unavailable_kind(reason)
+                        _set_flagship_latch((session_key, family, normalize_lookup(model)), kind, prior_status, reason)
                 return {
                     "parent_ledger_ref": parent_ref,
                     "terminal_ledger_ref": f"event:{terminal['id']}",
@@ -7240,12 +7848,17 @@ def _reconcile_terminal_decision_request(request_id: str, row: Mapping[str, Any]
         updated_target = next((target for target in targets if str(target.get("request_id") or "") == rid), None)
         if updated_target is None:
             return None
+        # Use the canonical state ("completed"/"failed"/"pending"/...), not the
+        # raw DB status string ("recorded"/"resolved"/"matched"/...), so a
+        # successfully completed row is recognised as non-failure regardless
+        # of which synonym the responder used, and its response text is never
+        # rescanned for failure wording.
         raw = {
-            "status": row.get("status"),
+            "status": canonical_request_state(row.get("status")),
             "response": row.get("response"),
             "error": row.get("error"),
         }
-        failure, should_latch = _decision_failure(raw)
+        failure, should_latch, latch_kind = _decision_failure_kind(raw)
         target_status = "completed" if not failure and canonical_request_state(row.get("status")) == "completed" else (failure or "failed")
         updated_target["status"] = target_status
         if target_status == "completed":
@@ -7274,12 +7887,14 @@ def _reconcile_terminal_decision_request(request_id: str, row: Mapping[str, Any]
             if should_latch:
                 session_key = str(parent_details.get("decision_session_key") or "")
                 family = str(updated_target.get("target") or "")
-                if session_key and family:
-                    _FLAGSHIP_AVAILABILITY_LATCHES[(session_key, family)] = {
-                        "status": target_status,
-                        "reason": str(updated_target.get("error") or target_status)[:240],
-                        "created_at": utc_now(),
-                    }
+                model = str(updated_target.get("resolved_model") or "")
+                if session_key and family and model:
+                    _set_flagship_latch(
+                        (session_key, family, normalize_lookup(model)),
+                        latch_kind or "plan",
+                        target_status,
+                        str(updated_target.get("error") or target_status),
+                    )
         details = {
             "parent_ledger_ref": parent_ref,
             "request_id": rid,
@@ -7349,9 +7964,41 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
     response_chars = max(800, min(response_chars, DECISION_ADVICE_MAX_CHARS))
 
     session_key = _decision_session_key(args, host_family)
-    native_expected = _decision_native_requirement(host_family, host_model)
+    retry_unavailable = truthy(args.get("retry_unavailable"))
+    native_capable = host_family in {"codex", "claude"}
+    native_chain = _flagship_chain(host_family, native=True) if native_capable else []
     native_value = args.get("native_consultation")
-    if native_expected and native_value is None:
+    consultations: list[dict[str, Any]] = []
+    notices: list[str] = []
+
+    def needs_native_result(candidate: dict[str, str], fallback_from: str | None = None) -> dict[str, Any]:
+        native_request: dict[str, Any] = {
+            "lane": "native_same_vendor",
+            "mechanism": "host_native_subagent",
+            "family": candidate["family"],
+            "model": candidate["model"],
+            "effort": effort,
+            "work_package_id": package_id,
+            "max_summary_chars": DECISION_ADVICE_MAX_CHARS,
+            "adviser_instructions": _DECISION_ADVISER_INSTRUCTIONS,
+            "max_prompt_bytes": DECISION_PROVIDER_PROMPT_MAX_BYTES,
+            "return_contract": {
+                "family": candidate["family"],
+                "model": candidate["model"],
+                "status": "completed | unavailable | failed",
+                "attestation": "verified runtime identity, or not_run/unverified",
+                "agent_id": "optional native child-agent id",
+                "summary": f"compact decision advice, at most {DECISION_ADVICE_MAX_CHARS} characters",
+            },
+            "instruction": (
+                "Spawn the named same-vendor flagship model as your native child agent, using ONLY "
+                "adviser_instructions plus the decision brief you already submitted -- nothing else -- "
+                "keeping the assembled prompt within max_prompt_bytes. Then call consult_decision "
+                "again with native_consultation."
+            ),
+        }
+        if fallback_from:
+            native_request["fallback_from"] = fallback_from
         result = {
             "status": "needs_native_consultation",
             "policy_version": DECISION_POLICY_VERSION,
@@ -7361,137 +8008,193 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
             "session_id": session_key,
             "complexity": complexity,
             "complexity_escalated": complexity_escalated,
-            "consultations": [],
-            "native_request": {
-                "lane": "native_same_vendor",
-                "mechanism": "host_native_subagent",
-                "family": native_expected["family"],
-                "model": native_expected["model"],
-                "effort": effort,
-                "work_package_id": package_id,
-                "max_summary_chars": DECISION_ADVICE_MAX_CHARS,
-                "return_contract": {
-                    "family": native_expected["family"],
-                    "model": native_expected["model"],
-                    "status": "completed | unavailable | failed",
-                    "attestation": "verified runtime identity, or not_run/unverified",
-                    "agent_id": "optional native child-agent id",
-                    "summary": f"compact decision advice, at most {DECISION_ADVICE_MAX_CHARS} characters",
-                },
-                "instruction": (
-                    "Consult the named same-vendor flagship using only the already supplied "
-                    "bounded brief, then call consult_decision again with native_consultation."
-                ),
-            },
-            "handoff_notices": [],
+            "consultations": list(consultations),
+            "native_request": native_request,
+            "handoff_notices": list(dict.fromkeys(notices)),
             "completion_notice": "Native same-vendor flagship consultation is required before dispatch continues.",
             "authoritative": False,
             "decision_owner": "host",
         }
-        _record_decision_result(args, result, ["needs_native_consultation"])
+        _record_decision_result(args, result, [item["status"] for item in consultations] or ["needs_native_consultation"])
         _cap_decision_result(result)
         return result
-    if not native_expected and native_value is not None:
+
+    native_completed = False
+    if native_capable:
+        if native_value is None:
+            candidate = _next_chain_candidate(host_family, host_model, session_key, retry_unavailable)
+            if candidate:
+                return needs_native_result(candidate)
+            # Only note an exhaustion when the host actually had eligible candidates
+            # (all latched); a host that IS the family's own frontier never had any,
+            # so it silently proceeds straight to cross-vendor as before.
+            if _chain_candidates_for_host(native_chain, host_family, host_model):
+                notices.append(
+                    f"Native {host_family} flagship chain is exhausted for this session; "
+                    "proceeding straight to cross-vendor consultation."
+                )
+        else:
+            native_entry = _normalized_native_consultation(native_value, host_family, native_chain, effort)
+            consultations.append(native_entry)
+            matched_model = native_entry["resolved_model"]
+            # Carry forward the fallback history: any chain candidate that
+            # comes before the reported model and is still latched from an
+            # earlier turn in this session was skipped before the host ever
+            # got asked about it, so it belongs in this call's handoff too.
+            if session_key:
+                matched_index = next(
+                    (i for i, m in enumerate(native_chain) if normalize_lookup(m) == normalize_lookup(matched_model)),
+                    len(native_chain),
+                )
+                for earlier in native_chain[:matched_index]:
+                    earlier_key = (session_key, host_family, normalize_lookup(earlier))
+                    earlier_active, _void_notice = _latch_active(earlier_key)
+                    if earlier_active:
+                        earlier_latch = _FLAGSHIP_AVAILABILITY_LATCHES.get(earlier_key) or {}
+                        reason = earlier_latch.get("reason") or "provider unavailable for this session"
+                        notices.append(f"Skipped {host_family}:{earlier} earlier this session: {reason}.")
+            latch_key = (session_key, host_family, normalize_lookup(matched_model))
+            native_completed = native_entry["status"] == "completed"
+            if native_completed and not any(
+                normalize_lookup(candidate) == normalize_lookup(matched_model)
+                for candidate in _chain_candidates_for_host(native_chain, host_family, host_model)
+            ):
+                # A report that completed but names a model at or below the
+                # host's own tier (e.g. an Opus host reporting an "opus"
+                # consult) is not a genuine flagship escalation -- record it,
+                # but do not let it suppress the cross-vendor leg.
+                native_completed = False
+                notices.append(
+                    f"Native {host_family}:{matched_model} consultation is at or below the "
+                    "host's own tier; not counted as a flagship consultation."
+                )
+            if native_entry["status"] == "completed":
+                _FLAGSHIP_AVAILABILITY_LATCHES.pop(latch_key, None)
+            if not native_completed and native_entry["status"] != "completed":
+                notices.append(
+                    f"Native {host_family}:{matched_model} consultation "
+                    f"was {native_entry['native_status']}; include this in the final handoff."
+                )
+                if native_entry["native_status"] == "unavailable":
+                    reason = native_entry.get("error") or native_entry["native_status"]
+                    kind = _classify_native_unavailable_kind(reason)
+                    _set_flagship_latch(latch_key, kind, native_entry["status"], reason)
+                next_candidate = _next_chain_candidate(
+                    host_family, host_model, session_key, retry_unavailable, start_after=matched_model
+                )
+                if next_candidate:
+                    return needs_native_result(next_candidate, fallback_from=matched_model)
+    elif native_value is not None:
         raise ValueError("native_consultation is not expected for this host model")
+
     targets = decision_consult_targets(host_family, host_model, complexity)
-    consultations: list[dict[str, Any]] = []
-    notices: list[str] = []
-    if native_expected:
-        native_entry = _normalized_native_consultation(native_value, native_expected, effort)
-        consultations.append(native_entry)
-        if native_entry["status"] != "completed":
-            notices.append(
-                f"Native {native_expected['family']}:{native_expected['model']} consultation "
-                f"was {native_entry['native_status']}; include this in the final handoff."
-            )
-    if native_expected and complexity == "bounded":
+    if native_capable and complexity == "bounded" and native_completed:
         targets = []
+
     for target in targets:
         family = target["family"]
-        model = target["model"]
-        latch = _FLAGSHIP_AVAILABILITY_LATCHES.get((session_key, family))
-        if latch:
-            status = latch.get("status") or "skipped_unavailable"
-            notice = f"Skipped {family}:{model}: {latch.get('reason') or 'provider unavailable for this session'}."
-            consultations.append(
-                {
+        chain = _flagship_chain(family)
+        attempt_model: str | None = target["model"]
+        fallback_from: str | None = None
+        while attempt_model is not None:
+            key = (session_key, family, normalize_lookup(attempt_model))
+            active, void_notice = _latch_active(key)
+            if void_notice:
+                notices.append(void_notice)
+            if active and not retry_unavailable:
+                latch = _FLAGSHIP_AVAILABILITY_LATCHES.get(key) or {}
+                status = latch.get("status") or "skipped_unavailable"
+                reason = latch.get("reason") or "provider unavailable for this session"
+                entry: dict[str, Any] = {
                     "target": family,
                     "lane": "switchboard_cross_vendor",
-                    "resolved_model": model,
+                    "resolved_model": attempt_model,
                     "requested_effort": effort,
                     "effective_effort": None,
                     "attestation": "not_run",
                     "status": status,
                 }
-            )
-            notices.append(notice)
-            continue
-        call_args: dict[str, Any] = {
-            "project": args.get("project"),
-            "topic": args.get("topic"),
-            "prompt": prompt,
-            "target_model": model,
-            "effort": effort,
-            "task_kind": "consult",
-            "token_budget": min(2000, max(500, DECISION_BRIEF_MAX_TOKENS)),
-            "include_context_pack": False,
-            "include_task_contract": False,
-            "max_response_chars": response_chars,
-            "_decision_internal_token": _DECISION_INTERNAL_TOKEN,
-        }
-        if family == "claude" and effort in {"xhigh", "max"}:
-            call_args["async"] = True
-            call_args["new_chat"] = True
-        if family == "codex" and truthy(args.get("outbound_reviewed")):
-            call_args["outbound_reviewed"] = True
-        try:
-            raw = consult(family, call_args)
-        except Exception as exc:  # noqa: BLE001
-            raw = {"status": "error", "response": f"{type(exc).__name__}: {exc}"}
-        failure, should_latch = _decision_failure(raw)
-        raw_status = normalize_lookup(raw.get("status"))
-        if failure:
-            status = failure
-        elif raw_status in {"pending", "queued", "running"} or raw.get("async"):
-            status = "pending"
-        else:
-            status = "completed"
-        actual_model = raw.get("actual_model") or raw.get("responder_model")
-        attested = raw.get("model_attested")
-        entry: dict[str, Any] = {
-            "target": family,
-            "lane": "switchboard_cross_vendor",
-            "resolved_model": model,
-            "requested_effort": effort,
-            "effective_effort": raw.get("actual_effort") or raw.get("effort"),
-            "attestation": "verified" if attested is True else ("unverified" if attested is False else "pending"),
-            "status": status,
-        }
-        if actual_model:
-            entry["actual_model"] = actual_model
-        request_id = raw.get("request_id") or raw.get("id")
-        if request_id:
-            entry["request_id"] = request_id
-        if status == "completed":
-            entry["advice"] = str(raw.get("response") or "")[:response_chars]
-        elif status == "pending":
-            entry["poll"] = raw.get("poll") or {
-                "tool": "request_result",
-                "request_id": request_id,
-                "wait_seconds": 180,
+                if fallback_from:
+                    entry["fallback_from"] = fallback_from
+                consultations.append(entry)
+                notices.append(f"Skipped {family}:{attempt_model}: {reason}.")
+                fallback_from = attempt_model
+                attempt_model = _chain_model_after(chain, attempt_model)
+                continue
+
+            call_args: dict[str, Any] = {
+                "project": args.get("project"),
+                "topic": args.get("topic"),
+                "prompt": prompt,
+                "target_model": attempt_model,
+                "effort": effort,
+                "task_kind": "consult",
+                "token_budget": min(2000, max(500, DECISION_BRIEF_MAX_TOKENS)),
+                "include_context_pack": False,
+                "include_task_contract": False,
+                "max_response_chars": response_chars,
+                "_decision_internal_token": _DECISION_INTERNAL_TOKEN,
             }
-        else:
-            error = str(raw.get("response") or raw.get("error") or status)
-            entry["error"] = error[:600]
-            notice = f"Skipped or failed {family}:{model} ({status}); include this in the final handoff."
-            notices.append(notice)
-            if should_latch:
-                _FLAGSHIP_AVAILABILITY_LATCHES[(session_key, family)] = {
-                    "status": status,
-                    "reason": error[:240],
-                    "created_at": utc_now(),
+            if family == "claude" and effort in {"xhigh", "max"}:
+                call_args["async"] = True
+                call_args["new_chat"] = True
+            if family == "codex" and truthy(args.get("outbound_reviewed")):
+                call_args["outbound_reviewed"] = True
+            try:
+                raw = consult(family, call_args)
+            except Exception as exc:  # noqa: BLE001
+                raw = {"status": "error", "response": f"{type(exc).__name__}: {exc}"}
+            failure, should_latch, kind = _decision_failure_kind(raw)
+            raw_status = normalize_lookup(raw.get("status"))
+            if failure:
+                status = failure
+            elif raw_status in {"pending", "queued", "running"} or raw.get("async"):
+                status = "pending"
+            else:
+                status = "completed"
+            actual_model = raw.get("actual_model") or raw.get("responder_model")
+            attested = raw.get("model_attested")
+            entry = {
+                "target": family,
+                "lane": "switchboard_cross_vendor",
+                "resolved_model": attempt_model,
+                "requested_effort": effort,
+                "effective_effort": raw.get("actual_effort") or raw.get("effort"),
+                "attestation": "verified" if attested is True else ("unverified" if attested is False else "pending"),
+                "status": status,
+            }
+            if fallback_from:
+                entry["fallback_from"] = fallback_from
+            if actual_model:
+                entry["actual_model"] = actual_model
+            request_id = raw.get("request_id") or raw.get("id")
+            if request_id:
+                entry["request_id"] = request_id
+            if status == "completed":
+                entry["advice"] = str(raw.get("response") or "")[:response_chars]
+                consultations.append(entry)
+                _FLAGSHIP_AVAILABILITY_LATCHES.pop(key, None)
+                break
+            elif status == "pending":
+                entry["poll"] = raw.get("poll") or {
+                    "tool": "request_result",
+                    "request_id": request_id,
+                    "wait_seconds": 180,
                 }
-        consultations.append(entry)
+                consultations.append(entry)
+                _FLAGSHIP_AVAILABILITY_LATCHES.pop(key, None)
+                break
+            else:
+                error = str(raw.get("response") or raw.get("error") or status)
+                entry["error"] = error[:600]
+                consultations.append(entry)
+                notice = f"Skipped or failed {family}:{attempt_model} ({status}); include this in the final handoff."
+                notices.append(notice)
+                if should_latch:
+                    _set_flagship_latch(key, kind or "plan", status, error)
+                fallback_from = attempt_model
+                attempt_model = _chain_model_after(chain, attempt_model)
+                continue
 
     statuses = [item["status"] for item in consultations]
     overall = _decision_overall_status(statuses)
@@ -10176,6 +10879,128 @@ def prompt_budget_notice(
     }
 
 
+def _route_task_complexity(value: Any) -> str | None:
+    """Validate route_agent_task's optional `complexity` arg. None means the
+    caller omitted it (the effort ladder then defaults to "architecture")."""
+    if value is None:
+        return None
+    normalized = normalize_lookup(str(value)).replace(" ", "_")
+    if normalized not in DECISION_COMPLEXITY_EFFORT:
+        raise ValueError("complexity must be bounded, architecture, or critical")
+    return normalized
+
+
+def _route_task_risk_flags(value: Any) -> list[str]:
+    """Validate route_agent_task's optional `risk_flags` arg: at most 8 strings
+    of at most 80 characters each."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("risk_flags must be an array of strings")
+    if len(value) > 8:
+        raise ValueError("risk_flags allows at most 8 items")
+    items: list[str] = []
+    for raw in value:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("every risk_flags item must be a nonempty string")
+        item = raw.strip()
+        if len(item) > 80:
+            raise ValueError("every risk_flags item must be at most 80 characters")
+        items.append(item)
+    return items
+
+
+def _is_frontier_target(family: str, model: Any) -> bool:
+    """True when `model` is a same-vendor flagship tier for `family`: for codex,
+    the live frontier role model or the previous-generation frontier resilience
+    fallback (CODEX_PREVIOUS_FRONTIER_MODEL); for claude, any model in the
+    fable -> opus chain (_flagship_chain("claude"))."""
+    if family == "codex":
+        candidates = {
+            normalize_lookup(current_codex_role_model("frontier")),
+            normalize_lookup(CODEX_PREVIOUS_FRONTIER_MODEL),
+        }
+        return normalize_lookup(model) in candidates
+    if family == "claude":
+        return any(normalize_lookup(model) == normalize_lookup(m) for m in _flagship_chain("claude"))
+    return False
+
+
+def _frontier_effort_ladder(complexity: str | None, risk_flags: list[str]) -> tuple[str, str]:
+    """The progressive effort ladder for a direct frontier route_agent_task call
+    with no explicit effort/model_policy: bounded/architecture/critical -> high/
+    xhigh/max (mirrors consult_decision's DECISION_COMPLEXITY_EFFORT), defaulting
+    an unrated request to architecture/xhigh, with any DECISION_CRITICAL_RISK_FLAGS
+    match raising it to critical/max. Returns (effort, resolved_complexity)."""
+    resolved_complexity = complexity or "architecture"
+    flags = {normalize_lookup(item).replace(" ", "_") for item in risk_flags}
+    if flags & {normalize_lookup(item).replace(" ", "_") for item in DECISION_CRITICAL_RISK_FLAGS}:
+        resolved_complexity = "critical"
+    return DECISION_COMPLEXITY_EFFORT[resolved_complexity], resolved_complexity
+
+
+def _enforce_frontier_prompt_cap(family: str, model: str, prompt: str, args: dict[str, Any]) -> None:
+    """A direct frontier request (route_agent_task target is a codex/claude
+    flagship) must stay bounded, same as a consult_decision-assembled prompt.
+    Exempt only consult_decision's own internal dispatch, which carries the
+    unforgeable _decision_internal_token and always supplies explicit effort."""
+    if args.get("_decision_internal_token") is _DECISION_INTERNAL_TOKEN:
+        return
+    if not _is_frontier_target(family, model):
+        return
+    byte_count = len(prompt.encode("utf-8"))
+    token_count = estimate_tokens(prompt)
+    if byte_count > DECISION_PROVIDER_PROMPT_MAX_BYTES or token_count > DECISION_PROVIDER_PROMPT_MAX_TOKENS:
+        raise ValueError(
+            "Direct frontier request exceeds the provider budget: "
+            f"{byte_count}/{DECISION_PROVIDER_PROMPT_MAX_BYTES} UTF-8 bytes, "
+            f"~{token_count}/{DECISION_PROVIDER_PROMPT_MAX_TOKENS} tokens. Send a bounded brief plus "
+            "file paths instead (the target can read files itself), or use consult_decision for a "
+            "full flagship decision consultation."
+        )
+
+
+def _route_task_flagship_fallback(
+    family: str, model: str, args: dict[str, Any]
+) -> tuple[str, str | None, str | None]:
+    """When `model` is a claude/codex frontier target actively latched for the
+    current session (the same per-model latches WP-SB1's consult_decision reads
+    and writes), resolve to the next non-latched model in the family's flagship
+    chain at the same effort. Returns (model, fallback_from, notice).
+    fallback_from is None when no fallback applied (including when every later
+    chain model is also latched: the request proceeds on the original model
+    unchanged, but `notice` is still set so the caller does not silently retry
+    a known-latched model). This is a preflight skip only -- no retry-on-failure
+    logic runs for an async dispatch."""
+    if family not in {"claude", "codex"} or not _is_frontier_target(family, model):
+        return model, None, None
+    chain = _flagship_chain(family)
+    if not any(normalize_lookup(model) == normalize_lookup(m) for m in chain):
+        return model, None, None
+    session_key = _decision_session_key(args, family)
+    key = (session_key, family, normalize_lookup(model))
+    active, _void_notice = _latch_active(key)
+    if not active:
+        return model, None, None
+    latch = _FLAGSHIP_AVAILABILITY_LATCHES.get(key) or {}
+    reason = latch.get("reason") or "provider unavailable for this session"
+    candidate = _chain_model_after(chain, model)
+    while candidate is not None:
+        candidate_key = (session_key, family, normalize_lookup(candidate))
+        candidate_active, _void = _latch_active(candidate_key)
+        if not candidate_active:
+            notice = (
+                f"{family}:{model} is latched for this session ({reason}); "
+                f"falling back to {family}:{candidate}."
+            )
+            return candidate, model, notice
+        candidate = _chain_model_after(chain, candidate)
+    exhausted_notice = (
+        f"All fallback models are latched for this session ({reason}); using {family}:{model} anyway."
+    )
+    return model, None, exhausted_notice
+
+
 def route_agent_task(args: dict[str, Any]) -> dict[str, Any]:
     """Public router entry. Runs the token-economy guard on the raw prompt, then delegates
     to the routing impl and attaches a `prompt_notice` to actual deliveries."""
@@ -10194,6 +11019,10 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
     prompt = str(args.get("prompt") or "").strip()
     if not prompt:
         raise ValueError("prompt is required")
+    # Validated up front so a bad complexity value always raises, even for a
+    # non-frontier target where the ladder never actually applies.
+    route_complexity = _route_task_complexity(args.get("complexity"))
+    route_risk_flags = _route_task_risk_flags(args.get("risk_flags"))
     project = args.get("project")
     topic = args.get("topic")
     # Pass the RAW model into resolution. normalize_model_name applies the
@@ -10296,6 +11125,27 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         # route_agent_task calls the queue/CLI implementations directly, so it
         # must enforce the same native-first boundary as consult_* and queue_*.
         enforce_native_first_broker_fallback(args, family)
+
+    # WP-SB2: bounded payload cap + progressive effort ladder + latched-fable
+    # skip for a direct frontier (codex/claude flagship) route_agent_task call.
+    if family in {"codex", "claude"} and _is_frontier_target(family, target_model):
+        _enforce_frontier_prompt_cap(family, target_model, prompt, args)
+        explicit_effort_given = bool(str(args.get("effort") or args.get("reasoning_effort") or "").strip())
+        internal_decision_call = args.get("_decision_internal_token") is _DECISION_INTERNAL_TOKEN
+        if not explicit_effort_given and not model_policy and not internal_decision_call:
+            ladder_effort, ladder_complexity = _frontier_effort_ladder(route_complexity, route_risk_flags)
+            resolved_effort = ladder_effort
+            model_resolution["effort"] = ladder_effort
+            model_resolution["effort_source"] = "ladder"
+            model_resolution["complexity"] = ladder_complexity
+        fallback_model, fallback_from, fallback_notice = _route_task_flagship_fallback(family, target_model, args)
+        if fallback_from:
+            target_model = fallback_model
+            model_resolution["target_model"] = target_model
+            model_resolution["fallback_from"] = fallback_from
+        if fallback_notice:
+            model_resolution.setdefault("notices", [])
+            model_resolution["notices"].append(fallback_notice)
     surface_note: str | None = None
     ide_host = resolve_ide_host(args, target_agent)
     cfg = load_config()
@@ -10690,7 +11540,11 @@ TOOLS = [
                     "description": "Bounded result from the host's same-vendor native flagship subagent. Omit on the first call; needs_native_consultation returns the exact native request.",
                     "properties": {
                         "family": {"type": "string", "enum": ["codex", "claude"]},
-                        "model": {"type": "string", "maxLength": 200},
+                        "model": {
+                            "type": "string",
+                            "maxLength": 200,
+                            "description": "Must be the model named in native_request (its 'model' field), including a prior fallback_from turn.",
+                        },
                         "status": {"type": "string", "enum": ["completed", "unavailable", "failed"]},
                         "attestation": {
                             "type": "string",
@@ -10745,6 +11599,15 @@ TOOLS = [
                 },
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 3000},
                 "outbound_reviewed": {"type": "boolean"},
+                "retry_unavailable": {
+                    "type": "boolean",
+                    "description": (
+                        "Call-scoped bypass: attempt each latched model once more in this call "
+                        "(for example after the operator signs in with another account or tops up "
+                        "credits). A completed result clears that model's latch; a new availability "
+                        "failure refreshes it. Latches for models not attempted this call are left alone."
+                    ),
+                },
             },
             "required": ["work_package_id", "host", "complexity", "brief"],
         },
@@ -10995,7 +11858,9 @@ TOOLS = [
                 "acceptance_criteria": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "For Flash implementation, required deterministic criteria for this package."},
                 "forbidden_actions": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "Additional prohibitions; global Flash safety rules cannot be removed."},
                 "research_questions": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "minLength": 1, "maxLength": 500}, "description": "Required when task_kind=research. Exact bounded questions, preserved in order; vague research without them is rejected."},
-                "model_policy": {"type": "string", "description": "Explicit cost policy for Codex or Claude. 'cheap_read' selects Luna/low or Haiku (no effort); 'balanced'/'efficient'/'lower_effort' selects Terra/medium or Sonnet/medium. Omit for frontier/max consultation, audit, review, or debate."},
+                "model_policy": {"type": "string", "description": "Explicit cost policy for Codex or Claude. 'cheap_read' selects the live Codex reader (Luna)/low or Haiku (no effort); 'balanced'/'efficient'/'lower_effort' selects the live Codex workhorse (Sol)/medium or Sonnet/medium. Omit for a frontier target: it follows the complexity ladder (bounded/architecture/critical -> high/xhigh/max, default xhigh; a risk flag raises it to max)."},
+                "complexity": {"type": "string", "enum": ["bounded", "architecture", "critical"], "description": "For a direct codex/claude frontier target with no explicit effort/model_policy: sets the progressive effort ladder (high/xhigh/max). Omit for the xhigh default."},
+                "risk_flags": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 80}, "description": "For a direct frontier target: any flag matching a critical-risk keyword (e.g. security, payment, migration, irreversible) raises the effort ladder to max."},
                 "native_unavailable_reason": {"type": "string", "description": "Required for same-vendor Codex/Claude MCP fallback after native subagent startup/access failure."},
                 "outbound_reviewed": {"type": "boolean", "description": "For a Codex target, explicit operator opt-in that lets a payload the outbound screen classified needs_owner_review proceed. Never overrides a block verdict."},
                 "prompt": {"type": "string"},
@@ -13101,6 +13966,13 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         )
     if name == "queue_codex_request":
         enforce_native_first_broker_fallback(args, "codex")
+        # WP-SB2b: this MCP tool queues the caller-supplied prompt directly,
+        # bypassing consult()'s own cap -- resolve the (possibly generic/alias)
+        # target_model the same way consult() would, then apply the same cap.
+        _enforce_frontier_prompt_cap(
+            "codex", pick_cli_model("codex", args.get("target_model")),
+            str(args.get("prompt") or ""), args,
+        )
         return text_content(queue_codex_request(
             args.get("project"),
             str(args.get("prompt") or ""),
@@ -13118,6 +13990,11 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return text_content(get_codex_requests(args.get("project"), int(args.get("limit") or 20)))
     if name == "queue_claude_request":
         enforce_native_first_broker_fallback(args, "claude")
+        # WP-SB2b: same bypass concern as queue_codex_request above.
+        _enforce_frontier_prompt_cap(
+            "claude", pick_cli_model("claude", args.get("target_model")),
+            str(args.get("prompt") or ""), args,
+        )
         return text_content(queue_claude_request(
             args.get("project"),
             str(args.get("prompt") or ""),

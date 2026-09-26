@@ -117,10 +117,25 @@ READ_TOOL_NAMES = {"read", "readfile", "read_file"}
 SEARCH_TOOL_NAMES = {"grep", "glob", "find", "search", "search_files"}
 WEB_RESEARCH_TOOL_NAMES = {"webfetch", "websearch"}
 DELEGATION_TOOL_NAMES = {"agent", "task", "spawn_agent"}
+# Bounded-request cap for a delegation call that explicitly names a flagship
+# model (fable/opus). Single source of truth: agent_broker_mcp.py's
+# DECISION_PROVIDER_PROMPT_MAX_BYTES is set equal to this constant where
+# import order allows (see WP-SB2), with a pinning test either way.
+FLAGSHIP_PROMPT_MAX_BYTES = 14_000
 SWITCHBOARD_CONTROL_SUFFIXES = {
     "consult_decision", "consult_codex", "consult_claude", "consult_gemini", "consult_antigravity",
     "queue_codex_request", "queue_claude_request", "request_status",
     "request_result", "route_agent_task",
+}
+# WP-SB6: the narrower set of Switchboard tools a delegated child (a codex/claude CLI
+# subprocess the broker itself launched, AGENT_BROKER_CHILD=1) is never allowed to call --
+# a depth-1 adviser must answer from its brief, not spawn agents or open another
+# consultation. Matched against tool names the same way SWITCHBOARD_CONTROL_SUFFIXES is:
+# a bare name, or an mcp__agent_switchboard__ (or hyphenated mcp__agent-switchboard__,
+# folded by normalize_tool_name) namespaced name ending in one of these.
+CHILD_GUARD_SWITCHBOARD_SUFFIXES = {
+    "consult_decision", "route_agent_task", "consult_codex", "consult_claude",
+    "consult_gemini", "consult_antigravity", "queue_codex_request", "queue_claude_request",
 }
 CLAUDE_UNAVAILABLE_REASONS = {
     "quota",
@@ -516,6 +531,36 @@ def _payload_is_cheap_native_call(payload: dict) -> bool:
     )
 
 
+def _delegation_prompt_text(tool_input: dict) -> str:
+    """The caller-supplied task text for a delegation call. Claude's Agent/Task
+    tools use 'prompt'; Codex's spawn_agent does not -- it uses one of
+    message/input/task/instructions instead. First non-empty field wins."""
+    for field in ("prompt", "message", "input", "task", "instructions"):
+        value = tool_input.get(field)
+        if value:
+            text = str(value)
+            if text.strip():
+                return text
+    return ""
+
+
+def _is_flagship_agent_model(value: object) -> bool:
+    """True for an explicit flagship model request: bare 'fable'/'opus' (any
+    casing/whitespace), an id starting with 'claude-fable'/'claude-opus', or
+    any id containing 'astra' (the Codex frontier, e.g. 'gpt-6-astra') --
+    case-insensitive. Empty values, 'sonnet', 'haiku', and other Codex tiers
+    ('gpt-6-sol', 'gpt-6-luna') are never flagship -- an Agent call that merely
+    inherits the brain's own model (no explicit model field) is untouched."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    if text in {"fable", "opus"}:
+        return True
+    if "astra" in text:
+        return True
+    return text.startswith("claude-fable") or text.startswith("claude-opus")
+
+
 def subagent_start(payload: dict) -> dict:
     """Record a host-issued native agent id/type without trusting prose output."""
     sweep_stale()
@@ -724,6 +769,23 @@ def _is_claude_consult_route(tool_name: object, tool_input: object) -> bool:
 def _claude_unavailable_reason(session_id: str) -> str | None:
     reason = _read_state(session_id).get("claude_unavailable") if session_id else None
     return reason if reason in CLAUDE_UNAVAILABLE_REASONS else None
+
+
+def _is_child_guarded_tool(tool_name: object) -> bool:
+    """True for a tool a Switchboard child (AGENT_BROKER_CHILD=1) must never call:
+    agent delegation (spawning its own child) or a Switchboard consult/route tool
+    (starting another consultation). Bare names and both mcp__agent_switchboard__ /
+    mcp__agent-switchboard__ spellings are matched, mirroring _direct_labour_category."""
+    name = normalize_tool_name(tool_name)
+    if not name:
+        return False
+    if name in DELEGATION_TOOL_NAMES:
+        return True
+    if name.startswith("mcp__agent_switchboard__") and any(
+        name.endswith(suffix) for suffix in CHILD_GUARD_SWITCHBOARD_SUFFIXES
+    ):
+        return True
+    return name in CHILD_GUARD_SWITCHBOARD_SUFFIXES
 
 
 def _direct_labour_category(tool_name: object, tool_input: object) -> str | None:
@@ -1314,6 +1376,26 @@ def pre_tool_use(payload: dict) -> dict:
     host = str(payload.get("_switchboard_host") or "").strip().lower()
     session_id = str(payload.get("session_id") or "").strip()
     normalized_tool = normalize_tool_name(payload.get("tool_name"))
+    # WP-SB6: a Switchboard child (a codex/claude CLI subprocess the broker itself
+    # launched -- AGENT_BROKER_CHILD=1 in its env) is a depth-1 adviser/worker, never a
+    # brain: it must not spawn its own agents or open another consultation. Checked first
+    # and independent of session/warn-mode state; without the env var this is a no-op.
+    if os.environ.get("AGENT_BROKER_CHILD") == "1" and _is_child_guarded_tool(
+        payload.get("tool_name")
+    ):
+        log_gate_decision(
+            session_id, "PreToolUse", normalized_tool, None, "deny",
+            extra={"reason": "switchboard_child_guard"},
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    "Switchboard children may not spawn agents or start consultations"
+                ),
+            }
+        }
     claude_unavailable = _claude_unavailable_reason(session_id)
     if claude_unavailable and _is_claude_consult_route(
         payload.get("tool_name"), payload.get("tool_input") or {}
@@ -1361,6 +1443,28 @@ def pre_tool_use(payload: dict) -> dict:
                 ),
             }
         }
+    if normalized_tool in DELEGATION_TOOL_NAMES:
+        tool_input = payload.get("tool_input") or {}
+        if _is_flagship_agent_model(tool_input.get("model")):
+            prompt_text = _delegation_prompt_text(tool_input)
+            prompt_bytes = len(prompt_text.encode("utf-8"))
+            if prompt_bytes > FLAGSHIP_PROMPT_MAX_BYTES:
+                log_gate_decision(
+                    session_id, "PreToolUse", normalized_tool, None, "deny",
+                    extra={"reason": "flagship_prompt_oversize", "bytes": prompt_bytes},
+                )
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            f"Prompt exceeds the flagship bounded-request cap "
+                            f"({prompt_bytes}/{FLAGSHIP_PROMPT_MAX_BYTES} UTF-8 bytes). Send a bounded "
+                            "brief plus file paths instead (the agent can read files itself), or use "
+                            "consult_decision for a full flagship decision consultation."
+                        ),
+                    }
+                }
     category = _direct_labour_category(
         payload.get("tool_name"), payload.get("tool_input") or {}
     )

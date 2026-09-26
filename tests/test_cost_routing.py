@@ -643,7 +643,7 @@ class AsyncDecisionReconciliationTests(unittest.TestCase):
         self.assertEqual(update["updated_target_status"], "skipped_unavailable")
         self.assertEqual(update["terminal_overall_status"], "unavailable")
         self.assertTrue(update["handoff_notices"])
-        self.assertIn(("session-async-1", "claude"), broker._FLAGSHIP_AVAILABILITY_LATCHES)
+        self.assertIn(("session-async-1", "claude", "fable"), broker._FLAGSHIP_AVAILABILITY_LATCHES)
         again = broker.request_result("async-claude")
         self.assertTrue(again["decision_update"]["already_recorded"])
         self.assertEqual(len(self._terminal_events()), 1)

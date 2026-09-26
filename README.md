@@ -188,6 +188,15 @@ On Windows, Switchboard-owned bounded subprocesses use hidden-window flags and a
 
 ## Changelog
 
+### v1.0.48 (flagship fallback, smart latches, effort ladder, Flash timeout fixes)
+- **`consult_decision` now has a real fallback chain.** A latched or unavailable native flagship (e.g. Fable blocked on credits) walks the rest of its same-vendor chain, then the opposite-vendor chain, at the same ladder effort, instead of failing outright or asking for the same blocked model again.
+- **Availability latches are smarter.** Credit/plan blocks last the session; quota/rate-limit blocks expire at the parsed reset time or after a bounded default window; both are voided early when the signed-in account changes, so a fresh sign-in is retried automatically.
+- **Direct frontier reviews, audits, and debates use a bounded effort ladder** (`complexity`: bounded/architecture/critical, plus `risk_flags`) instead of always running at max, and oversized prompts to expensive models are rejected with guidance instead of silently truncated.
+- **Consult children can no longer recurse.** A depth-1 flagship adviser child is fenced from spawning its own agents or calling Switchboard tools, closing a leak where an architecture consult could silently double its own cost.
+- **Flash timeouts are classified correctly.** A synchronous MCP timeout that hit mid-execution now reports `flash-failed` with transcript evidence instead of being mislabelled `flash-unavailable`/`model_resolution failed`.
+- **Flash model selection is attested from the agy transcript** when the CLI's own JSON omits it, closing a gap where a dispatched model could go unverified.
+- **Stale `gpt-5.6-terra` references are gone.** The generated hierarchy text and static Codex catalog now reflect the live `gpt-6-sol`/`gpt-6-luna` workhorse and reader roles.
+
 ### v1.0.47 (Codex-native hook discovery and trust diagnosis)
 - **Corrects v1.0.46's Codex hook activation assumption.** Codex automatically discovers `~/.codex/hooks.json`; `hooks` in `config.toml` is a table for inline hooks and trust state, not a scalar file path. Switchboard no longer tries to add that invalid scalar and preserves the Codex App-owned `[hooks.state]` table byte-for-byte.
 - **`doctor` now asks Codex itself whether Switchboard hooks are ready.** A bounded read-only `hooks/list` app-server probe reports each required handler's discovery, enabled state, and trust state. New or changed hooks are reported as `pending_user_review` with the supported `/hooks` remediation instead of being mistaken for active enforcement; Switchboard never manufactures private trust hashes.

@@ -610,7 +610,11 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         self.assertTrue(result["complexity_escalated"])
         self.assertTrue(all(call.args[1]["effort"] == "max" for call in consult.call_args_list))
 
-    def test_native_unavailable_is_not_retried_through_switchboard(self):
+    def test_native_unavailable_falls_back_to_cross_vendor_at_bounded_effort(self):
+        # Codex/gpt-5.6-sol has no further native chain member once Astra is
+        # unavailable (sol is the host's own tier), so a bounded decision now
+        # runs the opposite-vendor chain at the bounded ladder effort (high)
+        # instead of dropping every other target.
         result, consult = self._run(
             self._args(
                 "codex",
@@ -619,9 +623,11 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
                 native_consultation=self._native("codex", "unavailable"),
             )
         )
-        consult.assert_not_called()
-        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual([call.args[0] for call in consult.call_args_list], ["claude"])
+        self.assertEqual(consult.call_args_list[0].args[1]["effort"], "high")
+        self.assertEqual(result["status"], "partial")
         self.assertEqual(result["consultations"][0]["lane"], "native_same_vendor")
+        self.assertEqual(result["consultations"][1]["lane"], "switchboard_cross_vendor")
         self.assertTrue(result["handoff_notices"])
 
     def test_native_failure_still_allows_only_opposite_vendor_architecture_consult(self):
@@ -677,7 +683,10 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
 
         first, _ = self._run(self._args("gemini", "gemini-3.8-flash-high"), outcome)
         second, _ = self._run(self._args("gemini", "gemini-3.8-flash-high"), outcome)
-        self.assertEqual(calls, ["codex", "claude", "claude"])
+        # The codex cross-vendor leg now walks its own chain (Astra, then the
+        # previous-frontier Sol) before giving up, so the first run tries codex
+        # twice; both get latched, so the second run skips codex entirely.
+        self.assertEqual(calls, ["codex", "codex", "claude", "claude"])
         self.assertEqual(first["consultations"][0]["status"], "skipped_quota")
         self.assertEqual(second["consultations"][0]["attestation"], "not_run")
         self.assertTrue(first["handoff_notices"])
@@ -725,7 +734,9 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
 
         first, _ = self._run(self._args("gemini", "gemini-3.8-flash-high"), outcome)
         second, _ = self._run(self._args("gemini", "gemini-3.8-flash-high"), outcome)
-        self.assertEqual(calls, ["codex", "claude", "claude"])
+        # Same chain-walk as the quota test: codex tries Astra then Sol before
+        # giving up, so the first run calls codex twice and both get latched.
+        self.assertEqual(calls, ["codex", "codex", "claude", "claude"])
         self.assertEqual(first["status"], "partial")
         self.assertEqual(first["consultations"][0]["status"], "skipped_unavailable")
         self.assertEqual(second["consultations"][0]["status"], "skipped_unavailable")
@@ -743,13 +754,15 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         result, _ = self._run(
             self._args("gemini", "gemini-3.8-flash-high", "critical"), unavailable
         )
-        self.assertEqual(calls, ["codex", "claude"])
+        # Each family walks its own chain before giving up: codex tries Astra
+        # then Sol, claude tries Fable then Opus.
+        self.assertEqual(calls, ["codex", "codex", "claude", "claude"])
         self.assertEqual(result["status"], "unavailable")
         self.assertEqual(
             [item["status"] for item in result["consultations"]],
-            ["skipped_unavailable", "skipped_unavailable"],
+            ["skipped_unavailable"] * 4,
         )
-        self.assertEqual(len(result["handoff_notices"]), 2)
+        self.assertEqual(len(result["handoff_notices"]), 4)
 
     def test_unicode_excerpt_budget_is_enforced_before_dispatch(self):
         args = self._args("codex", "gpt-5.6-sol")
