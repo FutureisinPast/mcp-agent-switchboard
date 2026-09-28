@@ -419,35 +419,56 @@ STATIC_CLAUDE_MODELS = [
         "aliases": ["best", "claude best", "most capable claude", "frontier claude"],
     },
     {
-        "id": "fable",
-        "display": "Claude alias: fable (latest Fable, e.g. claude-fable-5)",
+        # WP-SB9: versioned Claude requests must resolve to an EXPLICIT model id,
+        # never to a bare CLI alias -- the installed Claude CLI's own alias table
+        # can map a bare alias to a different concrete version than the one named
+        # (this is exactly how "opus 5.5" used to silently run Opus 4.8).
+        "id": "claude-fable-5-1",
+        "display": "Claude Fable 5.1",
         "aliases": [
-            "claude fable", "fable", "fable 5", "fable5", "claude-fable-5", "claude fable 5",
+            "fable 5.1", "fable5.1", "claude fable 5.1", "claude-fable-5-1",
+        ],
+    },
+    {
+        "id": "fable",
+        "display": "Claude alias: fable (latest Fable available to the installed Claude CLI)",
+        "aliases": ["claude fable", "fable"],
+    },
+    {
+        "id": "claude-opus-5-5",
+        "display": "Claude Opus 5.5",
+        "aliases": [
+            "opus 5.5", "opus5.5", "claude opus 5.5", "claude-opus-5-5",
         ],
     },
     {
         "id": "opus",
         "display": "Claude alias: opus (latest Opus available to the installed Claude CLI)",
+        "aliases": ["claude opus", "opus"],
+    },
+    {
+        "id": "claude-sonnet-5",
+        "display": "Claude Sonnet 5",
         "aliases": [
-            "claude opus", "opus",
-            "opus 5", "opus5", "claude opus 5",
-            "opus 4.8", "opus4.8", "claude opus 4.8",
-            "opus 4.6", "opus 4.5", "opus 4.1",
+            "sonnet 5", "sonnet5", "claude sonnet 5", "claude-sonnet-5",
         ],
     },
     {
         "id": "sonnet",
         "display": "Claude alias: sonnet (latest available Sonnet)",
+        "aliases": ["claude sonnet", "sonnet"],
+    },
+    {
+        "id": "claude-haiku-4-5-20251001",
+        "display": "Claude Haiku 4.5",
         "aliases": [
-            "claude sonnet", "sonnet",
-            "sonnet 5", "sonnet5", "claude sonnet 5",
-            "sonnet 4.6", "sonnet 4.5", "claude sonnet 4.6", "claude sonnet 4.8",
+            "haiku 4.5", "haiku4.5", "claude haiku 4.5", "claude-haiku-4-5-20251001",
         ],
     },
     {
         "id": "haiku",
         "display": "Claude alias: haiku (latest fast/efficient Haiku)",
-        "aliases": ["claude haiku", "haiku", "cheap claude", "fast claude", "claude-haiku-4-5-20251001"],
+        "aliases": ["claude haiku", "haiku", "cheap claude", "fast claude"],
     },
 ]
 
@@ -3435,11 +3456,20 @@ def version_collapse_note(family: str, requested_text: Any, matched_id: Any) -> 
 # more specific (versioned) patterns come first so "opus 4.8" wins over bare "opus".
 # Each entry maps a regex to the canonical request text fed back into resolution.
 _PROMPT_MODEL_PATTERNS: list[tuple[str, str]] = [
+    # Versioned mentions must win before the bare-alias fallback below, so
+    # "Opus 5.5" resolves to the explicit claude-opus-5-5 id rather than the
+    # bare "opus" CLI alias (WP-SB9).
+    (r"opus\s*5\.5", "opus 5.5"),
     (r"opus\s*4\.8", "opus 4.8"),
     (r"opus\s*4\.6", "opus 4.6"),
     (r"opus", "opus"),
+    (r"sonnet\s*5\.2", "sonnet 5.2"),
+    (r"sonnet\s*5(?!\.\d)", "sonnet 5"),
     (r"sonnet\s*4\.6", "sonnet 4.6"),
     (r"sonnet", "sonnet"),
+    (r"fable\s*5\.1", "fable 5.1"),
+    (r"fable", "fable"),
+    (r"haiku\s*4\.5", "haiku 4.5"),
     (r"haiku", "haiku"),
     (r"gpt[-\s]?5\.6[-\s]?(?:sol|solar)", CODEX_FLAGSHIP_MODEL),
     (r"gpt[-\s]?5\.6[-\s]?terra", CODEX_BALANCED_MODEL),
@@ -3537,6 +3567,30 @@ def model_guard_text(requested_label: Any, *, strict: bool) -> str:
     )
 
 
+# WP-SB9: generic fallback for a versioned Claude mention that has no exact
+# catalog alias (e.g. "opus 4.8", "sonnet 5.2"). Produces an EXPLICIT model id
+# ("claude-opus-4-8") rather than collapsing to a bare CLI alias, so the
+# requested version is what actually gets passed to `claude --model`.
+_CLAUDE_VERSIONED_MODEL_RE = re.compile(
+    r"^(?:claude\s*)?(opus|sonnet|haiku|fable)\s*(\d+)(?:[.\s](\d+))?$"
+)
+
+
+def parse_claude_versioned_model(text: Any) -> tuple[str, str] | None:
+    """Parse a versioned Claude model mention into an explicit CLI model id.
+    Returns (model_id, display) or None if `text` doesn't name a family+version."""
+    raw = normalize_lookup(text)
+    if not raw:
+        return None
+    match = _CLAUDE_VERSIONED_MODEL_RE.match(raw)
+    if not match:
+        return None
+    family_name, major, minor = match.group(1), match.group(2), match.group(3)
+    model_id = f"claude-{family_name}-{major}" + (f"-{minor}" if minor else "")
+    display = f"Claude {family_name.title()} {major}" + (f".{minor}" if minor else "")
+    return model_id, display
+
+
 def match_model_request(family: str, requested_model: Any) -> dict[str, Any]:
     requested_text = str(requested_model or "").strip()
     # Preserve an empty/bare Antigravity request as generic. normalize_model_name
@@ -3570,6 +3624,11 @@ def match_model_request(family: str, requested_model: Any) -> dict[str, Any]:
         return {"status": "matched", "model": item["id"], "display": item["display"], "matches": matches}
     if len(matches) > 1:
         return {"status": "ambiguous", "requested": raw, "matches": matches}
+    if family == "claude":
+        parsed = parse_claude_versioned_model(requested_text)
+        if parsed:
+            model_id, display = parsed
+            return {"status": "matched", "model": model_id, "display": display, "matches": []}
     return {"status": "unknown", "requested": raw, "matches": [], "choices": choices}
 
 
@@ -5139,14 +5198,18 @@ def claude_frontier_candidates(requested_model: Any) -> list[str | None]:
     """Return a bounded, ordered frontier fallback chain.
 
     Exact/pinned ids never fall back. The moving aliases do: ``best`` first,
-    then the user's preferred Fable family, then Opus when Fable is unavailable.
+    then the user's preferred Fable family. WP-SB9 owner rule: never
+    auto-retry under Opus -- an unavailable Fable ends the chain instead of
+    silently running under a different (and possibly older) model. An
+    explicit "opus ..." request is still honoured as asked (falls through to
+    the single-candidate branch below).
     """
     requested = str(requested_model or "").strip()
     lowered = requested.lower()
     if lowered == "best":
-        return ["best", "fable", "opus"]
+        return ["best", "fable"]
     if lowered == "fable":
-        return ["fable", "opus"]
+        return ["fable"]
     return [requested or None]
 
 

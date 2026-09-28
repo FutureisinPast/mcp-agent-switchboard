@@ -188,6 +188,13 @@ On Windows, Switchboard-owned bounded subprocesses use hidden-window flags and a
 
 ## Changelog
 
+### v1.0.52 (WP-SB9: explicit versioned Claude model ids, never-fall-back-to-Opus)
+- **A versioned Claude request now resolves to an explicit model id, never a bare CLI alias.** A Codex host asking for "opus 5.5" previously matched the bare `opus` catalog alias, and `claude --model opus` resolved inside the installed Claude CLI's own (possibly stale) alias table -- silently running Opus 4.8 instead of 5.5. Static catalog entries for `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5`, and `claude-haiku-4-5-20251001` now match their versioned aliases exactly; the bare `fable`/`opus`/`sonnet`/`haiku` entries keep only unversioned aliases.
+- **New generic versioned-model parser** (`parse_claude_versioned_model`) handles any Claude version not in the static catalog (e.g. "sonnet 5.2" -> `claude-sonnet-5-2`, "opus 4.8" -> `claude-opus-4-8`), used only when no exact catalog alias matches.
+- **`_PROMPT_MODEL_PATTERNS` now resolves a versioned mention in prompt text (e.g. "Opus 5.5") before any bare pattern**, so free-text routing requests get the same explicit-id treatment as structured `target_model` args.
+- **Owner rule: never fall back to Opus.** `claude_frontier_candidates()` no longer retries under `opus` when `best`/`fable` are unavailable -- the chain now ends at `fable`. An explicit "opus ..." request is still honoured as asked.
+- See `RELEASE_NOTES_v1.0.52.md` for the exact pytest evidence.
+
 ### v1.0.51 (WP-SB8D: latched-target skip + retry_unavailable, header-bounded response envelope guarantee, Switchboard-child hook scope)
 - **A latched flagship target no longer dispatches "anyway."** A live Astra audit found that when `_route_task_flagship_fallback()` had no available fallback for an actively-latched `route_agent_task` target, it silently proceeded on the original (latched) model with a notice. It now returns a structured `skipped_unavailable`/`skipped_quota` result instead -- carrying the latch reason/kind (and `expires_at` for quota) plus guidance to use `consult_decision` for the cross-vendor fallback or retry with `retry_unavailable=true` -- and never dispatches.
 - **New optional `retry_unavailable` on `route_agent_task`.** Forces exactly one dispatch despite an active latch (for after switching accounts or topping up): a genuine success clears the latch, a fresh availability failure refreshes it, using the same classifier `consult_decision`'s own retry path uses (`_decision_failure_kind`).

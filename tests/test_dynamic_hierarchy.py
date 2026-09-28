@@ -1136,17 +1136,20 @@ class ClaudeFrontierFallbackTests(unittest.TestCase):
         self.assertTrue(result.model_attested)
         self.assertEqual(run.call_count, 2)
 
-    def test_best_and_fable_unavailable_fall_back_to_opus(self):
+    def test_best_and_fable_unavailable_never_falls_back_to_opus(self):
+        # WP-SB9: opus was removed from the automatic frontier retry chain (the
+        # owner rule is "never fall back to Opus" -- an unavailable fable ends
+        # the chain instead of silently retrying under Opus).
         result, run = self._consult(
             [
                 (1, "", "Unknown model: best"),
                 (1, "", "Model fable is unavailable for this subscription"),
-                (0, claude_stream("claude-opus-6-1", "approved"), ""),
             ]
         )
-        self.assertEqual(result.requested_model, "opus")
-        self.assertEqual(result.attempted_models, ("best", "fable", "opus"))
-        self.assertEqual(run.call_count, 3)
+        self.assertEqual(result.requested_model, "fable")
+        self.assertEqual(result.attempted_models, ("best", "fable"))
+        self.assertFalse(result.model_attested)
+        self.assertEqual(run.call_count, 2)
 
     def test_general_failure_does_not_retry(self):
         result, run = self._consult([(1, "", "Network connection reset")])
