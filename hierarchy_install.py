@@ -10,7 +10,10 @@ import hashlib
 import json
 import re
 import shlex
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 build interpreter: tomllib is 3.11+
+    import tomli as tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable

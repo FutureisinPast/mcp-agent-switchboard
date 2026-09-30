@@ -53,7 +53,7 @@ a = Analysis(
     pathex=[ROOT],
     binaries=[],
     datas=_datas(),
-    hiddenimports=[
+    hiddenimports=['tomli', 
         "agent_broker_mcp", "setup", "model_roles", "routing_gate", "atomic_io", "hierarchy_install",
         "flash_manifest",
         "tiktoken", "tiktoken_ext", "tiktoken_ext.openai_public",
