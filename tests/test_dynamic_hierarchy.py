@@ -408,6 +408,9 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
             "mode": "plan",
             "task_kind": "research",
             "research_questions": ["Q1", "Q2"],
+            # WP-SB10: research now defaults to the async lane; this test pins consult()'s
+            # sync forwarding contract, so it opts out explicitly.
+            "async": False,
         }
         with mock.patch.object(broker, "resolve_model_request", return_value=resolved), \
              mock.patch.object(broker, "consult", return_value={"status": "ok"}) as consult, \

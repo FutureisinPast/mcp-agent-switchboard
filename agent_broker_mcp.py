@@ -102,6 +102,17 @@ CODEX_STALE_REQUEST_SECONDS = _env_int(
     max(1800, CODEX_ASYNC_WORKER_TIMEOUT_SECONDS + 300),
 )
 CODEX_QUEUE_AUTORUN = _env_bool("AGENT_BROKER_CODEX_QUEUE_AUTORUN", True)
+# WP-SB10: Flash (agy) packages that can outlive the sync window run in a detached worker
+# with their own cap. Per-call timeout_seconds is bounded to [MIN, MAX]; the env sets the
+# default (60 minutes). Real implementation packages routinely exceed the 240 s sync cap.
+FLASH_ASYNC_MIN_TIMEOUT_SECONDS = 240
+FLASH_ASYNC_MAX_TIMEOUT_SECONDS = 10800
+FLASH_ASYNC_DEFAULT_TIMEOUT_SECONDS = max(
+    FLASH_ASYNC_MIN_TIMEOUT_SECONDS,
+    min(_env_int("AGENT_BROKER_FLASH_ASYNC_TIMEOUT_SECONDS", 3600), FLASH_ASYNC_MAX_TIMEOUT_SECONDS),
+)
+FLASH_ASYNC_STALE_GRACE_SECONDS = 120
+FLASH_ASYNC_QUEUED_STALE_SECONDS = 600
 # Claude inbox requests get the same detached-CLI-worker treatment as Codex ones (v1.0.19):
 # without it a queued Fable/Opus consult waits for an interactive session/bridge pickup that
 # never happens in a headless environment and sits "queued" forever.
@@ -927,6 +938,47 @@ def init_db() -> None:
                 task_kind TEXT,
                 token_budget INTEGER,
                 mode TEXT
+            )
+            """
+        )
+        # WP-SB10: async Flash packages. Mirrors claude_requests plus the persisted, fully
+        # validated package envelope (args_json/package_json/manifest_json), the write paths
+        # used by the overlap guard, and the broker receipt assigned at queue time.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS flash_requests (
+                id TEXT PRIMARY KEY,
+                project TEXT NOT NULL,
+                root_path TEXT,
+                topic TEXT,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL,
+                response TEXT,
+                error TEXT,
+                created_by TEXT,
+                created_at TEXT NOT NULL,
+                notified_at TEXT,
+                completed_at TEXT,
+                responder TEXT,
+                responder_model TEXT,
+                target_model TEXT,
+                strict_model INTEGER DEFAULT 0,
+                task_kind TEXT,
+                token_budget INTEGER,
+                effort TEXT,
+                mode TEXT,
+                worker_pid INTEGER,
+                worker_started_at TEXT,
+                worker_completed_at TEXT,
+                work_package_id TEXT,
+                receipt TEXT,
+                timeout_seconds INTEGER,
+                max_response_chars INTEGER,
+                response_ref TEXT,
+                write_paths TEXT,
+                args_json TEXT,
+                package_json TEXT,
+                manifest_json TEXT
             )
             """
         )
@@ -3117,6 +3169,7 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
             "Codex/Claude eligible bounded labour uses the newest live Antigravity Gemini Flash High through Agent Switchboard first.",
             "For one concrete package, use the matching same-vendor native reader/workhorse instead when a recorded native preference applies or Flash failed/unavailable; never auto-launch it.",
             "Choose reader for quick_check/research/search and read-only extraction; choose workhorse for implementation, drafting/planning, tests, review, bug_hunt, sanity_check, and harder routine analysis.",
+            "Flash implementation (accept-edits) and research packages run async by default with a 60-minute cap (timeout_seconds 240-10800; async=false forces the 240 s sync path; quick_check/search stay sync): route_agent_task returns request_id/receipt/poll immediately; poll request_result(request_id, wait_seconds=180) until terminal. The start earns one gate relief; overlapping accept-edits write paths are refused.",
             "Gemini/Antigravity and unknown hosts have no automatic downward cost route.",
             "For flagship decisions, Codex/Claude first use their native same-vendor child agent with a bounded brief, then pass its compact descriptor to consult_decision for any required cross-vendor leg; never send whole files or articles.",
             "Use a same-vendor broker worker only when the named native role is unavailable or failed to start, and record the fallback.",
@@ -6935,7 +6988,12 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         effort, effort_policy = enforce_codex_effort_policy(
             args, prompt, task_kind, resolved_model, effort, model_policy
         )
-    timeout_seconds = bounded_sync_timeout(args.get("timeout_seconds"))
+    flash_async_worker = model == "antigravity" and args.get("_flash_async_token") is _FLASH_ASYNC_INTERNAL_TOKEN
+    timeout_seconds = (
+        bounded_flash_async_timeout(args.get("timeout_seconds"))
+        if flash_async_worker
+        else bounded_sync_timeout(args.get("timeout_seconds"))
+    )
     project_info = resolve_project(str(project_arg) if project_arg is not None else None)
     flash_package = None
     if model == "antigravity":
@@ -7090,7 +7148,13 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             flash_outcome = classify_flash_outcome(
                 response, status, antigravity_structured, flash_timeout_meta.get("failure_kind")
             )
-            consult_request_id = str(uuid.uuid4())
+            # The async worker reuses the id issued at queue time so the receipt the caller
+            # already holds resolves to this consultation row.
+            consult_request_id = (
+                str(args.get("_flash_receipt_id") or "").strip() or str(uuid.uuid4())
+                if flash_async_worker
+                else str(uuid.uuid4())
+            )
         if not already_stored:
             store_consultation(
                 project_info, consulted_name, mode, prompt, response, status, error, started_at,
@@ -7318,6 +7382,7 @@ def _envelope_header_fields(result: Mapping[str, Any]) -> dict[str, Any]:
         "status", "outcome", "accepted", "credit_eligible", "worker_status", "disposition",
         "receipt", "work_package_id", "model", "attested_model", "attestation", "model_attested",
         "elapsed_seconds", "native_handoff", "caveats", "response_ref", "truncated",
+        "request_id", "async_worker", "poll",
     ):
         if key in result:
             header[key] = result[key]
@@ -7333,7 +7398,7 @@ _NATIVE_HANDOFF_HEADER_KEYS = ("family", "role", "model", "flash_skip_reason", "
 # pathological every-field-is-huge result, per WP-SB8D item 2.
 _ENVELOPE_ESSENTIAL_KEYS = (
     "status", "outcome", "accepted", "credit_eligible", "receipt",
-    "work_package_id", "response_ref", "truncated",
+    "work_package_id", "response_ref", "truncated", "request_id", "poll",
 )
 _HEADER_OBJECT_CONDENSE_CHARS = 300
 _HEADER_STRING_CAP_CHARS = 500
@@ -10203,6 +10268,702 @@ def run_claude_request_worker(request_id: str) -> dict[str, Any]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# WP-SB10: async Flash (agy) lane. Reuses the Codex/Claude detached-worker pattern:
+# a request row + `start_*_request_worker` + `run-*-request` bridge verb, polled with
+# request_status/request_result. The worker calls the SAME consult() dispatch the sync
+# path uses (staging -> agy -> structured validation -> apply); only the timeout differs.
+# ---------------------------------------------------------------------------
+_FLASH_ASYNC_INTERNAL_TOKEN = object()
+_FLASH_IMPLEMENTATION_MODES = {
+    "accept edits", "accept-edits", "workspace write", "workspace-write",
+    "implementation", "implement", "edit",
+}
+_FLASH_DANGER_MODES = {
+    "danger full access", "danger-full-access", "bypass permissions", "bypasspermissions", "unrestricted",
+}
+
+
+def bounded_flash_async_timeout(value: Any = None) -> int:
+    """Per-call Flash async timeout, bounded to [240, 10800]; unset -> env default (3600)."""
+    try:
+        requested = int(str(value).strip()) if value is not None and str(value).strip() else 0
+    except (TypeError, ValueError):
+        requested = 0
+    if requested <= 0:
+        requested = FLASH_ASYNC_DEFAULT_TIMEOUT_SECONDS
+    return max(FLASH_ASYNC_MIN_TIMEOUT_SECONDS, min(requested, FLASH_ASYNC_MAX_TIMEOUT_SECONDS))
+
+
+def flash_async_decision(args: Mapping[str, Any], mode: Any) -> tuple[bool, str]:
+    """Decide sync vs async for a Flash CLI package. An explicit `async` always wins;
+    otherwise accept-edits/implementation modes and research/implementation task kinds
+    default to async (they routinely outlive the 240 s sync window)."""
+    explicit = args.get("async")
+    if explicit is not None and str(explicit).strip() != "":
+        return truthy(explicit), "explicit"
+    if normalize_lookup(mode) in _FLASH_IMPLEMENTATION_MODES:
+        return True, "default_implementation_mode"
+    raw_kind = str(args.get("task_kind") or args.get("request_type") or "").strip().lower()
+    if raw_kind in {"research", "implementation"}:
+        return True, f"default_{raw_kind}"
+    return False, "default_sync"
+
+
+def _pid_alive(pid: Any) -> bool:
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_int <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            handle = kernel32.OpenProcess(0x1000, False, pid_int)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return False
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            return True
+    try:
+        os.kill(pid_int, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _kill_pid_tree(pid: Any) -> bool:
+    """Kill a worker process and its children (the agy tree). Best effort."""
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_int <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid_int), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                check=False,
+                creationflags=WINDOWS_NO_WINDOW,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log(f"taskkill failed for flash worker pid {pid_int}: {exc}")
+            return False
+    try:
+        os.kill(pid_int, 9)
+        return True
+    except OSError:
+        return False
+
+
+def _flash_row_args(row: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        parsed = json.loads(row.get("args_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _flash_paths_overlap(a: str, b: str) -> bool:
+    na = os.path.normcase(os.path.normpath(a))
+    nb = os.path.normcase(os.path.normpath(b))
+    return na == nb or na.startswith(nb + os.sep) or nb.startswith(na + os.sep)
+
+
+def _assert_no_flash_write_overlap(paths: list[str]) -> None:
+    """Refuse a new accept-edits package whose write/create paths overlap a queued or
+    running Flash package. Stale/dead rows are refreshed first so a dead worker never
+    blocks new work."""
+    if not paths:
+        return
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM flash_requests WHERE status IN ('queued', 'running')"
+            ).fetchall()
+        ]
+    for row in rows:
+        row = _refresh_flash_request(row)
+        if is_terminal_state(row.get("status")):
+            continue
+        try:
+            existing = json.loads(row.get("write_paths") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            existing = []
+        for mine in paths:
+            for theirs in existing:
+                if _flash_paths_overlap(mine, str(theirs)):
+                    raise ValueError(
+                        f"Flash write overlap: {mine} conflicts with {theirs} owned by "
+                        f"{row.get('status')} request {row.get('id')} "
+                        f"(work_package_id={row.get('work_package_id')}). Wait for it, or cancel it, "
+                        "before dispatching an overlapping accept-edits package."
+                    )
+
+
+def queue_flash_request(flash_args: dict[str, Any], autorun: Any = None) -> dict[str, Any]:
+    """Validate one Flash package exactly as the sync path would, persist the full envelope,
+    start the detached worker, and return immediately with request_id/receipt/poll."""
+    init_db()
+    prompt = str(flash_args.get("prompt") or "").strip()
+    if not prompt:
+        raise ValueError("prompt is required")
+    mode = str(flash_args.get("mode") or "plan")
+    normalized_mode = normalize_lookup(mode)
+    if normalized_mode in _FLASH_DANGER_MODES:
+        raise ValueError(
+            "Antigravity CLI Flash safety policy rejected danger-full-access. Keep production SSH, "
+            "credentials, destructive operations, migrations, and live deployment with the brain."
+        )
+    implementation_mode = normalized_mode in _FLASH_IMPLEMENTATION_MODES
+    task_kind = normalize_task_kind(flash_args.get("task_kind"))
+    project_info = resolve_project(str(flash_args.get("project")) if flash_args.get("project") is not None else None)
+    package = prepare_flash_work_package(
+        flash_args, "implementation" if implementation_mode else task_kind, prompt
+    )
+    try:
+        manifest = flash_manifest.build_manifest(package, project_info.root_path, implementation_mode)
+    except flash_manifest.ManifestRejection as rejection:
+        raise ValueError(f"Flash package rejected before queueing: {rejection.message()}") from rejection
+    write_paths = [str(p) for p in list(manifest.get("writes") or []) + list(manifest.get("creates") or [])]
+    if implementation_mode:
+        _assert_no_flash_write_overlap(write_paths)
+
+    timeout_seconds = bounded_flash_async_timeout(flash_args.get("timeout_seconds"))
+    try:
+        max_response_chars = max(
+            800,
+            min(int(flash_args.get("max_response_chars") or RESPONSE_ENVELOPE_DEFAULT_CHARS), MAX_CONSULT_RESPONSE_CHARS),
+        )
+    except (TypeError, ValueError):
+        max_response_chars = RESPONSE_ENVELOPE_DEFAULT_CHARS
+
+    # Persist the NORMALIZED envelope so the worker's prepare_flash_work_package rebuilds an
+    # identical package (prepare is idempotent over its own output).
+    stored_args = {k: v for k, v in flash_args.items() if not str(k).startswith("_") and k != "async"}
+    stored_args.update(
+        {
+            "mode": mode,
+            "task_kind": task_kind,
+            "work_package_id": package["package_id"],
+            "allowed_files": package["allowed_files"],
+            "allowed_writes": package["allowed_writes"],
+            "allowed_creates": package["allowed_creates"],
+            "read_context": package["read_context"],
+            "workspace_root": package["workspace_root"],
+            "acceptance_criteria": package["acceptance_criteria"],
+            "forbidden_actions": package["forbidden_actions"],
+            "research_questions": package["research_questions"],
+            "timeout_seconds": timeout_seconds,
+            "max_response_chars": max_response_chars,
+            "caller": os.environ.get("AGENT_BROKER_CALLER") or _MCP_CLIENT_NAME or "",
+        }
+    )
+    manifest_summary = {
+        "workspace_root": str(manifest.get("workspace_root")),
+        "writes": [str(p) for p in manifest.get("writes") or []],
+        "creates": [str(p) for p in manifest.get("creates") or []],
+        "read_context": [str(p) for p in manifest.get("read_context") or []],
+        "files": manifest.get("files"),
+        "bytes": manifest.get("bytes"),
+    }
+    request_id = str(uuid.uuid4())
+    receipt = f"broker:{request_id}"
+    now = utc_now()
+    created_by = os.environ.get("AGENT_BROKER_CALLER") or "mcp-client"
+    model_label = str(flash_args.get("target_model") or "") or None
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO flash_requests (
+                id, project, root_path, topic, prompt, status, created_by, created_at,
+                target_model, strict_model, task_kind, token_budget, effort, mode,
+                work_package_id, receipt, timeout_seconds, max_response_chars,
+                write_paths, args_json, package_json, manifest_json
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                project_info.name,
+                project_info.root_path,
+                str(flash_args.get("topic") or "").strip() or None,
+                prompt,
+                created_by,
+                now,
+                model_label,
+                task_kind,
+                int(flash_args.get("token_budget") or 0) or None,
+                str(flash_args.get("effort") or "") or None,
+                mode,
+                package["package_id"],
+                receipt,
+                timeout_seconds,
+                max_response_chars,
+                json.dumps(write_paths, ensure_ascii=False),
+                json.dumps(stored_args, ensure_ascii=False, default=str),
+                json.dumps(package, ensure_ascii=False, default=str),
+                json.dumps(manifest_summary, ensure_ascii=False, default=str),
+            ),
+        )
+    autorun_enabled = True if autorun is None else truthy(autorun)
+    worker = start_flash_request_worker(request_id) if autorun_enabled else None
+    started = bool((worker or {}).get("started"))
+    return {
+        "status": "running" if started else "queued",
+        "async": True,
+        "request_id": request_id,
+        "id": request_id,
+        "work_package_id": package["package_id"],
+        "receipt": receipt,
+        "outcome": "async_queued",
+        "credit_eligible": False,
+        "accepted": False,
+        "mode": mode,
+        "task_kind": task_kind,
+        "timeout_seconds": timeout_seconds,
+        "async_worker": worker,
+        "poll": {"tool": "request_result", "request_id": request_id, "wait_seconds": 180},
+        "note": (
+            f"Flash package runs in a detached worker ({timeout_seconds}s cap). Collect it with "
+            f'request_result(request_id="{request_id}", wait_seconds=180) and repeat until done; '
+            "running for many minutes is normal for implementation packages."
+        ),
+    }
+
+
+def _flash_worker_recent_enough(row: Mapping[str, Any]) -> bool:
+    if str(row.get("status") or "").lower() != "running":
+        return False
+    started = _iso_epoch(row.get("worker_started_at"))
+    if started is None:
+        return False
+    timeout = int(row.get("timeout_seconds") or FLASH_ASYNC_DEFAULT_TIMEOUT_SECONDS)
+    return time.time() - started < timeout + FLASH_ASYNC_STALE_GRACE_SECONDS
+
+
+def start_flash_request_worker(request_id: str) -> dict[str, Any]:
+    """Start the detached worker for a queued Flash request (same claim protocol as
+    start_codex_request_worker: exactly one starter may move the row to running)."""
+    init_db()
+    rid = str(request_id or "").strip()
+    if not rid:
+        return {"started": False, "reason": "empty request id"}
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM flash_requests WHERE id = ?", (rid,)).fetchone()
+        if not row:
+            return {"started": False, "reason": "unknown request"}
+        data = dict(row)
+        if data.get("response") or is_terminal_state(data.get("status")):
+            return {"started": False, "reason": "request already terminal", "status": data.get("status")}
+        if _flash_worker_recent_enough(data):
+            return {
+                "started": False,
+                "reason": "worker already running",
+                "pid": data.get("worker_pid"),
+                "worker_started_at": data.get("worker_started_at"),
+            }
+        timeout = int(data.get("timeout_seconds") or FLASH_ASYNC_DEFAULT_TIMEOUT_SECONDS)
+        now = utc_now()
+        stale_epoch = (_iso_epoch(now) or int(time.time())) - (timeout + FLASH_ASYNC_STALE_GRACE_SECONDS)
+        stale_cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stale_epoch))
+        cur = conn.execute(
+            """
+            UPDATE flash_requests
+            SET status = 'running', worker_started_at = ?, notified_at = COALESCE(notified_at, ?)
+            WHERE id = ? AND response IS NULL
+              AND status NOT IN ('completed','error','cancelled','canceled','expired','failed')
+              AND (worker_started_at IS NULL OR worker_started_at < ?)
+            """,
+            (now, now, rid, stale_cutoff),
+        )
+        if cur.rowcount != 1:
+            return {
+                "started": False,
+                "reason": "worker already claimed",
+                "pid": data.get("worker_pid"),
+                "worker_started_at": data.get("worker_started_at"),
+            }
+    try:
+        tmp_dir = BROKER_DIR / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        out_path = tmp_dir / f"flash-worker-{safe_slug(rid)}.log"
+        env = os.environ.copy()
+        env.pop("AGENT_BROKER_CHILD", None)
+        # Preserve the queuing caller's identity so native_handoff resolves the same family.
+        caller = str(_flash_row_args(data).get("caller") or data.get("created_by") or "").strip()
+        env["AGENT_BROKER_CALLER"] = caller or "agent-broker-flash-worker"
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+        with out_path.open("ab") as fh:
+            proc = subprocess.Popen(
+                _broker_bridge_command("run-flash-request", rid),
+                cwd=str(BROKER_DIR),
+                stdin=subprocess.DEVNULL,
+                stdout=fh,
+                stderr=fh,
+                env=env,
+                creationflags=creationflags,
+            )
+        with db_connect() as conn:
+            conn.execute("UPDATE flash_requests SET worker_pid = ? WHERE id = ?", (proc.pid, rid))
+        return {"started": True, "pid": proc.pid, "timeout_seconds": timeout, "log": str(out_path)}
+    except Exception as exc:  # noqa: BLE001
+        reason = f"failed to start Flash async worker: {type(exc).__name__}: {exc}"
+        _flash_finalize_failure(
+            data, reason, classify=False, failure_kind="worker_start_failed",
+            outcome="unavailable_pre_mutation",
+        )
+        return {"started": False, "reason": reason}
+
+
+def _flash_finalize_row(
+    rid: str, status: str, response: str, error: str | None,
+    response_ref: str | None, responder_model: str | None,
+) -> bool:
+    now = utc_now()
+    with db_connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE flash_requests
+            SET status = ?, response = ?, error = ?, response_ref = ?, responder = ?,
+                responder_model = ?, completed_at = ?, worker_completed_at = ?
+            WHERE id = ? AND response IS NULL
+              AND status NOT IN ('completed','error','cancelled','canceled','expired','failed')
+            """,
+            (
+                status, scrub_surrogates(response), scrub_surrogates(error), response_ref,
+                "flash-cli-worker", responder_model, now, now, rid,
+            ),
+        )
+        return cur.rowcount == 1
+
+
+def _flash_finalize_failure(
+    row: Mapping[str, Any],
+    reason: str,
+    *,
+    classify: bool,
+    failure_kind: str | None = None,
+    outcome: str | None = None,
+) -> dict[str, Any]:
+    """Mark a Flash request failed and record the final envelope with the SB3 timeout
+    classification and the flash-failed/flash-unavailable native handoff."""
+    rid = str(row.get("id") or "")
+    package_id = str(row.get("work_package_id") or "")
+    receipt = str(row.get("receipt") or f"broker:{rid}")
+    launched = _iso_epoch(row.get("worker_started_at")) or _iso_epoch(row.get("created_at")) or int(time.time())
+    if classify:
+        meta = _classify_flash_timeout(package_id, float(launched))
+    else:
+        meta = {"failure_kind": failure_kind or "worker_failed", "outcome": outcome or "failed_pre_mutation"}
+    flash_outcome = meta.get("outcome") or "failed_pre_mutation"
+    args = _flash_row_args(row)
+    mode = str(row.get("mode") or args.get("mode") or "plan")
+    elapsed = max(0, int(time.time()) - int(launched))
+    envelope: dict[str, Any] = {
+        "project": row.get("project"),
+        "root_path": row.get("root_path"),
+        "model": row.get("target_model"),
+        "mode": mode,
+        "status": "error",
+        "response": reason,
+        "request_id": rid,
+        "work_package_id": package_id or None,
+        "structured_output_enforced": True,
+        "structured_output": None,
+        "worker_status": None,
+        "disposition": None,
+        "caveats": [],
+        "brain_verification": {
+            "required": True,
+            "status": "pending",
+            "acceptance_rule": "Independently inspect cited lines, the actual diff, and check output before accepting or dispatching another package.",
+        },
+        "accepted": False,
+        "receipt": receipt,
+        "outcome": flash_outcome,
+        "credit_eligible": False,
+        "failure_kind": meta.get("failure_kind"),
+        "elapsed_seconds": elapsed,
+        "progress": flash_terminal_progress(
+            flash_outcome, mode, reason, elapsed_seconds=elapsed, failure_kind=meta.get("failure_kind"),
+        ),
+    }
+    if meta.get("timeout_evidence"):
+        envelope["timeout_evidence"] = meta["timeout_evidence"]
+    native_handoff = native_handoff_for_flash_outcome(
+        {**args, "work_package_id": package_id, "task_kind": args.get("task_kind") or row.get("task_kind")},
+        flash_outcome,
+        receipt,
+    )
+    if native_handoff is not None:
+        envelope["native_handoff"] = native_handoff
+    envelope["fallback_advice"] = (
+        "Flash was unavailable before any work started. A native cheap role may take this package; "
+        "record the package-specific flash-unavailable reason with this ledger receipt."
+        if flash_outcome == "unavailable_pre_mutation"
+        else "Flash failed before completing. Review the failure and rescope before using the native handoff; "
+        "check the workspace diff before replaying (a timed-out worker applies nothing)."
+    )
+    text = json.dumps(envelope, ensure_ascii=False, default=str)
+    finalized = _flash_finalize_row(rid, "error", text, reason, None, None)
+    if finalized:
+        try:
+            store_consultation(
+                ProjectInfo(str(row.get("project") or ""), str(row.get("root_path") or str(Path.cwd()))),
+                f"antigravity:{row.get('target_model') or 'flash'}",
+                mode,
+                str(row.get("prompt") or ""),
+                reason,
+                "error",
+                reason,
+                str(row.get("created_at") or utc_now()),
+                request_id=rid,
+                receipt_meta={
+                    "outcome": flash_outcome,
+                    "work_package_id": package_id,
+                    "requested_model": row.get("target_model"),
+                    "attested_model": None,
+                    "attestation": "none",
+                    "mode": mode,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            log(f"flash async failure ledger write failed for {rid}: {exc}")
+    return envelope
+
+
+def _refresh_flash_request(row: dict[str, Any]) -> dict[str, Any]:
+    """Polled-time stale detection: a running row whose worker died or exceeded its cap, or
+    a queued row nothing ever started, becomes a failed request with the SB3 classification."""
+    if row.get("response") or is_terminal_state(row.get("status")):
+        return row
+    status = str(row.get("status") or "").strip().lower()
+    now_epoch = _iso_epoch(utc_now()) or int(time.time())
+    timeout = int(row.get("timeout_seconds") or FLASH_ASYNC_DEFAULT_TIMEOUT_SECONDS)
+    reason = ""
+    failure_kind = None
+    kill_first = False
+    if status == "running":
+        started = _iso_epoch(row.get("worker_started_at")) or _iso_epoch(row.get("created_at")) or now_epoch
+        elapsed = now_epoch - started
+        if elapsed > timeout + FLASH_ASYNC_STALE_GRACE_SECONDS:
+            reason = (
+                f"Antigravity CLI timed out after {timeout} seconds: the async Flash worker exceeded its cap "
+                "without recording a result."
+            )
+            failure_kind = "timeout_exceeded"
+            kill_first = True
+        elif row.get("worker_pid") and elapsed >= 5 and not _pid_alive(row.get("worker_pid")):
+            reason = (
+                f"Antigravity CLI async worker (pid {row.get('worker_pid')}) died before recording a result "
+                f"after {elapsed} seconds."
+            )
+            failure_kind = "worker_dead"
+    elif status in {"queued", "notified"}:
+        created = _iso_epoch(row.get("created_at")) or now_epoch
+        if now_epoch - created > FLASH_ASYNC_QUEUED_STALE_SECONDS:
+            reason = "Antigravity CLI async worker never started for this queued Flash request."
+            failure_kind = "worker_never_started"
+    if not reason:
+        return row
+    if kill_first:
+        _kill_pid_tree(row.get("worker_pid"))
+    _flash_finalize_failure(row, reason, classify=True, failure_kind=failure_kind)
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        updated = conn.execute("SELECT * FROM flash_requests WHERE id = ?", (row.get("id"),)).fetchone()
+    return dict(updated) if updated else row
+
+
+def _flash_cancel_worker(row: Mapping[str, Any]) -> dict[str, Any]:
+    pid = row.get("worker_pid")
+    alive = _pid_alive(pid) if pid else False
+    killed = _kill_pid_tree(pid) if alive else False
+    return {"pid": pid, "was_alive": alive, "killed": killed}
+
+
+def run_flash_request_worker(request_id: str) -> dict[str, Any]:
+    """Detached-worker body: run the SAME consult() Flash dispatch as the sync path, with the
+    per-request async timeout, and record the final envelope on the request row."""
+    init_db()
+    rid = str(request_id or "").strip()
+    if not rid:
+        raise ValueError("request_id is required")
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM flash_requests WHERE id = ?", (rid,)).fetchone()
+        if not row:
+            raise ValueError(f"unknown Flash request: {rid}")
+        data = dict(row)
+        if data.get("response") or is_terminal_state(data.get("status")):
+            return {"id": rid, "status": data.get("status"), "skipped": True, "reason": "already terminal"}
+        conn.execute(
+            """
+            UPDATE flash_requests
+            SET status = 'running', worker_started_at = COALESCE(worker_started_at, ?), worker_pid = ?
+            WHERE id = ?
+            """,
+            (utc_now(), os.getpid(), rid),
+        )
+    args = _flash_row_args(data)
+    timeout = bounded_flash_async_timeout(data.get("timeout_seconds"))
+    args.pop("async", None)
+    args.update(
+        {
+            "timeout_seconds": timeout,
+            "max_response_chars": MAX_CONSULT_RESPONSE_CHARS,
+            "_flash_async_token": _FLASH_ASYNC_INTERNAL_TOKEN,
+            "_flash_receipt_id": rid,
+        }
+    )
+    try:
+        result = consult("antigravity", args)
+    except Exception as exc:  # noqa: BLE001
+        reason = f"Antigravity CLI async worker raised {type(exc).__name__}: {exc}"
+        _flash_finalize_failure(
+            data, reason, classify=False, failure_kind="worker_exception", outcome="failed_pre_mutation"
+        )
+        return {"id": rid, "status": "error", "error": reason[:1000]}
+    if not isinstance(result, dict):
+        result = {"status": "error", "response": str(result)}
+    result["request_id"] = rid
+    full = json.dumps(result, ensure_ascii=False, default=str)
+    response_ref = None
+    try:
+        response_ref = store_shared_context(
+            data.get("project"), data.get("topic"), full, f"flash_async:{rid}",
+            "flash_async_result", None, redact=False,
+        ).get("ref")
+    except Exception as exc:  # noqa: BLE001
+        log(f"flash async result stash failed for {rid}: {exc}")
+    status = "completed" if result.get("status") in {"ok", "blocked", "failed"} else "error"
+    error = None if status == "completed" else str(result.get("response") or result.get("reason") or "")[:2000]
+    finalized = _flash_finalize_row(rid, status, full, error, response_ref, result.get("model"))
+    return {
+        "id": rid,
+        "status": status if finalized else "superseded",
+        "outcome": result.get("outcome"),
+        "receipt": result.get("receipt"),
+        "response_chars": len(full),
+        "response_ref": response_ref,
+    }
+
+
+def _flash_progress(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Live progress for a non-terminal Flash request from the agy transcript (WP-SB3 finder,
+    keyed by package id and launch time). Never raises."""
+    started = _iso_epoch(row.get("worker_started_at")) or _iso_epoch(row.get("created_at"))
+    elapsed = max(0, int(time.time()) - started) if started else None
+    progress: dict[str, Any] = {
+        "elapsed_seconds": elapsed,
+        "steps": 0,
+        "last_action": "",
+        "transcript_found": False,
+    }
+    package_id = str(row.get("work_package_id") or "")
+    if not package_id or started is None:
+        return progress
+    try:
+        transcript = _find_flash_timeout_transcript(package_id, float(started))
+        if transcript is not None:
+            steps, last_action = _read_flash_timeout_transcript_steps(transcript)
+            progress.update({"steps": steps, "last_action": last_action, "transcript_found": True})
+    except Exception as exc:  # noqa: BLE001
+        progress["progress_error"] = type(exc).__name__
+    return progress
+
+
+def _flash_status_fields(row: Mapping[str, Any]) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "work_package_id": row.get("work_package_id"),
+        "receipt": row.get("receipt"),
+        "timeout_seconds": row.get("timeout_seconds"),
+    }
+    if not (row.get("response") or is_terminal_state(row.get("status"))):
+        fields["progress"] = _flash_progress(row)
+    return fields
+
+
+def _flash_request_result(row: dict[str, Any]) -> dict[str, Any]:
+    rid = str(row.get("id") or "")
+    state = canonical_request_state(row.get("status"))
+    created_epoch = _iso_epoch(row.get("created_at"))
+    base: dict[str, Any] = {
+        "id": rid,
+        "request_id": rid,
+        "found": True,
+        "kind": "flash",
+        "state": state,
+        "work_package_id": row.get("work_package_id"),
+        "receipt": row.get("receipt"),
+    }
+    response = row.get("response")
+    if not response:
+        progress = _flash_progress(row)
+        base.update(
+            {
+                "answered": False,
+                "elapsed_seconds": progress.get("elapsed_seconds"),
+                "progress": progress,
+                "poll": {"tool": "request_result", "request_id": rid, "wait_seconds": 180},
+                "note": (
+                    f"Flash package still {state} ({progress.get('steps', 0)} agy steps"
+                    + (f"; last: {progress['last_action']}" if progress.get("last_action") else "")
+                    + f'). Call request_result(request_id="{rid}", wait_seconds=180) again.'
+                ),
+            }
+        )
+        return base
+    try:
+        envelope = json.loads(response)
+    except (json.JSONDecodeError, TypeError):
+        envelope = None
+    if not isinstance(envelope, dict):
+        envelope = {"status": "error" if state != "completed" else "ok", "response": str(response)}
+    merged = dict(envelope)
+    for key in ("id", "found", "kind", "state"):
+        merged[key] = base[key]
+    for key in ("request_id", "work_package_id", "receipt"):
+        if not merged.get(key):
+            merged[key] = base[key]
+    merged["answered"] = True
+    merged["completed_at"] = row.get("completed_at")
+    if created_epoch and merged.get("elapsed_seconds") is None:
+        merged["elapsed_seconds"] = max(0, (_iso_epoch(row.get("completed_at")) or int(time.time())) - created_epoch)
+    if row.get("response_ref") and not merged.get("response_ref"):
+        merged["response_ref"] = row.get("response_ref")
+    return apply_response_envelope_budget(
+        merged, row.get("max_response_chars"), row.get("project"), row.get("topic"), "request_result:flash"
+    )
+
+
 def ledger_path(project_info: ProjectInfo, topic: str | None) -> Path:
     return BROKER_DIR / "topics" / safe_slug(project_info.name) / safe_slug(topic or "all") / "ledger.md"
 
@@ -10283,8 +11044,13 @@ def _terminal_sql() -> str:
 # All Q&A request tables share id/project/topic/prompt/status/response/created_at/
 # completed_at/responder/responder_model/target_model, so status/result/cancel/reap
 # operate over them uniformly.
-_REQUEST_TABLES = ("codex_requests", "antigravity_requests", "claude_requests")
-_REQUEST_KIND = {"codex_requests": "codex", "antigravity_requests": "antigravity", "claude_requests": "claude"}
+_REQUEST_TABLES = ("codex_requests", "antigravity_requests", "claude_requests", "flash_requests")
+_REQUEST_KIND = {
+    "codex_requests": "codex",
+    "antigravity_requests": "antigravity",
+    "claude_requests": "claude",
+    "flash_requests": "flash",
+}
 
 
 def _find_request(rid: str) -> tuple[str, dict[str, Any]] | None:
@@ -10304,6 +11070,8 @@ def _refresh_stale_codex_request(table: str, row: dict[str, Any]) -> dict[str, A
     """Turn abandoned codex/claude worker requests into terminal errors when polled.
     (Name kept for call-site compatibility; since v1.0.19 it also covers claude_requests,
     whose queued rows previously sat 'queued' forever when nothing picked the inbox up.)"""
+    if table == "flash_requests":
+        return _refresh_flash_request(row)
     if table not in ("codex_requests", "claude_requests") or row.get("response") or is_terminal_state(row.get("status")):
         return row
     agent_label = "Codex" if table == "codex_requests" else "Claude"
@@ -10547,7 +11315,7 @@ def request_status(request_id: str, wait_seconds: Any = None) -> dict[str, Any]:
         and "unverified" not in responder_model
         and "<synthetic>" not in responder_model
     )
-    return {
+    status_payload = {
         "id": rid,
         "found": True,
         "kind": _REQUEST_KIND.get(table, table),
@@ -10565,6 +11333,9 @@ def request_status(request_id: str, wait_seconds: Any = None) -> dict[str, Any]:
         "completed_at": row.get("completed_at"),
         "latency": _latency(row.get("created_at"), row.get("completed_at")),
     }
+    if table == "flash_requests":
+        status_payload.update(_flash_status_fields(row))
+    return status_payload
 
 
 def request_result(request_id: str, wait_seconds: Any = None) -> dict[str, Any]:
@@ -10580,6 +11351,8 @@ def request_result(request_id: str, wait_seconds: Any = None) -> dict[str, Any]:
     if not polled:
         return {"id": rid, "found": False, "error": "unknown request id"}
     table, row = polled
+    if table == "flash_requests":
+        return _flash_request_result(row)
     decision_update = _reconcile_terminal_decision_request(rid, row)
     response = row.get("response")
     state = canonical_request_state(row.get("status"))
@@ -10632,6 +11405,11 @@ def cancel_request(request_id: str, reason: str | None = None) -> dict[str, Any]
                 "note": "already terminal; left unchanged"}
     now = utc_now()
     note = f"cancelled: {reason}" if reason else "cancelled via broker"
+    killed = None
+    if table == "flash_requests":
+        # Take the worker (and its agy child tree) down; the row is then marked cancelled
+        # below and every worker/refresh finalizer refuses to overwrite a terminal row.
+        killed = _flash_cancel_worker(row)
     with db_connect() as conn:
         conn.execute(
             f"""
@@ -10646,7 +11424,10 @@ def cancel_request(request_id: str, reason: str | None = None) -> dict[str, Any]
         render_request_ledger(row.get("project"), row.get("topic"))
     except Exception as exc:  # noqa: BLE001
         log(f"ledger refresh after cancel failed: {exc}")
-    return {"id": rid, "found": True, "kind": kind, "cancelled": True, "state": "cancelled"}
+    cancelled_payload = {"id": rid, "found": True, "kind": kind, "cancelled": True, "state": "cancelled"}
+    if killed is not None:
+        cancelled_payload["worker_killed"] = killed
+    return cancelled_payload
 
 
 def reap_stale_requests(max_age_hours: float = 24.0) -> dict[str, Any]:
@@ -11954,9 +12735,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
         antigravity_mode = args.get("mode")
         if not antigravity_mode:
             antigravity_mode = "accept-edits" if task_kind == "implementation" else "plan"
-        result = consult(
-            "antigravity",
-            {
+        flash_args = {
                 "project": project,
                 "topic": topic,
                 "prompt": prompt,
@@ -11976,8 +12755,13 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "acceptance_criteria": args.get("acceptance_criteria"),
                 "forbidden_actions": args.get("forbidden_actions"),
                 "research_questions": args.get("research_questions"),
-            },
-        )
+            }
+        flash_async, flash_async_reason = flash_async_decision(args, antigravity_mode)
+        if flash_async:
+            result = queue_flash_request(flash_args)
+            result["async_reason"] = flash_async_reason
+        else:
+            result = consult("antigravity", flash_args)
         result["route"] = "antigravity_cli"
         result["surface"] = "cli"
         if surface_note:
@@ -12338,7 +13122,13 @@ TOOLS = [
                 },
                 "async": {
                     "type": "boolean",
-                    "description": "For Claude targets, queue through the Claude inbox and return a request id instead of waiting on the synchronous CLI.",
+                    "description": "Run detached and return a request id immediately; collect with request_result(request_id, wait_seconds=180). Claude targets queue through the Claude inbox. Antigravity/Flash CLI packages default to async=true for accept-edits/implementation and research (60-minute cap, see timeout_seconds); quick_check/search stay sync. An explicit async always wins.",
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 15,
+                    "maximum": 10800,
+                    "description": "Per-call cap. Sync calls are bounded to the 240 s window; an async Flash package is bounded to [240, 10800] seconds (default 3600, env AGENT_BROKER_FLASH_ASYNC_TIMEOUT_SECONDS).",
                 },
                 "force_sync": {
                     "type": "boolean",
@@ -15371,7 +16161,7 @@ def handle_bridge_cli(argv: list[str]) -> int:
             "claude-responses [project] | status <request_id> | result <request_id> | "
             "cancel <request_id> [reason] | reap [max_age_hours] | "
             "debate <project> <topic> <proposition> [rounds] [sideA[:model[:effort]]] [sideB[:model[:effort]]] | "
-            "codex-notified <request_id> | run-codex-request <request_id> | run-claude-request <request_id> | completed-unnotified [limit] | completion-notified <request_id> | "
+            "codex-notified <request_id> | run-codex-request <request_id> | run-claude-request <request_id> | run-flash-request <request_id> | completed-unnotified [limit] | completion-notified <request_id> | "
             "context-pack [project] [topic] [budget] | context-retrieve <ref> [query] [limit] | "
             "context-stats [project] [topic] | chat-bootstrap [project] [topic] [target_agent] [budget] | "
             "work-memory [project] [topic] [limit] | "
@@ -15533,6 +16323,10 @@ def handle_bridge_cli(argv: list[str]) -> int:
         if len(argv) < 2:
             raise ValueError("run-claude-request requires <request_id>")
         result = run_claude_request_worker(argv[1])
+    elif command == "run-flash-request":
+        if len(argv) < 2:
+            raise ValueError("run-flash-request requires <request_id>")
+        result = run_flash_request_worker(argv[1])
     elif command == "completed-unnotified":
         limit = int(argv[1]) if len(argv) > 1 else 20
         result = get_unnotified_antigravity_completions(limit)

@@ -188,6 +188,14 @@ On Windows, Switchboard-owned bounded subprocesses use hidden-window flags and a
 
 ## Changelog
 
+### v1.0.53 (WP-SB10: async Flash lane -- long agy packages no longer die at the 240 s sync cap)
+- **Flash implementation and research packages now run in a detached worker.** `route_agent_task` with `target_agent="antigravity"` (CLI surface) defaults to async for `mode="accept-edits"` and for `task_kind` research/implementation; `quick_check`/`search` stay sync, and an explicit `async` always wins. The worker reuses the Codex/Claude pattern (request row, detached `run-flash-request` bridge process, `request_status`/`request_result` polling) and runs the same `consult()` dispatch -- staging, agy, structured validation, apply -- with a per-call `timeout_seconds` bounded to 240-10800 s (default 3600 s, env `AGENT_BROKER_FLASH_ASYNC_TIMEOUT_SECONDS`).
+- **Immediate return:** `status` queued/running, `request_id`, `work_package_id`, the broker `receipt` (issued at queue time), `async_worker {started, pid, timeout_seconds, log}` and a `poll` hint, all inside the response envelope budget.
+- **Polling:** while running, `request_result`/`request_status` show elapsed seconds plus live agy step count and last action from the transcript; when done, the final envelope under the stored `max_response_chars` (full result under `response_ref`). A dead or overdue worker is failed with the WP-SB3 timeout classification and the `flash-failed`/`flash-unavailable` native handoff.
+- **Cancel** (`cancel` verb / tool) now kills the Flash worker and its agy process tree. **Overlap guard:** a new accept-edits package whose write/create paths overlap a queued or running Flash package is refused with the conflicting request_id.
+- **Gate relief:** a successfully started async package earns exactly one relief (deduped by request_id; a later completed result never credits twice; failed starts earn nothing).
+- `tests/conftest.py` now forbids any test from spawning a real Flash worker. See `RELEASE_NOTES_v1.0.53.md` for the exact pytest evidence.
+
 ### v1.0.52 (WP-SB9: explicit versioned Claude model ids, never-fall-back-to-Opus)
 - **A versioned Claude request now resolves to an explicit model id, never a bare CLI alias.** A Codex host asking for "opus 5.5" previously matched the bare `opus` catalog alias, and `claude --model opus` resolved inside the installed Claude CLI's own (possibly stale) alias table -- silently running Opus 4.8 instead of 5.5. Static catalog entries for `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5`, and `claude-haiku-4-5-20251001` now match their versioned aliases exactly; the bare `fable`/`opus`/`sonnet`/`haiku` entries keep only unversioned aliases.
 - **New generic versioned-model parser** (`parse_claude_versioned_model`) handles any Claude version not in the static catalog (e.g. "sonnet 5.2" -> `claude-sonnet-5-2`, "opus 4.8" -> `claude-opus-4-8`), used only when no exact catalog alias matches.

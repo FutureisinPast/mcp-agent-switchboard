@@ -2280,6 +2280,89 @@ def _receipt_resolves(receipt: str) -> bool:
         return False
 
 
+def _async_flash_started(result: dict) -> str | None:
+    """request_id of an async Flash package that was SUCCESSFULLY started, else None.
+
+    The started signal is exactly: status queued/running, async_worker.started true, and
+    a request_id present. A failed start (started false, or no id) earns nothing."""
+    request_id = str(result.get("request_id") or "").strip()
+    worker = result.get("async_worker")
+    if not request_id or not isinstance(worker, dict) or worker.get("started") is not True:
+        return None
+    if str(result.get("status") or "").strip().lower() not in {"queued", "running"}:
+        return None
+    return request_id
+
+
+def _flash_request_resolves(request_id: str) -> bool:
+    """True when the id names a real queued Flash request row (fails CLOSED like
+    _receipt_resolves: a fabricated id must never buy relief)."""
+    if not request_id:
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM flash_requests WHERE id = ? LIMIT 1", (request_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return bool(row)
+    except sqlite3.Error:
+        return False
+
+
+def _credit_async_flash_start(
+    session_id: str, normalized_tool: str, result: dict, request_id: str
+) -> dict | None:
+    """ONE relief for a successfully started async Flash package, deduped by request_id.
+
+    The credit key is the request's own broker receipt (broker:<request_id>), so any later
+    credit path that sees the same request (a completed_verified result) is a replay and
+    buys nothing."""
+    receipt = f"broker:{request_id}"
+    work_package = str(result.get("work_package_id") or "") or "unnamed-package"
+    details = {"receipt": receipt, "request_id": request_id[:200], "work_package_id": work_package[:200]}
+    if not BROKER_RECEIPT_RE.search(receipt) or not _flash_request_resolves(request_id):
+        log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "no-credit",
+                          extra={"reason": "async request does not resolve in the ledger", **details})
+        return None
+
+    granted = {"value": False}
+
+    def update(state: dict) -> None:
+        credited = state.setdefault("credited_receipts", [])
+        if receipt in credited:
+            return
+        credited.append(receipt)
+        state["direct_labour_since_relief"] = 0
+        state["direct_labour_block_counts"] = {}
+        state["labour_relief_sequence"] = int(state.get("labour_relief_sequence") or 0) + 1
+        dispatches = state.setdefault("switchboard_dispatches", [])
+        dispatches.append({"receipt": receipt, "work_package_id": work_package, "outcome": "async_started",
+                           "request_id": request_id})
+        granted["value"] = True
+
+    _update_state(session_id, update)
+    if not granted["value"]:
+        log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "no-credit",
+                          extra={"reason": "request already credited", **details})
+        return None
+    log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "credit",
+                      extra={"async": True, **details})
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": (
+                f"Routing credit: {work_package} started on the async Flash workhorse lane "
+                f"({receipt}); the next bounded block is open. Collect the result with "
+                f"request_result(request_id=\"{request_id}\", wait_seconds=180). The result is EVIDENCE, "
+                "not acceptance: check cited lines, the actual diff, and check output first."
+            ),
+        }
+    }
+
+
 def _credit_switchboard_dispatch(session_id: str, normalized_tool: str, payload: dict) -> dict | None:
     """Grant one bounded block for a dispatch that actually completed.
 
@@ -2300,6 +2383,9 @@ def _credit_switchboard_dispatch(session_id: str, normalized_tool: str, payload:
                    "response_type": type(payload.get("tool_response")).__name__},
         )
         return None
+    async_request_id = _async_flash_started(result)
+    if async_request_id:
+        return _credit_async_flash_start(session_id, normalized_tool, result, async_request_id)
     receipt = str(result.get("receipt") or "")
     outcome = str(result.get("outcome") or "")
     work_package = str(result.get("work_package_id") or "") or "unnamed-package"
