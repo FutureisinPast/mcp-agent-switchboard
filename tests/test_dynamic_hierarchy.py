@@ -973,7 +973,7 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         joined = " | ".join(errors)
         self.assertIn("completed contradicts non-empty ambiguities", joined)
         self.assertIn("out-of-scope file reported", joined)
-        self.assertIn("acceptance criteria do not exactly match", joined)
+        self.assertIn("does not correspond to the dispatched criterion", joined)
         self.assertIn("intentional/by-design claim lacks observed primary evidence", joined)
 
     def test_consult_marks_flash_completion_pending_brain_verification(self):

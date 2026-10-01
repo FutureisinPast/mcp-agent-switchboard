@@ -3873,7 +3873,8 @@ def native_semantic_lane(args: dict[str, Any], task_kind: Any = None) -> str:
 
 
 def native_handoff_for_flash_outcome(
-    args: dict[str, Any], outcome: str | None, receipt: str | None
+    args: dict[str, Any], outcome: str | None, receipt: str | None,
+    quarantine_files: list[str] | None = None, quarantine_diff: str | None = None,
 ) -> dict[str, Any] | None:
     """Describe, but never launch, the Codex/Claude native fallback for failed Flash work."""
     if outcome == FLASH_OUTCOME_CREDITABLE or not receipt:
@@ -3910,6 +3911,12 @@ def native_handoff_for_flash_outcome(
         "auto_launch": False,
         "action": "Start the named current native role with the same bounded package only after applying any review caveat.",
     }
+    if quarantine_files or quarantine_diff:
+        handoff["quarantine_files"] = list(quarantine_files or [])
+        handoff["quarantine_diff"] = quarantine_diff
+        handoff["salvage_note"] = (
+            "The worker's edited files are kept in quarantine for review only; they were NOT applied."
+        )
     if needs_review:
         handoff["brain_review"] = {
             "required": True,
@@ -4863,11 +4870,23 @@ def validate_flash_workhorse_result(
         for item in criteria
         if isinstance(item, dict)
     ]
-    if expected_criteria and (
-        len(reported_criteria) != len(expected_criteria)
-        or set(reported_criteria) != set(expected_criteria)
-    ):
-        errors.append("reported acceptance criteria do not exactly match the dispatched package")
+    if expected_criteria:
+        if len(reported_criteria) != len(expected_criteria):
+            errors.append("reported acceptance criteria do not match the dispatched package: count differs")
+        else:
+            for index, (want, got) in enumerate(zip(expected_criteria, reported_criteria), 1):
+                verdict = _criterion_match(want, got)
+                if verdict == "missing":
+                    errors.append(
+                        f"reported acceptance criterion {index} does not correspond to the dispatched criterion"
+                    )
+                elif verdict == "paraphrased":
+                    caveats.append(
+                        {
+                            "code": "acceptance_criterion_paraphrased",
+                            "detail": f"criterion {index} was reported with different wording than dispatched",
+                        }
+                    )
     if worker_status == "completed":
         if ambiguities:
             errors.append("status=completed contradicts non-empty ambiguities")
@@ -4906,6 +4925,27 @@ def validate_flash_workhorse_result(
                 }
             )
     return structured, errors
+
+
+def _normalize_criterion(text: Any) -> str:
+    value = str(text or "").lower()
+    value = value.replace("‘", "'").replace("’", "'").replace("“", '"').replace("”", '"')
+    value = re.sub(r"[`'\"]", "", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _criterion_match(dispatched: Any, reported: Any) -> str:
+    """Compare one reported acceptance criterion to the dispatched one at the same
+    index: 'exact' after whitespace/quote/case normalisation, 'paraphrased' when the
+    word-token overlap is at least 0.6, else 'missing'."""
+    want, got = _normalize_criterion(dispatched), _normalize_criterion(reported)
+    if want == got:
+        return "exact"
+    want_tokens, got_tokens = set(re.findall(r"\w+", want)), set(re.findall(r"\w+", got))
+    if want_tokens and got_tokens:
+        if len(want_tokens & got_tokens) / min(len(want_tokens), len(got_tokens)) >= 0.6:
+            return "paraphrased"
+    return "missing"
 
 
 def infer_target_agent(target_agent: Any, target_model: Any = None) -> str:
@@ -5850,9 +5890,37 @@ def _find_flash_timeout_transcript(package_id: str, launched_at: float) -> Path 
     return None
 
 
+def _flash_transcript_line_action(data: dict[str, Any]) -> str:
+    """Best human-readable action for one agy transcript line, or "".
+
+    Real lines look like {"step_index", "source", "type", "status", "tool_calls":
+    [{"name", "args": {"toolAction", "toolSummary", ...}}]} -- the action text lives
+    inside the LAST tool call's args, not at the top level. Older/other shapes with a
+    top-level toolAction/toolSummary are still honoured."""
+    top = data.get("toolAction") or data.get("toolSummary")
+    if top:
+        return str(top)
+    calls = data.get("tool_calls")
+    if isinstance(calls, list):
+        for call in reversed(calls):
+            if not isinstance(call, dict):
+                continue
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            text = args.get("toolAction") or args.get("toolSummary")
+            if text:
+                return str(text)
+            name = str(call.get("name") or "").strip()
+            if name:
+                target = args.get("TargetFile") or args.get("AbsolutePath") or args.get("CommandLine") or ""
+                target = str(target).replace("\\", "/").rsplit("/", 1)[-1] if target else ""
+                return f"{name} {target}".strip()
+    return ""
+
+
 def _read_flash_timeout_transcript_steps(transcript: Path) -> tuple[int, str]:
     """Count non-blank transcript lines AFTER the first (bounded), and recover
-    the last parseable line's toolAction/toolSummary, capped to 200 chars.
+    the most recent action text (tool_calls[].args.toolAction/toolSummary, else the
+    tool name), capped to 200 chars.
 
     The first line is the run header carrying the 'Package ID: <id>' marker
     already matched in _find_flash_timeout_transcript -- it is not a model
@@ -5860,7 +5928,7 @@ def _read_flash_timeout_transcript_steps(transcript: Path) -> tuple[int, str]:
     counts as zero steps (startup_stall), not one.
     """
     steps = 0
-    last_parsed: dict[str, Any] | None = None
+    last_action = ""
     bytes_read = 0
     with transcript.open("r", encoding="utf-8", errors="replace") as f:
         first_line = True
@@ -5877,14 +5945,11 @@ def _read_flash_timeout_transcript_steps(transcript: Path) -> tuple[int, str]:
                 except Exception:
                     data = None
                 if isinstance(data, dict):
-                    last_parsed = data
+                    action = _flash_transcript_line_action(data)
+                    if action:
+                        last_action = action[:FLASH_TIMEOUT_LAST_ACTION_CHARS]
             if bytes_read >= FLASH_TIMEOUT_TRANSCRIPT_BYTE_CAP or steps >= FLASH_TIMEOUT_TRANSCRIPT_LINE_CAP:
                 break
-    last_action = ""
-    if last_parsed:
-        action = last_parsed.get("toolAction") or last_parsed.get("toolSummary")
-        if action:
-            last_action = str(action)[:FLASH_TIMEOUT_LAST_ACTION_CHARS]
     return steps, last_action
 
 
@@ -6045,6 +6110,7 @@ def consult_antigravity_cli(
     )
     apply_report: dict[str, Any] | None = None
     staging_changes: dict[str, Any] | None = None
+    salvage: dict[str, Any] | None = None
     flash_launch_epoch = time.time()
     try:
         code, stdout, stderr = run_process(
@@ -6057,6 +6123,10 @@ def consult_antigravity_cli(
         # worth catching is a worker that created or rewrote something it never
         # mentioned. The tree is small by construction, so this walk is total.
         staging_changes = flash_manifest.collect_changes(staged)
+        if implementation_mode:
+            # Copy the worker's edited/created allowed files out BEFORE the staging tree
+            # is removed, so a rejected or failed package can still be reviewed/salvaged.
+            salvage = _collect_flash_salvage(staged, staging_changes)
         # Validate BEFORE touching the real tree. Applying first and validating
         # afterwards meant a dispatch could mutate the workspace and still report
         # failure to the caller -- the exact opposite of "a failure applies
@@ -6097,7 +6167,7 @@ def consult_antigravity_cli(
         reasons = apply_report.get("reasons") or []
         quarantine = _quarantine_rejected(
             package.get("package_id"), stdout, stderr, pre_outer_payload,
-            pre_validation_failures or reasons,
+            pre_validation_failures or reasons, salvage=salvage,
         )
         return (
             "Antigravity CLI structured-output validation failed: the package was refused "
@@ -6112,9 +6182,22 @@ def consult_antigravity_cli(
             timeout_meta_out.update(
                 _classify_flash_timeout(str(package.get("package_id") or ""), flash_launch_epoch)
             )
-        return consult_timeout_message("Antigravity CLI", timeout, stdout)
+        timeout_quarantine = (
+            _quarantine_rejected(package.get("package_id"), stdout, stderr, None,
+                                 ["agy timed out"], salvage=salvage)
+            if salvage and salvage.get("files") else None
+        )
+        return consult_timeout_message("Antigravity CLI", timeout, stdout) + _quarantine_suffix(timeout_quarantine)
     if code != 0:
-        return f"Antigravity CLI exited with code {code}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}".strip()
+        exit_quarantine = (
+            _quarantine_rejected(package.get("package_id"), stdout, stderr, None,
+                                 [f"agy exited with code {code}"], salvage=salvage)
+            if salvage and salvage.get("files") else None
+        )
+        return (
+            f"Antigravity CLI exited with code {code}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}".strip()
+            + _quarantine_suffix(exit_quarantine)
+        )
     raw = stdout or stderr
     # agy auto-denies every tool in headless print mode and can exit 0 with status
     # SUCCESS and an empty response; the only explanation for that lives on stderr.
@@ -6126,7 +6209,7 @@ def consult_antigravity_cli(
         stderr_note += f" | full log: {stderr_log}"
     if not raw:
         quarantine = _quarantine_rejected(
-            package.get("package_id"), stdout, stderr, None, ["agy returned no output"]
+            package.get("package_id"), stdout, stderr, None, ["agy returned no output"], salvage=salvage
         )
         return (
             "Antigravity CLI structured-output validation failed: agy returned no output."
@@ -6136,7 +6219,7 @@ def consult_antigravity_cli(
         outer = json.loads(raw)
     except json.JSONDecodeError as exc:
         quarantine = _quarantine_rejected(
-            package.get("package_id"), stdout, stderr, None, [f"invalid JSON ({exc})"]
+            package.get("package_id"), stdout, stderr, None, [f"invalid JSON ({exc})"], salvage=salvage
         )
         return (
             f"Antigravity CLI structured-output validation failed: invalid JSON ({exc})."
@@ -6146,7 +6229,7 @@ def consult_antigravity_cli(
     structured, validation_errors = validate_flash_workhorse_result(outer, package, caveats_out=caveats)
     if validation_errors:
         quarantine = _quarantine_rejected(
-            package.get("package_id"), stdout, stderr, outer, validation_errors
+            package.get("package_id"), stdout, stderr, outer, validation_errors, salvage=salvage
         )
         return (
             "Antigravity CLI structured-output validation failed: " + "; ".join(validation_errors)
@@ -6163,7 +6246,7 @@ def consult_antigravity_cli(
     conflict = attested_model_conflict(model_name, attested_model)
     if conflict:
         quarantine = _quarantine_rejected(
-            package.get("package_id"), stdout, stderr, outer, [conflict]
+            package.get("package_id"), stdout, stderr, outer, [conflict], salvage=salvage
         )
         return (
             "Antigravity CLI structured-output validation failed: " + conflict
@@ -6359,7 +6442,8 @@ def _quarantine_rejected(
     stderr: str,
     payload: dict[str, Any] | None,
     validation_failures: list[str],
-) -> dict[str, str] | None:
+    salvage: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Atomically write the raw worker stdout/stderr, the parsed payload (if
     any), and a manifest with sha256+sizes to the quarantine bundle for one
     rejected dispatch. Returns {"quarantine_path", "quarantine_sha256"} on
@@ -6392,6 +6476,31 @@ def _quarantine_rejected(
                 "bytes": len(data),
                 "truncated": was_truncated,
             }
+        quarantine_files: list[str] = []
+        quarantine_diff: str | None = None
+        if salvage:
+            # The worker's edited/created allowed files and a unified diff against the
+            # original workspace files. Review-only: NEVER applied to the workspace.
+            for rel, blob in (salvage.get("files") or {}).items():
+                target_rel = f"files/{rel}"
+                data = blob[:cap]
+                _write_bytes(bundle_dir / target_rel, data)
+                manifest_files[target_rel] = {
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "bytes": len(data),
+                    "truncated": len(blob) > cap,
+                }
+                quarantine_files.append(target_rel)
+            diff_text = salvage.get("diff") or ""
+            if diff_text:
+                diff_bytes = diff_text.encode("utf-8", errors="replace")
+                _write_bytes(bundle_dir / "changes.diff", diff_bytes)
+                manifest_files["changes.diff"] = {
+                    "sha256": hashlib.sha256(diff_bytes).hexdigest(),
+                    "bytes": len(diff_bytes),
+                    "truncated": False,
+                }
+                quarantine_diff = "changes.diff"
         manifest = {
             "package_id": package_id,
             "created_at": utc_now(),
@@ -6407,18 +6516,65 @@ def _quarantine_rejected(
         manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2)
         atomic_io.atomic_write_text(bundle_dir / "manifest.json", manifest_text, encoding="utf-8")
         manifest_sha256 = hashlib.sha256(manifest_text.encode("utf-8")).hexdigest()
-        return {"quarantine_path": str(bundle_dir), "quarantine_sha256": manifest_sha256}
+        return {
+            "quarantine_path": str(bundle_dir),
+            "quarantine_sha256": manifest_sha256,
+            "quarantine_files": quarantine_files,
+            "quarantine_diff": quarantine_diff,
+        }
     except Exception as exc:  # noqa: BLE001
         log(f"quarantine write failed: {exc}")
         return None
 
 
-def _quarantine_suffix(quarantine: dict[str, str] | None) -> str:
+def _write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def _collect_flash_salvage(staged: Any, changes: dict[str, Any]) -> dict[str, Any]:
+    """Snapshot the changed allowed_writes / allowed_creates files from the staging tree
+    (bytes) plus a unified diff against the original workspace files. Best-effort."""
+    import difflib
+
+    files: dict[str, bytes] = {}
+    diff_parts: list[str] = []
+    wanted = [(rel, staged.write_targets[rel]) for rel in changes.get("modified", []) if rel in staged.write_targets]
+    wanted += [(rel, staged.create_targets[rel]) for rel in changes.get("created", []) if rel in staged.create_targets]
+    for rel, real in wanted:
+        try:
+            new_bytes = staged.staged_path(rel).read_bytes()
+        except OSError:
+            continue
+        files[rel] = new_bytes
+        try:
+            old_text = real.read_text(encoding="utf-8", errors="replace") if real.exists() else ""
+        except OSError:
+            old_text = ""
+        new_text = new_bytes.decode("utf-8", errors="replace")
+        diff_parts.extend(
+            difflib.unified_diff(
+                old_text.splitlines(keepends=True), new_text.splitlines(keepends=True),
+                fromfile=f"a/{rel}", tofile=f"b/{rel}",
+            )
+        )
+        if diff_parts and not diff_parts[-1].endswith("\n"):
+            diff_parts.append("\n")
+    return {"files": files, "diff": "".join(diff_parts)}
+
+
+def _quarantine_suffix(quarantine: dict[str, Any] | None) -> str:
     if not quarantine:
         return ""
+    salvage_note = ""
+    if quarantine.get("quarantine_files"):
+        salvage_note = f" | quarantine_files: {json.dumps(quarantine['quarantine_files'])}"
+    if quarantine.get("quarantine_diff"):
+        salvage_note += f" | quarantine_diff: {quarantine['quarantine_diff']}"
     return (
         f" | quarantine_path: {quarantine['quarantine_path']}"
         f" | quarantine_sha256: {quarantine['quarantine_sha256']}"
+        + salvage_note +
         " | artifact_disposition: quarantined_untrusted"
         " | quarantined artifacts were NOT accepted and NOT applied."
     )
@@ -6427,6 +6583,20 @@ def _quarantine_suffix(quarantine: dict[str, str] | None) -> str:
 _QUARANTINE_SUFFIX_RE = re.compile(
     r"quarantine_path: (?P<path>.+?) \| quarantine_sha256: (?P<sha>[0-9a-f]{64})"
 )
+_QUARANTINE_FILES_RE = re.compile(r"\| quarantine_files: (?P<files>\[[^\]]*\])")
+_QUARANTINE_DIFF_RE = re.compile(r"\| quarantine_diff: (?P<diff>[^\s|]+)")
+
+
+def _quarantine_salvage_from_response(response: str) -> tuple[list[str], str | None]:
+    files: list[str] = []
+    match = _QUARANTINE_FILES_RE.search(response or "")
+    if match:
+        try:
+            files = [str(item) for item in json.loads(match.group("files"))]
+        except (json.JSONDecodeError, TypeError):
+            files = []
+    diff_match = _QUARANTINE_DIFF_RE.search(response or "")
+    return files, (diff_match.group("diff") if diff_match else None)
 
 
 def _rejection_validation_failures(response: str) -> list[str]:
@@ -7242,7 +7412,13 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             result["receipt"] = f"broker:{consult_request_id}" if consult_request_id else None
             result["outcome"] = flash_outcome
             result["credit_eligible"] = flash_outcome == FLASH_OUTCOME_CREDITABLE
-            native_handoff = native_handoff_for_flash_outcome(args, flash_outcome, result["receipt"])
+            salvage_files, salvage_diff = _quarantine_salvage_from_response(response)
+            if salvage_files or salvage_diff:
+                result["quarantine_files"] = salvage_files
+                result["quarantine_diff"] = salvage_diff
+            native_handoff = native_handoff_for_flash_outcome(
+                args, flash_outcome, result["receipt"], salvage_files, salvage_diff
+            )
             if native_handoff is not None:
                 result["native_handoff"] = native_handoff
             result["requested_model"] = resolved_model
@@ -12694,6 +12870,11 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "token_budget": token_budget,
                 "target_model": target_model,
                 "effort": resolved_effort,
+                # The route already resolved the effort (explicit arg or the WP-SB2
+                # ladder); without this flag consult()'s serious-task policy would
+                # force it back up to max.
+                "user_requested_effort": bool(resolved_effort),
+                "outbound_reviewed": truthy(args.get("outbound_reviewed")),
                 "max_response_chars": args.get("max_response_chars"),
                 "timeout_seconds": args.get("timeout_seconds"),
             },
@@ -12717,6 +12898,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "token_budget": token_budget,
                 "target_model": target_model,
                 "effort": resolved_effort,
+                "outbound_reviewed": truthy(args.get("outbound_reviewed")),
                 "max_response_chars": args.get("max_response_chars"),
                 "timeout_seconds": args.get("timeout_seconds"),
                 "new_chat": new_chat,

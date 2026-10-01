@@ -168,7 +168,7 @@ _ALLOW_SIGNAL_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 _REWORDED_RETRY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
-        r"(?:reword|rephrase|retry|resend|re-send)\w*\s+.{0,60}(?:previous|earlier|prior|blocked)",
+        r"(?:reword\w*|rephras\w*|retry|retries|retried|retrying|resend\w*|re-send\w*)\s+.{0,60}\b(?:blocked|flagged|screened|filtered|refused|rejected|held)\b",
         r"(?:previous|earlier|prior)\s+(?:request|payload|message)\s+was\s+blocked",
     )
 )

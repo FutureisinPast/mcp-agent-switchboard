@@ -188,6 +188,14 @@ On Windows, Switchboard-owned bounded subprocesses use hidden-window flags and a
 
 ## Changelog
 
+### v1.0.54 (WP-SB12: route approval/effort fixes, false reworded-retry hold, Flash salvage)
+- **`route_agent_task` codex_cli/claude_code now forwards `outbound_reviewed`** to `consult()`, so the stored `codex_requests` row carries the approval and an approved `needs_owner_review` request is no longer held again.
+- **The WP-SB2 effort ladder now actually reaches the dispatch.** The route marks its resolved effort as caller-requested so `consult()` stops forcing every serious Astra consult back to max: bounded -> high, unrated -> xhigh, risk flag -> max, explicit effort wins (sync and async).
+- **Outbound screen:** "retry/resend ... previous/earlier/prior" is no longer a reworded retry by itself; the window must contain an explicit screened-request word (blocked, flagged, screened, filtered, refused, rejected, held).
+- **Flash acceptance criteria** are matched by position and count with whitespace/quote/case normalised; a same-index paraphrase (token overlap >= 0.6) is a caveat. Count mismatch, a failed criterion or an unrelated criterion still reject.
+- **A rejected or failed accept-edits package keeps its work:** changed allowed files plus `changes.diff` are copied into quarantine (never applied) and reported as `quarantine_files` / `quarantine_diff` in the result and `native_handoff`.
+- **Async progress `last_action`** is now read from the real agy transcript (`tool_calls[].args.toolAction/toolSummary`).
+
 ### v1.0.53 (WP-SB10: async Flash lane -- long agy packages no longer die at the 240 s sync cap)
 - **Flash implementation and research packages now run in a detached worker.** `route_agent_task` with `target_agent="antigravity"` (CLI surface) defaults to async for `mode="accept-edits"` and for `task_kind` research/implementation; `quick_check`/`search` stay sync, and an explicit `async` always wins. The worker reuses the Codex/Claude pattern (request row, detached `run-flash-request` bridge process, `request_status`/`request_result` polling) and runs the same `consult()` dispatch -- staging, agy, structured validation, apply -- with a per-call `timeout_seconds` bounded to 240-10800 s (default 3600 s, env `AGENT_BROKER_FLASH_ASYNC_TIMEOUT_SECONDS`).
 - **Immediate return:** `status` queued/running, `request_id`, `work_package_id`, the broker `receipt` (issued at queue time), `async_worker {started, pid, timeout_seconds, log}` and a `poll` hint, all inside the response envelope budget.
