@@ -142,7 +142,15 @@ SWITCHBOARD_EVIDENCE_EXEMPT_TOOLS = {
     "request_status", "request_result", "compact_topic",
 }
 CODE_GRAPH_TOOLS = {"code_graph", "code-graph"}
-CODE_GRAPH_EXEMPT_OPS = {"locate", "expand", "path", "stats", "health"}
+CODE_GRAPH_EXEMPT_OPS = {
+    "locate",
+    "expand",
+    "path",
+    "stats",
+    "health",
+    "find_text",
+    "context_for",
+}
 # WP-SB6: the narrower set of Switchboard tools a delegated child (a codex/claude CLI
 # subprocess the broker itself launched, AGENT_BROKER_CHILD=1) is never allowed to call --
 # a depth-1 adviser must answer from its brief, not spawn agents or open another
@@ -384,6 +392,141 @@ def log_gate_decision(
             handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     except Exception:  # noqa: BLE001 - logging must never affect gate behaviour
         pass
+
+
+_TELEMETRY_STR_LIMIT = 100
+_TELEMETRY_REQUEST_RESULT_TOOL = "mcp__agent_switchboard__request_result"
+_TELEMETRY_SAFE_TOKEN = re.compile(r"[^A-Za-z0-9_.:/ +-]")
+
+
+def _telemetry_scalar(value: object) -> str | None:
+    """A short metadata token, or None. Never carries free text: only a bounded,
+    character-restricted single token is accepted."""
+    if isinstance(value, bool) or value is None or isinstance(value, (dict, list, tuple)):
+        return None
+    text = str(value).strip()
+    if not text or len(text) > _TELEMETRY_STR_LIMIT or _TELEMETRY_SAFE_TOKEN.search(text):
+        return None
+    return text
+
+
+def _parse_projection_stub(text: str) -> dict | None:
+    """Parse the ingress-quarantine stub's `projection: k=v | k=v` pairs."""
+    marker = "projection:"
+    index = text.find(marker)
+    if index < 0:
+        return None
+    parsed: dict = {}
+    for part in text[index + len(marker):].split(" | "):
+        key, sep, value = part.strip().partition("=")
+        key = key.strip()
+        if sep and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            parsed[key] = value.strip()
+    return parsed or None
+
+
+def _telemetry_result(payload: dict) -> dict | None:
+    """Best-effort parse of the tool response into a dict. Never raises."""
+    try:
+        result = _extract_dispatch_result(payload)
+        if isinstance(result, dict):
+            return result
+        response = payload.get("tool_response")
+        texts: list[str] = []
+        if isinstance(response, str):
+            texts.append(response)
+        elif isinstance(response, list):
+            for block in response:
+                texts.append(str(block.get("text") if isinstance(block, dict) else block))
+        elif isinstance(response, dict):
+            raw = response.get("content")
+            if isinstance(raw, list):
+                for block in raw:
+                    texts.append(str(block.get("text") if isinstance(block, dict) else block))
+            elif isinstance(raw, str):
+                texts.append(raw)
+        for text in texts:
+            stub = _parse_projection_stub(text)
+            if stub:
+                return stub
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _first_scalar(*candidates: object) -> str | None:
+    for candidate in candidates:
+        token = _telemetry_scalar(candidate)
+        if token:
+            return token
+    return None
+
+
+def _count_of(value: object) -> int | None:
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _gate_telemetry(normalized_tool: str, payload: dict) -> dict:
+    """Metadata-only telemetry fields for route_agent_task / request_result.
+
+    Values come from the broker's RESPONSE; the request's structured routing fields
+    (target_agent/target_model/task_kind/mode) are only a fallback. Prompts,
+    questions, file paths and criteria are never read. Must never raise."""
+    try:
+        if normalized_tool == CREDITABLE_DISPATCH_TOOL:
+            kind = "route"
+        elif normalized_tool == _TELEMETRY_REQUEST_RESULT_TOOL:
+            kind = "result"
+        else:
+            return {}
+        result = _telemetry_result(payload) or {}
+        args = payload.get("tool_input")
+        args = args if isinstance(args, dict) else {}
+        fields: dict = {}
+        if kind == "route":
+            resolution = result.get("model_resolution")
+            resolution = resolution if isinstance(resolution, dict) else {}
+            pairs = {
+                "target_agent": _first_scalar(result.get("target_agent"), args.get("target_agent")),
+                "model": _first_scalar(
+                    resolution.get("target_model"), resolution.get("resolved_model"),
+                    result.get("attested_model"), result.get("model"), result.get("actual_model"),
+                    args.get("target_model"),
+                ),
+                "task_kind": _first_scalar(result.get("task_kind"), args.get("task_kind")),
+                "mode": _first_scalar(result.get("mode"), args.get("mode")),
+            }
+            worker = result.get("async_worker")
+            if isinstance(worker, dict) or result.get("async") is True:
+                pairs["async_status"] = _first_scalar(result.get("status"))
+            fields.update({k: v for k, v in pairs.items() if v})
+            return fields
+        pairs = {
+            "request_id": _first_scalar(result.get("request_id"), args.get("request_id")),
+            "kind": _first_scalar(result.get("kind"), result.get("request_kind"), result.get("lane")),
+            "state": _first_scalar(result.get("state"), result.get("status")),
+            "outcome": _first_scalar(result.get("outcome")),
+            "worker_status": _first_scalar(result.get("worker_status")),
+            "disposition": _first_scalar(result.get("disposition")),
+            "model": _first_scalar(result.get("attested_model"), result.get("model")),
+        }
+        fields.update({k: v for k, v in pairs.items() if v})
+        count = _count_of(result.get("applied_files"))
+        if count is None:
+            count = _count_of(result.get("applied_files_count"))
+        if count is not None:
+            fields["applied_files_count"] = count
+        return fields
+    except Exception:  # noqa: BLE001 - telemetry must never affect gate behaviour
+        return {}
 
 
 def _read_state(session_id: str) -> dict:
@@ -1174,6 +1317,42 @@ def _read_session_broker_events(session_id: str, limit: int = 1000) -> list[dict
     return records
 
 
+def _flash_telemetry_line(log_records: list[dict]) -> str:
+    """One summary line of Flash dispatches and terminal outcomes, from telemetry fields.
+
+    Counts only the generic per-call PostToolUse record (allow/deny) so a credited
+    call is not counted twice. Empty when the log carries no telemetry."""
+    try:
+        dispatched = 0
+        async_started = 0
+        terminal: dict[str, int] = {}
+        seen_terminal: set[str] = set()
+        for record in log_records:
+            if str(record.get("event") or "") != "PostToolUse":
+                continue
+            if str(record.get("decision") or "") not in {"allow", "deny"}:
+                continue
+            tool = str(record.get("tool") or "")
+            if tool.endswith("route_agent_task") and str(record.get("target_agent") or "") == "antigravity":
+                dispatched += 1
+                if record.get("async_status"):
+                    async_started += 1
+            elif tool.endswith("request_result") and record.get("outcome"):
+                request_id = str(record.get("request_id") or "")
+                if request_id:
+                    if request_id in seen_terminal:
+                        continue
+                    seen_terminal.add(request_id)
+                key = str(record.get("outcome"))
+                terminal[key] = terminal.get(key, 0) + 1
+        if not dispatched and not terminal:
+            return ""
+        outcomes = ", ".join(f"{k}={v}" for k, v in sorted(terminal.items())) or "(none)"
+        return f"flash: dispatched {dispatched} (async {async_started}), terminal outcomes: {outcomes}"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _format_routing_report(label: str, state: dict, log_records: list[dict]) -> str:
     lines = [f"Routing report: {label}"]
     counts = state.get("direct_labour_counts") or {}
@@ -1223,6 +1402,9 @@ def _format_routing_report(label: str, state: dict, log_records: list[dict]) -> 
             "Switchboard dispatches: "
             + ", ".join(f"{k}={v}" for k, v in sorted(dispatch_outcomes.items()))
         )
+    flash_line = _flash_telemetry_line(log_records)
+    if flash_line:
+        lines.append(flash_line)
     lines.append(f"Log denials: {denial_log_count}")
     lines.append(f"Log credits: {credit_log_count}")
     return "\n".join(lines)
@@ -1418,6 +1600,166 @@ def routing_report_cli(argv: list[str]) -> int:
         sys.stdout.write("\n\n".join(reports) + "\n")
     except Exception:  # noqa: BLE001 - a report must never fail a session
         sys.stdout.write("Routing report: unavailable\n")
+    return 0
+
+
+def _read_code_graph_usage_events(days: int = 7) -> list[dict]:
+    if not DB_PATH.exists():
+        return []
+    records: list[dict] = []
+    from datetime import datetime, timezone, timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(0, days))
+    cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, event_type, summary, details, created_at
+                FROM agent_events
+                WHERE event_type = 'code_graph'
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return []
+    for row in rows:
+        try:
+            details = json.loads(row["details"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(details, dict):
+            continue
+        ts_str = str(details.get("ts") or row["created_at"] or "")
+        if ts_str:
+            try:
+                dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                if dt < cutoff:
+                    continue
+            except Exception:
+                if ts_str < cutoff_iso:
+                    continue
+        records.append(details)
+    return records
+
+
+def format_code_graph_usage_report(records: list[dict], days: int = 7) -> str:
+    lines = [f"Code graph usage report (last {days} days):", ""]
+    total = len(records)
+    lines.append(f"Total calls: {total}")
+
+    # Counts by host
+    host_counts: dict[str, int] = {}
+    for r in records:
+        h = str(r.get("host") or "unknown")
+        host_counts[h] = host_counts.get(h, 0) + 1
+    lines.append("Counts by host: " + (", ".join(f"{k}={v}" for k, v in sorted(host_counts.items())) if host_counts else "(none)"))
+
+    # Counts by op
+    op_counts: dict[str, int] = {}
+    for r in records:
+        o = str(r.get("op") or "unknown")
+        op_counts[o] = op_counts.get(o, 0) + 1
+    lines.append("Counts by op: " + (", ".join(f"{k}={v}" for k, v in sorted(op_counts.items())) if op_counts else "(none)"))
+
+    # Counts by host and op
+    host_op_counts: dict[tuple[str, str], int] = {}
+    for r in records:
+        pair = (str(r.get("host") or "unknown"), str(r.get("op") or "unknown"))
+        host_op_counts[pair] = host_op_counts.get(pair, 0) + 1
+    if host_op_counts:
+        lines.append("Counts by host and op: " + ", ".join(f"{h}/{o}={v}" for (h, o), v in sorted(host_op_counts.items())))
+
+    # Rates
+    if total > 0:
+        ok_count = sum(1 for r in records if r.get("ok"))
+        zero_hit_count = sum(1 for r in records if int(r.get("hits") or 0) == 0)
+        stale_count = sum(1 for r in records if r.get("stale"))
+        trunc_count = sum(1 for r in records if r.get("truncated"))
+        ms_list = [float(r.get("ms") or 0) for r in records]
+        import statistics
+        med_ms = statistics.median(ms_list) if ms_list else 0.0
+        lines.append(f"OK rate: {ok_count / total * 100:.1f}% ({ok_count}/{total})")
+        lines.append(f"Zero-hit rate: {zero_hit_count / total * 100:.1f}% ({zero_hit_count}/{total})")
+        lines.append(f"Stale rate: {stale_count / total * 100:.1f}% ({stale_count}/{total})")
+        lines.append(f"Truncated rate: {trunc_count / total * 100:.1f}% ({trunc_count}/{total})")
+        lines.append(f"Median ms: {med_ms:.1f}")
+    else:
+        lines.append("OK rate: 0.0%")
+        lines.append("Zero-hit rate: 0.0%")
+        lines.append("Stale rate: 0.0%")
+        lines.append("Truncated rate: 0.0%")
+        lines.append("Median ms: 0.0")
+
+    # Session comparison
+    session_cg: dict[str, int] = {}
+    for r in records:
+        sid = str(r.get("session") or "").strip()
+        if sid and sid != "unknown":
+            session_cg[sid] = session_cg.get(sid, 0) + 1
+
+    session_lines: list[str] = []
+    for sid, cg_count in sorted(session_cg.items()):
+        state_path = _session_path(sid)
+        log_path = _session_log_path(sid)
+        if not state_path.exists() and not log_path.exists():
+            continue
+        state = _read_state(sid)
+        counts = state.get("direct_labour_counts") or {}
+        reads = int(counts.get("reads") or 0)
+        searches = int(counts.get("searches") or 0)
+        if not reads and not searches and log_path.exists():
+            log_records = _read_session_log(log_path)
+            reads = sum(
+                1
+                for rec in log_records
+                if rec.get("event") == "PreToolUse"
+                and rec.get("category") == "reads"
+                and rec.get("decision") != "deny"
+            )
+            searches = sum(
+                1
+                for rec in log_records
+                if rec.get("event") == "PreToolUse"
+                and rec.get("category") == "searches"
+                and rec.get("decision") != "deny"
+            )
+        read_grep = reads + searches
+        session_lines.append(f"  {sid}: code_graph={cg_count} vs Read/Grep={read_grep}")
+
+    lines.append("")
+    lines.append("Sessions (code_graph vs Read/Grep direct labour):")
+    if session_lines:
+        lines.extend(session_lines)
+    else:
+        lines.append("  (none)")
+
+    lines.append("")
+    lines.append("Descriptive only: Read/Grep counts include required primary-evidence reads, so this does not prove the graph displaced reading.")
+    return "\n".join(lines)
+
+
+def code_graph_usage_cli(argv: list[str]) -> int:
+    """Print code graph usage events and session Read/Grep direct labour comparison."""
+    parser = argparse.ArgumentParser(prog="agent-switchboard code-graph-usage")
+    parser.add_argument("--days", type=int, default=7, help="Days to look back (default 7)")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit:
+        return 0
+    try:
+        events = _read_code_graph_usage_events(days=args.days)
+        report = format_code_graph_usage_report(events, days=args.days)
+        sys.stdout.write(report + "\n")
+    except Exception:
+        sys.stdout.write("Code graph usage report: unavailable\n\n")
+        sys.stdout.write(
+            "Descriptive only: Read/Grep counts include required primary-evidence reads, "
+            "so this does not prove the graph displaced reading.\n"
+        )
     return 0
 
 
@@ -2061,6 +2403,7 @@ def post_tool_use(payload: dict) -> dict:
         extra={
             "mutated": bool(mutated),
             **({"credited": True} if relief_text else {}),
+            **_gate_telemetry(normalized_tool, payload),
         },
     )
     if ingress_feedback is not None:
@@ -2356,7 +2699,8 @@ def _credit_async_flash_start(
                           extra={"reason": "request already credited", **details})
         return None
     log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "credit",
-                      extra={"async": True, **details})
+                      extra={"async": True, **details,
+                             **_gate_telemetry(normalized_tool, {"tool_response": result, "tool_input": {}})})
     return {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
@@ -2438,7 +2782,8 @@ def _credit_switchboard_dispatch(session_id: str, normalized_tool: str, payload:
                           extra={"reason": "receipt already credited", "receipt": receipt})
         return None
     log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "credit",
-                      extra={"receipt": receipt, "work_package_id": work_package})
+                      extra={"receipt": receipt, "work_package_id": work_package,
+                             **_gate_telemetry(normalized_tool, {"tool_response": result, "tool_input": {}})})
     return {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
@@ -2727,6 +3072,12 @@ def main(argv: list[str]) -> int:
         sys.stdout.write(json.dumps({}))
         return 0
     event = argv[0]
+    if event == "code-graph-usage":
+        return code_graph_usage_cli(argv[1:])
+    if event == "routing-report":
+        return routing_report_cli(argv[1:])
+    if event == "routing-override":
+        return routing_override_cli(argv[1:])
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
@@ -2753,3 +3104,15 @@ def main(argv: list[str]) -> int:
         result = {}
     sys.stdout.write(json.dumps(result))
     return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "code-graph-usage":
+        sys.exit(code_graph_usage_cli(sys.argv[2:]))
+    elif len(sys.argv) > 1 and sys.argv[1] == "routing-report":
+        sys.exit(routing_report_cli(sys.argv[2:]))
+    elif len(sys.argv) > 1 and sys.argv[1] == "routing-override":
+        sys.exit(routing_override_cli(sys.argv[2:]))
+    else:
+        sys.exit(main(sys.argv[1:]))
+

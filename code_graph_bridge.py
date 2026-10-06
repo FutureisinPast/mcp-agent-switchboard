@@ -18,7 +18,16 @@ import time
 from pathlib import Path
 from typing import Any
 
-VALID_OPS = {"locate", "expand", "path", "stats", "refresh", "health"}
+VALID_OPS = {
+    "locate",
+    "expand",
+    "path",
+    "stats",
+    "refresh",
+    "health",
+    "find_text",
+    "context_for",
+}
 
 FORWARD_KEYS = (
     "project",
@@ -34,6 +43,8 @@ FORWARD_KEYS = (
     "max_hops",
     "force",
     "include_ids",
+    "text",
+    "files",
 )
 
 
@@ -48,6 +59,28 @@ class CodeGraphBridge:
         self._started_once: bool = False
         self._restart_times: list[float] = []
         self._next_id: int = 1
+        self._fingerprint: tuple[Any, Any] | None = None
+        self._pending: str | None = None
+        self._failed_fingerprint: tuple[Any, Any] | None = None
+        self._handshake_timeout: float = 20.0
+
+    @staticmethod
+    def _file_stamp(path: Path) -> tuple[int, int] | None:
+        try:
+            st = path.stat()
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _marker_bytes(home: Path) -> bytes | None:
+        try:
+            return (home / "runtime.json").read_bytes()
+        except OSError:
+            return None
+
+    def _current_fingerprint(self, home: Path, projects_path: Path) -> tuple[Any, Any]:
+        return (self._marker_bytes(home), self._file_stamp(projects_path))
 
     def _resolve_paths(self) -> tuple[Path, Path, Path, Path]:
         if self._home is not None:
@@ -65,6 +98,16 @@ class CodeGraphBridge:
             python_path = home / "venv" / "bin" / "python"
 
         adapter_path = home / "gfy_adapter.py"
+        marker = self._marker_bytes(home)
+        if marker is not None:
+            try:
+                release = json.loads(marker.decode("utf-8")).get("release")
+            except Exception:
+                release = None
+            if isinstance(release, str) and release and release == Path(release).name:
+                candidate = home / "releases" / release / "gfy_adapter.py"
+                if candidate.exists():
+                    adapter_path = candidate
         projects_path = home / "projects.json"
         return home, python_path, adapter_path, projects_path
 
@@ -88,7 +131,9 @@ class CodeGraphBridge:
             except Exception:
                 pass
 
-    def _spawn(self, python_path: Path, adapter_path: Path, projects_path: Path) -> None:
+    def _start_process(
+        self, python_path: Path, adapter_path: Path, projects_path: Path
+    ) -> tuple[subprocess.Popen[str], queue.Queue[str | None], threading.Thread]:
         cmd = [str(python_path), str(adapter_path), "--projects", str(projects_path)]
         kwargs: dict[str, Any] = {
             "stdin": subprocess.PIPE,
@@ -118,16 +163,103 @@ class CodeGraphBridge:
 
         t = threading.Thread(target=_reader_loop, daemon=True)
         t.start()
+        return proc, out_q, t
 
+    @staticmethod
+    def _kill_proc(proc: subprocess.Popen[str]) -> None:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+    def _spawn(self, python_path: Path, adapter_path: Path, projects_path: Path) -> None:
+        home = self._resolve_paths()[0]
+        fp = self._current_fingerprint(home, projects_path)
+        proc, out_q, t = self._start_process(python_path, adapter_path, projects_path)
         self._child = proc
         self._out_q = out_q
         self._reader_thread = t
+        self._fingerprint = fp
+        self._pending = None
+        self._failed_fingerprint = None
+
+    def _health_handshake(
+        self, proc: subprocess.Popen[str], out_q: queue.Queue[str | None]
+    ) -> str | None:
+        """Send a side-effect-free health request; None on success, else a short reason."""
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(json.dumps({"id": 0, "op": "health", "max_chars": 500}) + "\n")
+            proc.stdin.flush()
+        except Exception:
+            return "health_write_failed"
+        deadline = time.time() + self._handshake_timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return "health_timeout"
+            try:
+                item = out_q.get(timeout=max(0.005, remaining))
+            except queue.Empty:
+                return "health_timeout"
+            if item is None:
+                return "candidate_exited"
+            raw = item.strip()
+            if not raw:
+                continue
+            try:
+                resp = json.loads(raw)
+            except Exception:
+                return "health_malformed"
+            if not isinstance(resp, dict) or resp.get("id") != 0:
+                continue
+            return None if resp.get("ok") is True else "health_not_ok"
+
+    def _maybe_hot_reload(self, python_path: Path, adapter_path: Path, projects_path: Path) -> None:
+        """Planned reload, called with a live child under the call lock (so any in-flight request
+        has already drained). Never touches the crash-restart cap. A candidate must pass a health
+        handshake before the old child is retired; otherwise the old child keeps serving."""
+        home = self._resolve_paths()[0]
+        fp = self._current_fingerprint(home, projects_path)
+        if fp == self._fingerprint or fp == self._failed_fingerprint:
+            return
+        try:
+            proc, out_q, t = self._start_process(python_path, adapter_path, projects_path)
+        except Exception:
+            self._failed_fingerprint = fp
+            self._pending = "candidate_spawn_failed"
+            return
+        reason = self._health_handshake(proc, out_q)
+        if reason is not None:
+            self._kill_proc(proc)
+            self._failed_fingerprint = fp
+            self._pending = reason
+            return
+        old = self._child
+        self._child, self._out_q, self._reader_thread = proc, out_q, t
+        self._fingerprint = fp
+        self._failed_fingerprint = None
+        self._pending = None
+        if old is not None:
+            self._kill_proc(old)
 
     def _ensure_child(
         self, python_path: Path, adapter_path: Path, projects_path: Path
     ) -> dict[str, Any] | None:
         if self._child is not None and self._child.poll() is not None:
             self._kill_child()
+
+        if self._child is not None:
+            self._maybe_hot_reload(python_path, adapter_path, projects_path)
 
         if self._child is None:
             now = time.time()
@@ -184,6 +316,7 @@ class CodeGraphBridge:
                 clamped_max_chars = 1500
 
         with self._lock:
+            home, python_path, adapter_path, projects_path = self._resolve_paths()
             err = self._ensure_child(python_path, adapter_path, projects_path)
             if err is not None:
                 return err
@@ -248,6 +381,8 @@ class CodeGraphBridge:
                 if len(raw_line) > 7500:
                     return {"ok": False, "error": "response_oversize", "chars": len(raw_line)}
 
+                if self._pending:
+                    resp["adapter_update_pending"] = self._pending
                 return resp
 
     def close(self) -> None:
@@ -258,6 +393,8 @@ class CodeGraphBridge:
         with self._lock:
             self._kill_child()
             self._started_once = False
+            self._pending = None
+            self._failed_fingerprint = None
             self._restart_times.clear()
             self._next_id = 1
 

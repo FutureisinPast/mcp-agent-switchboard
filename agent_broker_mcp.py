@@ -724,7 +724,7 @@ COST_AWARE_ROUTING_RULES = [
     "A dirty worktree or same-session ownership never excuses keeping read-only inventory, tests, evidence, docs, or isolated mechanical work on the brain; only the exact overlapping write or high-risk state transition may be retained.",
     "The installed PreToolUse gate allows a small allowance of direct brain labour calls (default four, for non-mutating micro-work such as reading your own handoff and adjudicating a premise), then denies the next eligible labour call until relief arrives. Relief comes from a completed Switchboard dispatch whose ledger receipt verifies, a managed same-vendor reader/workhorse package, or an exact brain override registered with the local routing-override command the gate supplies. A failed, blocked, rejected, or unavailable dispatch earns no relief -- credit cannot be farmed by firing a route known to fail. Each relief opens only the next bounded block; registered overrides must appear in the final audit.",
     "Brain-context ingress defaults to at most 8,000 characters (roughly 1-2k tokens). Verification calls declare a field projection and output cap; oversized raw evidence stays outside context with its query and location.",
-    "Code graph: for a project registered with the code graph, locate code with the Switchboard `code_graph` tool (op `locate`, then `expand` or `path`) before broad Grep/Glob/Read sweeps; its read ops do not consume the direct-labour allowance. Results are locators (symbol, file:line, confidence, freshness), never answers: read the cited primary lines before relying on them. `confidence: low`, a miss, `stale: true`, module constants, and non-code files mean fall back to a targeted grep (or `refresh` when stale). A graph miss is not evidence of absence.",
+    hierarchy_install.CODE_GRAPH_RULE,
     "A decision premise is a claim whose falsity changes the patch, risk classification, or release decision. The reader locates minimal primary evidence; the brain states premise | what changes if false | bounded primary evidence and adjudicates only that range. Never launder a reader interpretation into fact.",
     "Do not accept a worker summary as proof. Validate file-and-line evidence, the actual diff, and check output before signoff.",
     "Do NOT write a routing audit into your reply. The broker records every lane automatically -- each tool call, native subagent start, brain override, and Switchboard receipt is written to an append-only session ledger, which is more reliable than a model retyping it. Show it only when the user asks for it, by running `agent-switchboard.exe routing-report --table` (or `routing-report` for the summary) and returning that output; the backend renders the table identically every time. Registering an override with the routing-override command still matters and is still recorded -- only the recited audit is gone. Hosts that want the model to attest to its own work can set AGENT_BROKER_AUDIT_MODE=require to restore the mandatory audit.",
@@ -14531,13 +14531,22 @@ TOOLS = [
     },
     {
         "name": "code_graph",
-        "description": "Locate code in a registered project through its code-only knowledge graph (graphify). Returns compact locators: symbol, file:line, relations, confidence, freshness. Results are locators, not answers: read the primary lines before acting. confidence 'low' (or a miss) means fall back to a targeted grep; constants and non-code files are not indexed. Ops: locate, expand, path, stats, health; refresh rebuilds the graph.",
+        "description": "Locate code in a registered project through its code-only knowledge graph (graphify). Returns compact locators: symbol, file:line, relations, confidence, freshness. Results are locators, not answers: read the primary lines before acting. confidence 'low' (or a miss) means fall back to a targeted grep; constants and non-code files are not indexed. Ops: locate, expand, path, stats, health, find_text, context_for; refresh rebuilds the graph. find_text searches indexed string literals; context_for suggests related files.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "op": {
                     "type": "string",
-                    "enum": ["locate", "expand", "path", "stats", "refresh", "health"],
+                    "enum": [
+                        "locate",
+                        "expand",
+                        "path",
+                        "stats",
+                        "refresh",
+                        "health",
+                        "find_text",
+                        "context_for",
+                    ],
                     "description": "Operation to perform.",
                 },
                 "project": {"type": "string", "description": "Project name or root path."},
@@ -14568,6 +14577,19 @@ TOOLS = [
                 "force": {
                     "type": "boolean",
                     "description": "Force refresh even if not stale.",
+                },
+                "text": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 200,
+                    "description": "Exact substring search over indexed string literals such as error messages.",
+                },
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 5,
+                    "description": "Files whose read_context suggestions are wanted (1-5 repo-relative path strings).",
                 },
             },
             "required": ["op"],
@@ -14668,7 +14690,7 @@ COMPACT_TOOL_DESCRIPTIONS = {
     "record_context_event": "Record a compact evidence/context event.",
     "get_context_pack": "Return a compact project/topic context pack.",
     "retrieve_shared_context": "Retrieve stored large context by ref, optionally filtered by query.",
-    "code_graph": "Query code knowledge graph locators; caller must read primary lines before acting, low confidence falls back to grep.",
+    "code_graph": "Query code knowledge graph locators; caller must read primary lines before acting, low confidence falls back to grep. find_text searches indexed string literals; context_for suggests related files.",
     "request_context_snapshot": "Request a compact snapshot of another open agent session.",
     "get_latest_context_snapshot": "Read the latest completed snapshot, capped by max_tokens.",
     "list_live_surfaces": "List recent bridge heartbeats and capabilities.",
@@ -16027,6 +16049,87 @@ def latest_context_snapshots_section(project_info: "ProjectInfo", topic: str | N
     return out
 
 
+def _record_code_graph_usage_event(
+    args: Mapping[str, Any] | None,
+    resp: Mapping[str, Any] | None,
+    elapsed_ms: float,
+) -> None:
+    try:
+        args_map = args if isinstance(args, Mapping) else {}
+        resp_map = resp if isinstance(resp, Mapping) else {}
+
+        host = _MCP_CLIENT_NAME.strip() if _MCP_CLIENT_NAME and _MCP_CLIENT_NAME.strip() else "unknown"
+        session_info = routing_gate.resolve_current_session_identity()
+        session = str(session_info.get("session_id") or "").strip() or "unknown"
+
+        op = str(args_map.get("op") or resp_map.get("op") or "")
+        project = str(resp_map.get("project") or args_map.get("project") or "")
+        ok = bool(resp_map.get("ok"))
+        error = resp_map.get("error")
+        snapshot = resp_map.get("snapshot")
+
+        hits = resp_map.get("hits")
+        if hits is not None:
+            try:
+                hits = int(hits)
+            except (ValueError, TypeError):
+                hits = 0
+        else:
+            found_hits = None
+            for key in ("locators", "matches", "suggestions", "neighbors"):
+                val = resp_map.get(key)
+                if isinstance(val, (list, tuple)):
+                    found_hits = len(val)
+                    break
+            hits = found_hits if found_hits is not None else 0
+
+        stale = bool(resp_map.get("stale", False))
+        truncated = bool(resp_map.get("truncated", False) or resp_map.get("omitted", False))
+
+        chars = resp_map.get("chars")
+        if chars is not None:
+            try:
+                chars = int(chars)
+            except (ValueError, TypeError):
+                chars = 0
+        else:
+            try:
+                chars = len(json.dumps(dict(resp_map), ensure_ascii=False))
+            except Exception:
+                chars = 0
+
+        ms = round(elapsed_ms, 2)
+        ts = utc_now()
+
+        event_dict = {
+            "ts": ts,
+            "kind": "code_graph",
+            "host": host,
+            "session": session,
+            "op": op,
+            "project": project,
+            "ok": ok,
+            "error": error,
+            "snapshot": snapshot,
+            "hits": hits,
+            "stale": stale,
+            "truncated": truncated,
+            "chars": chars,
+            "ms": ms,
+        }
+
+        record_agent_event(
+            project=project or None,
+            topic=args_map.get("topic") or None,
+            agent="agent-switchboard",
+            event_type="code_graph",
+            summary=f"code_graph {op}: ok={ok} hits={hits}",
+            details=json.dumps(event_dict, ensure_ascii=False),
+        )
+    except Exception:
+        pass
+
+
 def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "register_project":
         return text_content(register_project(str(args.get("name") or ""), str(args.get("root_path") or "")))
@@ -16160,7 +16263,14 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             )
         )
     if name == "code_graph":
-        return text_content(code_graph_bridge.call(args))
+        t0 = time.perf_counter()
+        res = code_graph_bridge.call(args)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        try:
+            _record_code_graph_usage_event(args, res, elapsed_ms)
+        except Exception:
+            pass
+        return text_content(res)
     if name == "retrieve_shared_context":
         return text_content(
             retrieve_shared_context(

@@ -29,3 +29,11 @@ class Adapter:
             self.p.stdin.close(); self.p.wait(timeout=10)
         except Exception:
             self.p.kill()
+
+    def find_text(self, project, text, **kw):
+        """-> (parsed, raw, seconds). Exact case-sensitive substring over the literal index."""
+        return self.call(op="find_text", project=project, text=text, **kw)
+
+    def context_for(self, project, files, **kw):
+        """-> (parsed, raw, seconds). Import/conftest/fixture/test suggestions for 1-5 python files."""
+        return self.call(op="context_for", project=project, files=list(files), **kw)

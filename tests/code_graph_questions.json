@@ -1,5 +1,5 @@
 {
- "_how_to_extend": "When you add a feature, add one question here with its defining file and symbol (symbol = the function/class name; alt_symbols = other acceptable defining names). Mark must_hit true only for lexical questions that locate must always HIT. Paraphrase questions are reported, never gated. test_symbol_coverage already covers every new def/class/method automatically.",
+ "_how_to_extend": "When you add a feature, add one question here with its defining file and symbol (symbol = the function/class name; alt_symbols = other acceptable defining names). Mark must_hit true only for lexical questions that locate must always HIT. Also add an entry to literal_questions ({id, text, file, symbol}) when you add a user-visible error/message string: text must occur inside a string literal within that symbol in that file (checked by AST), and find_text must return it. Paraphrase questions are reported, never gated. test_symbol_coverage already covers every new def/class/method automatically.",
  "questions": [
   {
    "id": "Q1",
@@ -127,5 +127,10 @@
     "_set_flagship_latch"
    ]
   }
+ ],
+ "literal_questions": [
+  {"id": "L1", "text": "out-of-scope file reported", "file": "agent_broker_mcp.py", "symbol": "validate_flash_workhorse_result"},
+  {"id": "L2", "text": "managed routing block has no end marker", "file": "hierarchy_install.py", "symbol": "_block_parts"},
+  {"id": "L3", "text": "routing hook command prefix is empty", "file": "hierarchy_install.py", "symbol": "_hook_prefix_argv"}
  ]
 }

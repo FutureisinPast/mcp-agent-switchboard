@@ -390,3 +390,279 @@ def test_stray_print_goes_to_stderr_not_protocol(tmp_path):
     assert len(lines) == 1 and json.loads(lines[0])["id"] == 7, p.stderr.decode("utf-8", "replace")[-600:]
     err = p.stderr.decode("utf-8", "replace")
     assert "STRAY_PRINT" in err and "STRAY_FD" in err
+
+
+# ---------------------------------------------------------------- WP-CGN-1: literal index, find_text, context_for
+LIT_FILES = {
+    "svc.py": (
+        'MODULE_MSG = "module level literal text here"\n\n\n'
+        "class Checker:\n"
+        "    def validate(self, changed):\n"
+        "        return f\"out-of-scope file reported: {changed['path']}\"\n\n"
+        "    def outer(self):\n"
+        "        def inner():\n"
+        '            return "inner function literal message"\n'
+        "        return inner\n\n\n"
+        "def top_func():\n"
+        '    return "top level function error string"\n'
+    ),
+    "scripts/run.ps1": 'Write-Host "powershell literal message here"\nfunction Get-Thing { return 1 }\n',
+    "tool.js": "const m = 'javascript literal message text';\nfunction doThing() { return m; }\n",
+    "lib.py": "def helper_value():\n    return 41\n",
+    "app2.py": ("import importlib\nimport lib\nimport os\n\n\n"
+                "def load(name):\n    return importlib.import_module(name), lib.helper_value()\n"),
+    "tests/conftest.py": ("import pytest\n\n\n@pytest.fixture\ndef sample_cfg():\n    return {}\n\n\n"
+                          "@pytest.fixture\ndef unused_cfg():\n    return 1\n"),
+    "tests/sub/conftest.py": "import pytest\n\n\n@pytest.fixture\ndef deep_cfg():\n    return 2\n",
+    "tests/sub/test_app2.py": ("import app2\n\n\ndef test_load(sample_cfg, deep_cfg):\n"
+                               "    assert app2.lib.helper_value() == 41\n"),
+}
+
+
+def make_lit_project(tmp_path, name="L"):
+    root = tmp_path / f"{name}_repo"
+    for rel, t in LIT_FILES.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(t, encoding="utf-8")
+    out = tmp_path / f"{name}_out"
+    cfg = tmp_path / f"{name}.json"
+    cfg.write_text(json.dumps({PID: {"root": str(root), "out_dir": str(out)}}), encoding="utf-8")
+    return root, out, str(cfg)
+
+
+@pytest.fixture(scope="module")
+def lit(tmp_path_factory):
+    root, out, cfg = make_lit_project(tmp_path_factory.mktemp("lit"))
+    a = Adapter(projects=cfg)
+    r = a.call(op="refresh", project=PID)[0]
+    assert r["ok"], r
+    yield {"a": a, "root": root, "out": out, "cfg": cfg, "refresh": r}
+    a.close()
+
+
+def test_literal_refresh_publishes_one_generation(lit):
+    ptr = json.loads((lit["out"] / "published" / "current.json").read_text())
+    d = ptr["literals"]
+    assert (lit["out"] / "published" / d["name"]).exists() and d["count"] > 3
+    assert lit["refresh"]["timing"]["literals_s"] >= 0 and lit["refresh"]["literals"] == d["count"]
+
+
+def test_fstring_matches_by_constant_part(lit):
+    r, raw, _ = lit["a"].find_text(PID, "out-of-scope file reported")
+    assert r["ok"] and r["hits"] == 1 and len(raw) <= 1500
+    m = r["matches"][0]
+    assert m["file"] == "svc.py" and m["symbol"] == "Checker.validate" and m["owner"] == "ast"
+    assert m["lang"] == "python" and m["stale"] is False and m["line"] == 6
+    assert "not_indexed" in r and r["coverage"]["literal_count"] > 3 and r["omitted"] == 0
+    # match is against the SOURCE text as written (braces/quotes included), case-sensitive
+    r2 = lit["a"].find_text(PID, "reported: {changed['path']}")[0]
+    assert r2["ok"] and r2["hits"] == 1
+    assert lit["a"].find_text(PID, "OUT-OF-SCOPE file")[0]["hits"] == 0
+
+
+def test_nested_qualified_owner_and_module_level(lit):
+    a = lit["a"]
+    m = a.find_text(PID, "inner function literal")[0]["matches"][0]
+    assert m["symbol"] == "Checker.outer.inner" and m["owner"] == "ast"
+    m = a.find_text(PID, "top level function error")[0]["matches"][0]
+    assert m["symbol"] == "top_func" and m.get("in_graph") is True
+    m = a.find_text(PID, "module level literal")[0]["matches"][0]
+    assert m["symbol"] is None and m["owner"] == "ast" and m["line"] == 1
+
+
+def test_non_python_literals_are_textual_candidates(lit):
+    a = lit["a"]
+    for text, lang in (("powershell literal message", "ps1"), ("javascript literal message", "js")):
+        r = a.find_text(PID, text)[0]
+        assert r["ok"] and r["hits"] == 1, (text, r)
+        m = r["matches"][0]
+        assert m["owner"] == "unknown" and m["symbol"] is None and m["lang"] == lang
+
+
+def test_find_text_arg_validation_and_limits(lit):
+    a = lit["a"]
+    assert a.find_text(PID, "ab")[0]["error"] == "text_length_3_to_200"
+    assert a.find_text(PID, "x" * 201)[0]["error"] == "text_length_3_to_200"
+    r = a.find_text(PID, "literal", limit=1)[0]
+    assert r["ok"] and r["hits"] == 1 and r["omitted"] >= 1
+
+
+def test_stale_flag_flips_after_edit(tmp_path):
+    root, out, cfg = make_lit_project(tmp_path, "st")
+    a = Adapter(projects=cfg)
+    try:
+        assert a.call(op="refresh", project=PID)[0]["ok"]
+        assert a.find_text(PID, "top level function")[0]["matches"][0]["stale"] is False
+        with open(root / "svc.py", "a", encoding="utf-8") as f:
+            f.write("# edited\n")
+        r = a.find_text(PID, "top level function")[0]
+        assert r["matches"][0]["stale"] is True and r["stale"] is True
+        assert a.call(op="refresh", project=PID)[0]["ok"]
+        assert a.find_text(PID, "top level function")[0]["matches"][0]["stale"] is False
+    finally:
+        a.close()
+
+
+def _inproc_project(cfg):
+    import pathlib
+    import gfy_adapter
+    return gfy_adapter, gfy_adapter.load_projects(pathlib.Path(cfg))[PID]
+
+
+def test_source_change_during_build_is_rejected_keeps_last_good(tmp_path, monkeypatch):
+    root, out, cfg = make_lit_project(tmp_path, "mid")
+    ga, proj = _inproc_project(cfg)
+    r1 = json.loads(ga.op_refresh(proj, {}))
+    assert r1["ok"], r1
+    good = (out / "published" / "current.json").read_text()
+    real_run = ga.subprocess.run
+
+    def run_and_mutate(cmd, *a, **kw):
+        res = real_run(cmd, *a, **kw)
+        if isinstance(cmd, list) and "graphify" in cmd:
+            (root / "svc.py").write_text(LIT_FILES["svc.py"] + "\n\ndef sneaky():\n    return 'edited during the build'\n",
+                                         encoding="utf-8")
+        return res
+    monkeypatch.setattr(ga.subprocess, "run", run_and_mutate)
+    r2 = json.loads(ga.op_refresh(proj, {}))
+    assert r2["ok"] is False and r2["error"] == "refresh_failed" and "source_changed_during_build" in r2["detail"], r2
+    assert r2["serving"] == "last-good"
+    assert (out / "published" / "current.json").read_text() == good
+    q = json.loads(ga.handle({PID: proj}, {"op": "find_text", "project": PID, "text": "top level function"}))
+    assert q["ok"] and q["hits"] == 1
+
+
+def test_graph_and_literals_stay_one_generation(tmp_path):
+    root, out, cfg = make_lit_project(tmp_path, "gen")
+    a = Adapter(projects=cfg)
+    try:
+        r1 = a.call(op="refresh", project=PID)[0]
+        (root / "svc.py").write_text(LIT_FILES["svc.py"].replace("top level function error string", "brand new top level text")
+                                     + "\n\ndef added_fn():\n    return 1\n", encoding="utf-8")
+        r2 = a.call(op="refresh", project=PID)[0]
+        assert r1["ok"] and r2["ok"] and r1["snapshot"] != r2["snapshot"]
+    finally:
+        a.close()
+    pub = out / "published"
+    ptr = json.loads((pub / "current.json").read_text())
+    assert ptr["prev_literals"]["name"] != ptr["literals"]["name"]
+    # simulate a partial publish: the current literal artifact is gone -> whole generation falls back to prev
+    (pub / ptr["literals"]["name"]).unlink()
+    a = Adapter(projects=cfg)
+    try:
+        r = a.find_text(PID, "top level function error")[0]
+        assert r["ok"] and r["served"] == "prev" and r["snapshot"] == r1["snapshot"] and r["hits"] == 1
+        assert a.find_text(PID, "brand new top level")[0]["hits"] == 0   # never mix new literals with the old graph
+        loc = a.call(op="locate", project=PID, query="added_fn")[0]
+        assert loc["served"] == "prev" and loc["snapshot"] == r1["snapshot"]
+    finally:
+        a.close()
+
+
+def test_old_generation_without_literals_still_serves(tmp_path):
+    root, out, cfg = make_lit_project(tmp_path, "old")
+    a = Adapter(projects=cfg)
+    try:
+        r = a.call(op="refresh", project=PID, no_literals=True)[0]
+        assert r["ok"] and r["literals"] is None
+        f = a.find_text(PID, "top level function")[0]
+        assert f["ok"] is False and f["error"] == "literal_index_unavailable" and f["hits"] == 0
+        assert a.call(op="locate", project=PID, query="top_func")[0]["ok"]
+        assert a.call(op="stats", project=PID)[0]["ok"]
+        assert a.call(op="expand", project=PID, symbol="top_func()")[0]["ok"]
+        q = a.call(op="locate", project=PID, query='"top level function"')[0]   # quoted + no index: still answers
+        assert q["ok"] and q["literal_index"] == "unavailable"
+        # a refresh with literals upgrades the same pointer in place
+        assert a.call(op="refresh", project=PID)[0]["literals"] > 0
+        assert a.find_text(PID, "top level function")[0]["ok"]
+    finally:
+        a.close()
+
+
+def _strip(r):
+    r = dict(r)
+    for k in ("chars", "hits", "stale_reason", "id", "literal_index", "built_at"):
+        r.pop(k, None)
+    return r
+
+
+def test_quoted_locate_priority_and_unquoted_unchanged(tmp_path):
+    ra, oa, ca = make_lit_project(tmp_path, "qa")
+    rb, ob, cb = make_lit_project(tmp_path, "qb")
+    a, b = Adapter(projects=ca), Adapter(projects=cb)
+    try:
+        assert a.call(op="refresh", project=PID)[0]["ok"]
+        assert b.call(op="refresh", project=PID, no_literals=True)[0]["ok"]
+        for q in ("top_func", "checker validate changed", "inner function literal message", "helper value lib"):
+            ra_, rb_ = a.call(op="locate", project=PID, query=q)[0], b.call(op="locate", project=PID, query=q)[0]
+            assert _strip(ra_) == _strip(rb_), q          # unquoted ranking identical with/without the index
+            assert all(l["kind"] != "literal" for l in ra_["locators"])
+        r = a.call(op="locate", project=PID, query='where is "out-of-scope file reported" raised')[0]
+        first = r["locators"][0]
+        assert first["kind"] == "literal" and first["file"] == "svc.py" and first["symbol"] == "Checker.validate"
+        assert r["hits"] == len(r["locators"]) and len(r["locators"]) > 1   # symbol ranking still follows
+        assert r["locators"][1]["kind"] != "literal"
+    finally:
+        a.close()
+        b.close()
+
+
+def test_context_for_test_file(lit):
+    r, raw, _ = lit["a"].context_for(PID, ["tests/sub/test_app2.py"])
+    assert r["ok"] and len(raw) <= 1500 and "suggestions only" in r["note"]
+    by = {s["file"]: s for s in r["suggestions"]}
+    assert "tests/sub/test_app2.py" not in by                        # declared file excluded
+    assert by["app2.py"]["reason"] == "import" and by["app2.py"]["confidence"] == "high"
+    assert by["tests/sub/conftest.py"]["reason"].startswith("conftest+fixture:") and "deep_cfg" in by["tests/sub/conftest.py"]["reason"]
+    assert "sample_cfg" in by["tests/conftest.py"]["reason"] and "unused_cfg" not in by["tests/conftest.py"]["reason"]
+    assert r["hits"] == len(r["suggestions"]) and r["bytes_total"] == sum(s["bytes"] for s in r["suggestions"])
+    assert all(set(s) == {"file", "reason", "from", "confidence", "bytes", "stale"} for s in r["suggestions"])
+    ranks = [s["file"] for s in r["suggestions"]]
+    assert ranks.index("app2.py") < ranks.index("tests/sub/conftest.py")   # import before conftest
+
+
+def test_context_for_source_file_dynamic_and_referencing_test(lit):
+    r = lit["a"].context_for(PID, ["app2.py"])[0]
+    assert r["ok"]
+    by = {s["file"]: s for s in r["suggestions"]}
+    assert by["lib.py"]["reason"] == "import" and "app2.py" not in by
+    assert any(u["why"] == "dynamic_import" for u in r["unresolved"])
+    t = by["tests/sub/test_app2.py"]
+    assert t["confidence"] == "low" and r["suggestions"][-1]["file"] == t["file"]   # referencing test: low, last
+
+
+def test_context_for_cap_limits_and_errors(lit):
+    a = lit["a"]
+    r = a.context_for(PID, ["tests/sub/test_app2.py"], limit=1)[0]
+    assert r["hits"] == 1 and r["omitted"] >= 1
+    r = a.context_for(PID, ["../escape.py", "svc.ps1", "missing.py"])[0]
+    assert r["ok"] and r["hits"] == 0 and {u["why"] for u in r["unresolved"]} == {"outside_project_root", "python_only", "file_not_found"}
+    assert a.context_for(PID, [])[0]["error"] == "files_1_to_5"
+    assert a.context_for(PID, [f"f{i}.py" for i in range(6)])[0]["error"] == "files_1_to_5"
+
+
+def test_context_for_bytes_cap(lit, monkeypatch):
+    import gfy_adapter
+    monkeypatch.setattr(gfy_adapter, "CTX_MAX_BYTES", 100)
+    ga, proj = _inproc_project(lit["cfg"])
+    r = json.loads(ga.handle({PID: proj}, {"op": "context_for", "project": PID, "files": ["tests/sub/test_app2.py"]}))
+    assert r["bytes_total"] <= 100 and r["omitted"] >= 1
+
+
+def test_every_response_within_budget_and_has_hits(lit):
+    a = lit["a"]
+    calls = [dict(op="find_text", text="literal"), dict(op="find_text", text="literal", limit=10, max_chars=500),
+             dict(op="context_for", files=["tests/sub/test_app2.py"], max_chars=400),
+             dict(op="context_for", files=["app2.py", "svc.py"], max_chars=600),
+             dict(op="locate", query='"top level function error" top_func', max_chars=600),
+             dict(op="locate", query="top_func"), dict(op="expand", symbol="top_func()"),
+             dict(op="path", source="load()", target="helper_value()"), dict(op="stats"),
+             dict(op="find_text", text="zz"), dict(op="find_text", text="no such literal anywhere")]
+    for c in calls:
+        mc = c.get("max_chars", 1500)
+        r, raw, _ = a.call(project=PID, **c)
+        assert len(raw) <= mc, (c, len(raw))
+        assert isinstance(r["hits"], int) and r["chars"] == len(raw), (c, r)
+    h = a.call(op="health")[0]
+    assert h["hits"] == 0

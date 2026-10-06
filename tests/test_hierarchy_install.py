@@ -760,14 +760,9 @@ class HierarchyInstallTests(unittest.TestCase):
 
 
     def test_code_graph_bullet_present_in_body_for_every_host_target(self):
-        code_graph_bullet = (
-            "- Code graph: for a project registered with the code graph, locate code with the Switchboard "
-            "`code_graph` tool (op `locate`, then `expand` or `path`) before broad Grep/Glob/Read sweeps; "
-            "its read ops do not consume the direct-labour allowance. Results are locators (symbol, file:line, "
-            "confidence, freshness), never answers: read the cited primary lines before relying on them. "
-            "`confidence: low`, a miss, `stale: true`, module constants, and non-code files mean fall back "
-            "to a targeted grep (or `refresh` when stale). A graph miss is not evidence of absence."
-        )
+        code_graph_bullet = "- " + hierarchy_install.CODE_GRAPH_RULE
+        self.assertIn("optional", code_graph_bullet)
+        self.assertIn("Skip it for small or familiar code", code_graph_bullet)
         body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
         self.assertIn(code_graph_bullet, body)
 
@@ -786,14 +781,7 @@ class HierarchyInstallTests(unittest.TestCase):
             self.assertIn(code_graph_bullet, text, f"Missing code graph bullet in {name} global hierarchy")
 
     def test_install_over_pre_change_body_upgrades_to_new_body(self):
-        code_graph_bullet = (
-            "- Code graph: for a project registered with the code graph, locate code with the Switchboard "
-            "`code_graph` tool (op `locate`, then `expand` or `path`) before broad Grep/Glob/Read sweeps; "
-            "its read ops do not consume the direct-labour allowance. Results are locators (symbol, file:line, "
-            "confidence, freshness), never answers: read the cited primary lines before relying on them. "
-            "`confidence: low`, a miss, `stale: true`, module constants, and non-code files mean fall back "
-            "to a targeted grep (or `refresh` when stale). A graph miss is not evidence of absence."
-        )
+        code_graph_bullet = "- " + hierarchy_install.CODE_GRAPH_RULE
         current_body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
         pre_change_body = current_body.replace(code_graph_bullet + "\n", "")
         self.assertNotIn(code_graph_bullet, pre_change_body)
@@ -818,14 +806,7 @@ class HierarchyInstallTests(unittest.TestCase):
         self.assertEqual(second, "unchanged")
 
     def test_user_edited_pre_change_block_is_not_clobbered(self):
-        code_graph_bullet = (
-            "- Code graph: for a project registered with the code graph, locate code with the Switchboard "
-            "`code_graph` tool (op `locate`, then `expand` or `path`) before broad Grep/Glob/Read sweeps; "
-            "its read ops do not consume the direct-labour allowance. Results are locators (symbol, file:line, "
-            "confidence, freshness), never answers: read the cited primary lines before relying on them. "
-            "`confidence: low`, a miss, `stale: true`, module constants, and non-code files mean fall back "
-            "to a targeted grep (or `refresh` when stale). A graph miss is not evidence of absence."
-        )
+        code_graph_bullet = "- " + hierarchy_install.CODE_GRAPH_RULE
         current_body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
         pre_change_body = current_body.replace(code_graph_bullet + "\n", "")
         rendered = hierarchy_install._render_block(pre_change_body)

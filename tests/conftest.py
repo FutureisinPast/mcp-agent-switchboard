@@ -37,3 +37,12 @@ def _isolated_flash_apply_journal(tmp_path):
     memory = mock.patch.dict(broker._FLASH_APPLY_MEMORY, {}, clear=True)
     with flash_dir, memory:
         yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_broker_event_db(tmp_path, monkeypatch):
+    """handle_tool("code_graph") records a usage event through record_agent_event into
+    DB_PATH. No test may write the real broker DB, so every test gets a temp one; tests
+    that need a specific DB monkeypatch DB_PATH again after this fixture runs."""
+    monkeypatch.setattr(broker, "DB_PATH", tmp_path / "isolated-state.sqlite")
+    yield

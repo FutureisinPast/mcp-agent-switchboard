@@ -12,6 +12,7 @@ The one binary is dual-mode so a GitHub user needs no Python at all:
   agent-switchboard.exe --version       -> print the packaged release version
   agent-switchboard.exe routing-override -> register a package-specific gate override
   agent-switchboard.exe routing-report  -> summarize a session's routing lanes
+  agent-switchboard.exe code-graph-usage [--days N] -> summarize code_graph usage events
   agent-switchboard.exe canary flash    -> live read-only Flash dispatch + receipt
   agent-switchboard.exe gate-harness    -> deterministic proof the gate enforces
 
@@ -68,6 +69,9 @@ def run() -> int:
     if first == "routing-report":
         import routing_gate
         return routing_gate.routing_report_cli(sys.argv[2:])
+    if first == "code-graph-usage":
+        import routing_gate
+        return routing_gate.code_graph_usage_cli(sys.argv[2:])
     if first == "routing-hook":
         import routing_gate
         return routing_gate.main(sys.argv[2:])

@@ -188,6 +188,15 @@ On Windows, Switchboard-owned bounded subprocesses use hidden-window flags and a
 
 ## Changelog
 
+### v1.0.57 (`code_graph`: literal search, context suggestions, usage events, hot-reloading adapter)
+- Routing telemetry: async Flash dispatches now record their target and model, and request_result records the terminal outcome, so routing reports show real Flash use and failure rates (previously async packages were invisible to the gate log).
+- **String-literal index** built in the same pass and snapshot as the graph (AST owner for Python, textual candidates elsewhere; literals of 12+ characters; a miss is not absence). New op **`find_text`** answers "where does this message come from?"; a quoted phrase in `locate` now puts literal matches first. Every response carries an integer `hits`.
+- **`context_for`** (1-5 Python files): up to 5 suggested files to read next (imports, conftest, tests). Suggestion only: never includes the declared files and never widens allowed writes.
+- **Usage events:** one `kind=code_graph` row per call, with no query content. `agent-switchboard.exe code-graph-usage [--days N]` reports counts, hit/stale/truncated rates and per-session code_graph versus Read/Grep. It is descriptive only, and session attribution currently resolves Codex sessions only (other hosts show `unknown`).
+- **Hot-reloading adapter:** `install_code_graph.ps1` publishes immutable releases under `<home>\releases\<sha256-12>`, validates them (`py_compile` plus a stdio `health`), and writes the `runtime.json` marker last and atomically; the bridge switches to a new release after a health handshake, keeps the old child if it fails (`adapter_update_pending`), and never counts a planned reload toward the crash cap.
+- **Measured costs:** about +1 s per refresh and a 1.4 MB literal artifact on this repository. See `RELEASE_NOTES_v1.0.57.md`.
+- **Host rule:** The host rule for code_graph is now optional and situational (large or unfamiliar code, when several broad searches would otherwise be needed); models are told to skip it for small or familiar code, to avoid adding lookup overhead on top of required reads.
+
 ### v1.0.56 (WP-FL: validate once, apply last, truthful apply outcomes)
 - **Fixed the apply-then-reject bug:** a Flash accept-edits package could write its files and still be reported `rejected` / "NOT applied". Cause: two validations (the second ran after apply without the staging roots, so staged-path reports became out-of-scope) and model attestation ran after apply.
 - **Validate once, apply last:** one validation against the staging roots, every rejection check (including transcript attestation) before the first real write; staging is removed after apply. Apply happens only for a `completed` worker; `blocked`/`failed` edits are quarantine-only.

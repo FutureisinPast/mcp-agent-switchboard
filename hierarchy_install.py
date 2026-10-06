@@ -56,6 +56,18 @@ ROUTING_HOOK_WILDCARD_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
 # checksum matches neither check is a genuine user edit and stays refused.
 # Never hand-edit a checksum line to add yourself to this set; only record a
 # checksum actually produced by a prior `routing_rules_body()` release.
+# One source for the code_graph rule: the managed hierarchy body and the generated
+# ground rules both use it, so wording changes happen in exactly one place.
+CODE_GRAPH_RULE = (
+    "Code graph (optional): in a large or unfamiliar registered project, when you would otherwise run "
+    "several broad Grep/Glob/Read sweeps, the Switchboard `code_graph` tool can point you to the right "
+    "place first (`locate`, `find_text` for error or message strings, `expand`, `path`, `context_for` "
+    "for Flash read_context). Skip it for small or familiar code, or when one targeted grep or read will "
+    "do. Its read ops do not consume the direct-labour allowance. Results are locators, never answers: "
+    "read the cited lines before relying on them; a miss, `confidence: low` or `stale: true` means fall "
+    "back to a targeted grep."
+)
+
 KNOWN_HIERARCHY_BODY_CHECKSUMS = frozenset(
     {
         # v1.0.33 routing_rules_body(), rendered against the installer's test
@@ -340,7 +352,7 @@ def routing_rules_body(codex_roles: dict, claude_roles: dict) -> str:
 - A dirty worktree, same-session ownership, or deployment authority is not a blanket reason to keep reading, test execution, evidence gathering, documentation, or isolated mechanical edits on the brain. Retain only the specific overlapping write or high-risk state transition.
 - Brain overrides are package-specific and use exactly `override: brain - <WP-ID>: <specific reason>`. Bare/global overrides are invalid. The allowance is four direct labour calls per bounded block for non-mutating micro-work (no writes, no broad shell inspection, no delegation-sized evidence); after that, the installed `PreToolUse` gate denies the next eligible read/search/evidence/test/documentation/mechanical call until relief arrives. Relief comes from a verified Switchboard dispatch receipt, a managed native reader/workhorse package start, or a registered brain override using the gate-provided local `routing-override` command -- a failed, blocked, rejected, or unavailable dispatch earns no relief. Each relief opens only the next bounded block; completed planning delegation never disables implementation enforcement. Registered overrides must appear with the same reason in the final audit.
 - Brain-context ingress is capped by default at roughly 1-2k tokens (8,000 characters). Before a verification response enters brain context, request an explicit field projection and output cap. Oversized MCP evidence is quarantined outside context with its query and location; do not pull the whole artifact back into context.
-- Code graph: for a project registered with the code graph, locate code with the Switchboard `code_graph` tool (op `locate`, then `expand` or `path`) before broad Grep/Glob/Read sweeps; its read ops do not consume the direct-labour allowance. Results are locators (symbol, file:line, confidence, freshness), never answers: read the cited primary lines before relying on them. `confidence: low`, a miss, `stale: true`, module constants, and non-code files mean fall back to a targeted grep (or `refresh` when stale). A graph miss is not evidence of absence.
+- {CODE_GRAPH_RULE}
 - A claim is a decision premise when it being false would change the patch, risk classification, or release decision. The reader locates it; the brain adjudicates only the minimum primary evidence. Every brain-retained premise read states `premise | what changes if false | bounded primary evidence` before inspection. "Needs judgment" never justifies broad rereading.
 - Readers return file:line evidence and distinguish observed facts from interpretation. The brain reviews actual diffs and verification output. Reads may run in parallel; writes are serial unless files are demonstrably independent.
 - Background shell lifecycle is part of package completion: before claiming completion or returning, reconcile every Claude-managed background Bash/PowerShell/Monitor job started in that package by obtaining its terminal result or stopping it. Launching or detaching a job is never verification.

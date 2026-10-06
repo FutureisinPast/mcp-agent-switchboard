@@ -158,3 +158,81 @@ def test_symbol_coverage():
     cov = 100.0 * (len(todo) - len(misses)) / max(1, len(todo))
     print(f"coverage {cov:.2f}% ({len(todo) - len(misses)}/{len(todo)}); misses: {misses}")
     assert cov >= 99.0, f"code graph symbol coverage {cov:.2f}% < 99%; misses: {misses}"
+
+
+def _literal_questions():
+    with open(QUESTIONS_PATH, encoding="utf-8") as f:
+        return json.load(f).get("literal_questions", [])
+
+
+def _string_literals_in_symbol(path, symbol):
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == symbol:
+            out += [n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    return out
+
+
+def test_literal_ground_truth_exists():
+    qs = _literal_questions()
+    assert qs, "tests/code_graph_questions.json has no literal_questions"
+    bad = []
+    for q in qs:
+        path = os.path.join(REPO, q["file"])
+        if not os.path.isfile(path):
+            bad.append(f"{q['id']}: file {q['file']} no longer exists")
+        elif not any(q["text"] in lit for lit in _string_literals_in_symbol(path, q["symbol"])):
+            bad.append(f"{q['id']}: {q['text']!r} is not inside a string literal in {q['symbol']} of {q['file']}")
+    assert not bad, "Literal ground truth is stale - update literal_questions in tests/code_graph_questions.json:\n" + "\n".join(bad)
+
+
+def test_find_text_known_messages():
+    bad = []
+    for q in _literal_questions():
+        r = code_graph_bridge.call({"op": "find_text", "project": PROJECT, "text": q["text"]})
+        assert r.get("ok"), f"find_text failed for {q['id']}: {r}"
+        assert isinstance(r.get("hits"), int), f"{q['id']}: response lacks integer hits"
+        size = len(json.dumps(r, ensure_ascii=False, separators=(",", ":")))
+        if r.get("chars", 0) > 1500 or size > 1500:
+            bad.append(f"{q['id']}: response {size} chars (reported {r.get('chars')}) > 1500")
+        if not any(m.get("file") == q["file"] and m.get("symbol") == q["symbol"] and m.get("owner") == "ast"
+                   for m in r.get("matches", [])):
+            bad.append(f"{q['id']}: no ast-owned match for {q['symbol']}@{q['file']}")
+    assert not bad, "find_text regression:\n" + "\n".join(bad)
+
+
+def _local_imports(path):
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    mods = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            mods.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            mods.add(node.module.split(".")[0])
+    return {m + ".py" for m in mods if os.path.isfile(os.path.join(REPO, m + ".py"))}
+
+
+def test_context_for_imports():
+    declared = "routing_gate.py"
+    real = _local_imports(os.path.join(REPO, declared))
+    assert real, "routing_gate.py has no local imports any more - pick another declared file"
+    r = code_graph_bridge.call({"op": "context_for", "project": PROJECT, "files": [declared]})
+    assert r.get("ok"), f"context_for failed: {r}"
+    sug = r.get("suggestions", [])
+    assert len(sug) <= 5, f"more than 5 suggestions: {len(sug)}"
+    assert all(s.get("file") != declared for s in sug), "suggestions include the declared file"
+    assert any(s.get("file") in real and s.get("reason") == "import" for s in sug), (
+        f"no real local import of {declared} ({sorted(real)}) suggested with reason import: {sug}")
+    assert isinstance(r.get("hits"), int)
+
+
+def test_bridge_adapter_comes_from_release_marker():
+    home, _py, adapter, _pj = code_graph_bridge.get_bridge()._resolve_paths()
+    marker = home / "runtime.json"
+    if not marker.exists():
+        pytest.skip("no runtime.json marker (legacy install)")
+    release = json.loads(marker.read_text(encoding="utf-8"))["release"]
+    assert adapter == home / "releases" / release / "gfy_adapter.py"
