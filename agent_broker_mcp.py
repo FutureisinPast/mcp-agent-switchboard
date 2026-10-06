@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 import atomic_io
+import code_graph_bridge
 import flash_manifest
 import hierarchy_install
 import model_roles
@@ -723,6 +724,7 @@ COST_AWARE_ROUTING_RULES = [
     "A dirty worktree or same-session ownership never excuses keeping read-only inventory, tests, evidence, docs, or isolated mechanical work on the brain; only the exact overlapping write or high-risk state transition may be retained.",
     "The installed PreToolUse gate allows a small allowance of direct brain labour calls (default four, for non-mutating micro-work such as reading your own handoff and adjudicating a premise), then denies the next eligible labour call until relief arrives. Relief comes from a completed Switchboard dispatch whose ledger receipt verifies, a managed same-vendor reader/workhorse package, or an exact brain override registered with the local routing-override command the gate supplies. A failed, blocked, rejected, or unavailable dispatch earns no relief -- credit cannot be farmed by firing a route known to fail. Each relief opens only the next bounded block; registered overrides must appear in the final audit.",
     "Brain-context ingress defaults to at most 8,000 characters (roughly 1-2k tokens). Verification calls declare a field projection and output cap; oversized raw evidence stays outside context with its query and location.",
+    "Code graph: for a project registered with the code graph, locate code with the Switchboard `code_graph` tool (op `locate`, then `expand` or `path`) before broad Grep/Glob/Read sweeps; its read ops do not consume the direct-labour allowance. Results are locators (symbol, file:line, confidence, freshness), never answers: read the cited primary lines before relying on them. `confidence: low`, a miss, `stale: true`, module constants, and non-code files mean fall back to a targeted grep (or `refresh` when stale). A graph miss is not evidence of absence.",
     "A decision premise is a claim whose falsity changes the patch, risk classification, or release decision. The reader locates minimal primary evidence; the brain states premise | what changes if false | bounded primary evidence and adjudicates only that range. Never launder a reader interpretation into fact.",
     "Do not accept a worker summary as proof. Validate file-and-line evidence, the actual diff, and check output before signoff.",
     "Do NOT write a routing audit into your reply. The broker records every lane automatically -- each tool call, native subagent start, brain override, and Switchboard receipt is written to an append-only session ledger, which is more reliable than a model retyping it. Show it only when the user asks for it, by running `agent-switchboard.exe routing-report --table` (or `routing-report` for the summary) and returning that output; the backend renders the table identically every time. Registering an override with the routing-override command still matters and is still recorded -- only the recited audit is gone. Hosts that want the model to attest to its own work can set AGENT_BROKER_AUDIT_MODE=require to restore the mandatory audit.",
@@ -3875,6 +3877,7 @@ def native_semantic_lane(args: dict[str, Any], task_kind: Any = None) -> str:
 def native_handoff_for_flash_outcome(
     args: dict[str, Any], outcome: str | None, receipt: str | None,
     quarantine_files: list[str] | None = None, quarantine_diff: str | None = None,
+    missing_context: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """Describe, but never launch, the Codex/Claude native fallback for failed Flash work."""
     if outcome == FLASH_OUTCOME_CREDITABLE or not receipt:
@@ -3894,7 +3897,7 @@ def native_handoff_for_flash_outcome(
         effort = None if lane == "reader" else "medium"
     unavailable = outcome == "unavailable_pre_mutation"
     reason = f"{'flash-unavailable' if unavailable else 'flash-failed'}:{receipt}"
-    needs_review = outcome in {"rejected", "blocked", "failed_pre_mutation"}
+    needs_review = outcome in {"rejected", "blocked", "failed_pre_mutation", *FLASH_APPLIED_OUTCOMES}
     handoff = {
         "work_package_id": str(args.get("work_package_id") or "").strip() or None,
         "semantic_lane": lane,
@@ -3916,6 +3919,19 @@ def native_handoff_for_flash_outcome(
         handoff["quarantine_diff"] = quarantine_diff
         handoff["salvage_note"] = (
             "The worker's edited files are kept in quarantine for review only; they were NOT applied."
+        )
+    if outcome == "needs_context":
+        handoff["flash_skip_reason"] = None
+        handoff["record_requirement"] = "Not a Flash failure: no native fallback is needed."
+        handoff["missing_context_files"] = list(missing_context or [])
+        handoff["action"] = (
+            "Re-dispatch the same package to Flash with these paths added to read_context: "
+            + json.dumps(list(missing_context or []))
+        )
+    if outcome in FLASH_APPLIED_OUTCOMES:
+        handoff["action"] = (
+            "Do NOT replay this package: it already wrote files (or may have). Review the applied files "
+            "and the git diff first, then decide what remains."
         )
     if needs_review:
         handoff["brain_review"] = {
@@ -5170,8 +5186,11 @@ def run_process(
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     env_allow_prefixes: tuple[str, ...] = (),
     env_allow_names: tuple[str, ...] = (),
+    extra_env: Mapping[str, str] | None = None,
 ) -> tuple[int, str, str]:
     env = child_environment(env_allow_prefixes, env_allow_names)
+    if extra_env:
+        env.update({str(k): str(v) for k, v in extra_env.items()})
     # CREATE_NO_WINDOW so the CLI child (codex/claude/gemini) never pops a console window,
     # even when spawned from the windowless detached worker.
     creationflags = (subprocess.CREATE_NEW_PROCESS_GROUP | WINDOWS_NO_WINDOW) if os.name == "nt" else 0
@@ -6021,6 +6040,323 @@ def _attest_flash_model_from_transcript(conversation_id: str) -> str | None:
         return None
 
 
+
+
+def _flash_apply_dir() -> Path:
+    """Resolved at call time so a relocated BROKER_DIR (tests, AGENT_BROKER_HOME) is honoured."""
+    return BROKER_DIR / "flash-apply"
+
+
+FLASH_APPLIED_OUTCOMES = ("applied_then_rejected", "apply_outcome_uncertain")
+FLASH_TRANSCRIPT_WAIT_SECONDS = 3.0
+_FLASH_APPLY_MEMORY: dict[tuple[str, str], dict[str, Any]] = {}
+_FLASH_STALE_NOT_APPLIED_RE = re.compile(
+    r"NOT applied|nothing was written back|NOT accepted and NOT applied|not_applied", re.IGNORECASE
+)
+
+
+def flash_worker_env_overrides(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Environment the Flash worker must NOT inherit from the allowlist alone.
+
+    A worker that runs the tests would otherwise litter the staging tree with
+    bytecode and a pytest cache. An existing PYTEST_ADDOPTS is preserved, not
+    replaced.
+    """
+    source = os.environ if environ is None else environ
+    existing = str(source.get("PYTEST_ADDOPTS") or "").strip()
+    if "no:cacheprovider" not in existing:
+        existing = f"{existing} -p no:cacheprovider".strip()
+    return {"PYTHONDONTWRITEBYTECODE": "1", "PYTEST_ADDOPTS": existing}
+
+
+def _flash_apply_record_path(package_id: str, token: str) -> Path:
+    """One file per RUN: sha256 of the FULL package id plus the run token. The
+    sanitized prefix is for readability only and never takes part in identity."""
+    pid = str(package_id or "")
+    digest = hashlib.sha256(pid.encode("utf-8")).hexdigest()[:24]
+    readable = re.sub(r"[^A-Za-z0-9_.-]", "_", pid)[:24]
+    safe_token = re.sub(r"[^A-Za-z0-9_.-]", "_", str(token or ""))[:80]
+    return _flash_apply_dir() / f"{readable}-{digest}-{safe_token}.json"
+
+
+def _flash_apply_journal(
+    package_id: str, token: str, state: str, *, candidates: list[str] | None = None,
+    applied: list[str] | None = None,
+) -> None:
+    """Durable evidence of how far ONE run's write-back got. Never raises.
+
+    Written BEFORE the first real write (``apply_started``) and updated when the
+    outcome is known, so a crash, kill or later exception cannot turn a commit
+    into a clean-looking rejection: whoever builds a failure envelope consults
+    this first. Identity is (package_id, run token); no time window is involved.
+    """
+    pid = str(package_id or "")
+    tok = str(token or "")
+    previous = _flash_apply_record(pid, tok) or {}
+    if previous.get("state") in ("committed", "rollback_incomplete") and state != previous.get("state"):
+        # A commit is sticky: a restarted worker re-entering apply_started/no_write for the
+        # same run must never erase the evidence that files were written.
+        log(f"flash apply journal: refused {previous.get('state')} -> {state} for {pid}/{tok}")
+        return
+    record = {
+        "package_id": pid,
+        "token": tok,
+        "state": state,
+        "ts": time.time(),
+        "candidates": list(candidates if candidates is not None else previous.get("candidates") or []),
+        "applied": list(applied or []),
+        "pid": os.getpid(),
+    }
+    _FLASH_APPLY_MEMORY[(pid, tok)] = record
+    try:
+        _flash_apply_dir().mkdir(parents=True, exist_ok=True)
+        atomic_io.atomic_write_text(_flash_apply_record_path(pid, tok), json.dumps(record))
+    except Exception as exc:  # noqa: BLE001
+        log(f"flash apply journal write failed for {pid}/{tok}: {exc}")
+
+
+def _flash_apply_record(package_id: Any, token: Any) -> dict[str, Any] | None:
+    """This run's journal record, or None. A token is REQUIRED and both ids are
+    compared exactly, so another run (or a colliding file name) can never match."""
+    pid = str(package_id or "")
+    tok = str(token or "")
+    if not pid or not tok:
+        return None
+    record = _FLASH_APPLY_MEMORY.get((pid, tok))
+    try:
+        path = _flash_apply_record_path(pid, tok)
+        if path.exists():
+            disk = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                isinstance(disk, dict)
+                and disk.get("package_id") == pid
+                and disk.get("token") == tok
+                and (not record or float(disk.get("ts") or 0) >= float(record.get("ts") or 0))
+            ):
+                record = disk
+    except Exception:  # noqa: BLE001
+        pass
+    if record and record.get("package_id") == pid and record.get("token") == tok:
+        return record
+    return None
+
+
+def _flash_apply_state(package_id: Any, token: Any) -> str | None:
+    record = _flash_apply_record(package_id, token)
+    return str(record.get("state")) if record else None
+
+
+def _flash_apply_lookup_truth(package_id: Any, token: Any) -> dict[str, Any] | None:
+    """The truthful post-apply disposition for THIS run, or None when no real file
+    could have been written (never started, refused clean, rolled back)."""
+    record = _flash_apply_record(package_id, token)
+    if not record:
+        return None
+    state = record.get("state")
+    if state == "committed":
+        return {"disposition": "applied_then_rejected", "files": list(record.get("applied") or []), "rollback_incomplete": False}
+    if state == "rollback_incomplete":
+        return {"disposition": "applied_then_rejected", "files": list(record.get("applied") or []), "rollback_incomplete": True}
+    if state == "apply_started":
+        return {"disposition": "apply_outcome_uncertain", "files": list(record.get("candidates") or []), "rollback_incomplete": False}
+    return None
+
+
+def _flash_scrub_stale_claims(text: Any) -> str:
+    return _FLASH_STALE_NOT_APPLIED_RE.sub("[stale claim removed]", str(text or ""))
+
+
+def _flash_applied_message(disposition: str, files: list[str], reason: str, rollback_incomplete: bool = False) -> str:
+    listing = json.dumps(list(files))
+    cause = _flash_scrub_stale_claims(reason)[:600] or "unknown"
+    if disposition == "apply_outcome_uncertain":
+        return (
+            "Antigravity CLI could not confirm whether the workspace write-back finished "
+            f"(apply_outcome_uncertain). Candidate files that MAY have been written: {listing}. "
+            f"Cause: {cause}. This is NOT a clean rejection: inspect the files and the git diff "
+            "before any replay."
+        )
+    note = (
+        " A rollback was attempted and did not complete (rollback_incomplete): these files may hold partial content."
+        if rollback_incomplete
+        else ""
+    )
+    return (
+        f"Antigravity CLI wrote {len(files)} file(s) to the workspace and a later step then failed "
+        f"(applied_then_rejected). Applied files: {listing}. Cause: {cause}.{note} "
+        "This is NOT a clean rejection: the files are on disk; review the git diff before any replay."
+    )
+
+
+def _flash_applied_envelope(
+    package_id: Any,
+    disposition: str,
+    files: list[str],
+    reason: str,
+    *,
+    rollback_incomplete: bool = False,
+    structured: dict[str, Any] | None = None,
+    containment: dict[str, Any] | None = None,
+    apply_report: dict[str, Any] | None = None,
+    cli: dict[str, Any] | None = None,
+    caveats: list[Any] | None = None,
+) -> str:
+    """The single builder for a post-commit failure envelope. Never raises."""
+    message = _flash_applied_message(disposition, files, reason, rollback_incomplete)
+    envelope: dict[str, Any] = {
+        "package_id": package_id,
+        "worker_status": disposition,
+        "structured_output": structured,
+        "caveats": list(caveats or []),
+        "disposition": disposition,
+        "outcome": disposition,
+        "message": message,
+        "post_commit_error": _flash_scrub_stale_claims(reason)[:600],
+        "rollback_incomplete": bool(rollback_incomplete),
+        "applied_files" if disposition == "applied_then_rejected" else "candidate_files": list(files),
+    }
+    if cli is not None:
+        envelope["cli"] = cli
+    if containment is not None:
+        envelope["containment"] = containment
+    if apply_report is not None:
+        envelope["containment_apply"] = apply_report
+    try:
+        return json.dumps(envelope, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        return json.dumps(
+            {"package_id": str(package_id), "worker_status": disposition, "disposition": disposition,
+             "outcome": disposition, "message": message, "structured_output": None, "caveats": []},
+            ensure_ascii=False,
+        )
+
+
+def _flash_report_committed_files(apply_report: dict[str, Any] | None) -> list[str]:
+    report = apply_report or {}
+    return sorted({str(x) for x in (report.get("applied") or []) + (report.get("affected_files") or [])})
+
+
+def _flash_commit_apply(
+    staged: Any, changes: dict[str, Any], package_id: str, candidates: list[str], token: str = ""
+) -> dict[str, Any]:
+    """Run apply_changes with durable commit evidence around it."""
+    _flash_apply_journal(package_id, token, "apply_started", candidates=candidates)
+    try:
+        report = flash_manifest.apply_changes(staged, changes)
+    except Exception as exc:  # noqa: BLE001
+        # The write may have partly happened; the journal stays apply_started.
+        return {
+            "applied": [],
+            "refused": True,
+            "reasons": [f"apply raised {type(exc).__name__}: {exc}"],
+            "integrity": "indeterminate",
+            "apply_outcome_uncertain": True,
+            "candidate_files": list(candidates),
+        }
+    if report.get("rollback_incomplete"):
+        _flash_apply_journal(package_id, token, "rollback_incomplete", applied=_flash_report_committed_files(report))
+    elif report.get("applied"):
+        _flash_apply_journal(package_id, token, "committed", applied=list(report.get("applied") or []))
+    elif report.get("rolled_back"):
+        _flash_apply_journal(package_id, token, "rolled_back")
+    else:
+        _flash_apply_journal(package_id, token, "no_write")
+    return report
+
+
+def _wait_for_flash_transcript(conversation_id: str, wait_seconds: float | None = None) -> bool:
+    """agy has already exited, but its transcript may not be flushed yet. Wait a
+    short, bounded time for it to exist and be non-empty."""
+    bound = FLASH_TRANSCRIPT_WAIT_SECONDS if wait_seconds is None else wait_seconds
+    deadline = time.monotonic() + max(0.0, bound)
+    transcript = _antigravity_cli_home() / "brain" / str(conversation_id) / ".system_generated" / "logs" / "transcript.jsonl"
+    while True:
+        try:
+            if transcript.exists() and transcript.stat().st_size > 0:
+                return True
+        except OSError:
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+_FLASH_MODULE_MISSING_RES = (
+    re.compile(r"No module named ['\"]([A-Za-z_][\w.]*)['\"]"),
+    re.compile(r"cannot import name ['\"][\w]+['\"] from ['\"]([A-Za-z_][\w.]*)['\"]"),
+)
+_FLASH_IMPORT_ERROR_RE = re.compile(r"\b(?:ModuleNotFoundError|ImportError)\b")
+_FLASH_ANY_ERROR_RE = re.compile(r"\b\w*Error\b")
+_FLASH_FAIL_MARKER_RE = re.compile(r"\b(?:FAILED|ERROR)\b")
+_FLASH_CONTRADICTS_FAILED_CHECK = "status=completed contradicts a failed check"
+
+
+def _flash_needs_context_files(
+    structured: Any, errors: list[str], package: dict[str, Any], staged: Any
+) -> list[str] | None:
+    """Workspace files a worker's failed checks were missing from the staging copy.
+
+    Deliberately narrow (a staging limitation, never an auto-pass): the ONLY
+    validation error must be the failed-check contradiction and there must be at
+    least one failed check. EVERY failed check must have an excerpt in which every
+    failure marker is import-related: no ``assert`` text, no ``*Error`` other than
+    ImportError/ModuleNotFoundError, and no more FAILED/ERROR markers than import
+    errors. Each module M it names must resolve to ``<M>.py`` or
+    ``<M>/__init__.py`` under the WORKSPACE root (never a package root, which could
+    hide a wrong-import-root bug) and that file must not be in the staged manifest.
+    Anything else returns None -> a rejection.
+    """
+    if errors != [_FLASH_CONTRADICTS_FAILED_CHECK] or not isinstance(structured, dict):
+        return None
+    failed = [
+        c for c in (structured.get("checks") or [])
+        if isinstance(c, dict) and c.get("status") == "failed"
+    ]
+    if not failed:
+        return None
+    workspace = Path(str(getattr(staged, "workspace_root", "") or package.get("workspace_root") or ""))
+    staged_rels = set(getattr(staged, "baseline", {}) or {}) | set(getattr(staged, "create_targets", {}) or {})
+    missing: list[str] = []
+    for check in failed:
+        excerpt = str(check.get("output_excerpt") or "")
+        import_errors = len(_FLASH_IMPORT_ERROR_RE.findall(excerpt))
+        if import_errors == 0:
+            return None
+        if re.search(r"\bassert\b", excerpt):
+            return None
+        if any(
+            name not in {"ImportError", "ModuleNotFoundError"}
+            for name in _FLASH_ANY_ERROR_RE.findall(excerpt)
+        ):
+            return None
+        if len(_FLASH_FAIL_MARKER_RE.findall(excerpt)) > import_errors:
+            return None
+        modules = [m for rx in _FLASH_MODULE_MISSING_RES for m in rx.findall(excerpt)]
+        if not modules:
+            return None
+        for module in modules:
+            parts = module.split(".")
+            found = None
+            for candidate in (Path(*parts).with_suffix(".py"), Path(*parts) / "__init__.py"):
+                full = workspace / candidate
+                try:
+                    if not full.is_file():
+                        continue
+                    rel = full.resolve().relative_to(workspace.resolve()).as_posix()
+                except (OSError, ValueError):
+                    continue
+                found = (rel, full)
+                break
+            if not found:
+                return None
+            rel, full = found
+            if rel in staged_rels:
+                return None
+            if str(full) not in missing:
+                missing.append(str(full))
+    return missing or None
+
+
 def consult_antigravity_cli(
     project: str | None,
     prompt: str,
@@ -6030,7 +6366,9 @@ def consult_antigravity_cli(
     timeout: int = SYNC_CONSULT_TIMEOUT_SECONDS,
     work_package: dict[str, Any] | None = None,
     timeout_meta_out: dict[str, Any] | None = None,
+    run_token: str | None = None,
 ) -> str:
+    run_token = str(run_token or "").strip() or uuid.uuid4().hex
     config = load_config()
     agy = discover_antigravity_cli(config)
     if not agy:
@@ -6105,19 +6443,34 @@ def consult_antigravity_cli(
             "--print-timeout",
             f"{int(timeout)}s",
             "--print",
-            sanitize_flash_workhorse_prompt(prompt) + flash_manifest.prompt_appendix(staged),
+            (
+                flash_manifest.remap_to_staged(sanitize_flash_workhorse_prompt(prompt), staged)
+                if implementation_mode
+                else sanitize_flash_workhorse_prompt(prompt)
+            )
+            + flash_manifest.prompt_appendix(staged, real_table=implementation_mode),
         ]
     )
     apply_report: dict[str, Any] | None = None
     staging_changes: dict[str, Any] | None = None
     salvage: dict[str, Any] | None = None
     flash_launch_epoch = time.time()
+    package_id = str(package.get("package_id") or "")
+    code, stdout, stderr = 0, "", ""
+    outer: Any = None
+    structured: dict[str, Any] | None = None
+    caveats: list[dict[str, str]] = []
+    pre_failure: dict[str, Any] | None = None
+    attested_model: str | None = None
+    attestation_source = "none"
+    candidates: list[str] = []
     try:
         code, stdout, stderr = run_process(
             command,
             str(staged.root),
             None,
             timeout=timeout,
+            extra_env=flash_worker_env_overrides(),
         )
         # The ENTIRE staging tree is diffed, not just the declared paths: the case
         # worth catching is a worker that created or rewrote something it never
@@ -6127,166 +6480,253 @@ def consult_antigravity_cli(
             # Copy the worker's edited/created allowed files out BEFORE the staging tree
             # is removed, so a rejected or failed package can still be reviewed/salvaged.
             salvage = _collect_flash_salvage(staged, staging_changes)
-        # Validate BEFORE touching the real tree. Applying first and validating
-        # afterwards meant a dispatch could mutate the workspace and still report
-        # failure to the caller -- the exact opposite of "a failure applies
-        # nothing", and it made the outcome depend on which check tripped first.
-        pre_outer_payload: dict[str, Any] | None = None
-        pre_validation_failures: list[str] = []
-        if implementation_mode and code == 0:
-            try:
-                pre_outer = json.loads(stdout or stderr or "null")
-            except json.JSONDecodeError:
-                pre_outer = None
-            if pre_outer is None:
-                pre_errors = ["agy returned no parseable output"]
+        # VALIDATE ONCE, APPLY LAST. The payload is parsed and judged exactly once,
+        # against the staging roots (the worker reports staged paths), and EVERY
+        # rejection check -- schema, scope, criteria, status consistency and model
+        # attestation -- runs here, before the first real write. A second validation
+        # after apply could not see the staging root and turned a committed write
+        # into a "rejected / NOT applied" receipt.
+        if code == 0:
+            raw = stdout or stderr
+            if implementation_mode:
+                try:
+                    outer = json.loads(raw or "null")
+                except json.JSONDecodeError:
+                    outer = None
+                if outer is None:
+                    pre_failure = {"kind": "unparseable", "errors": ["agy returned no parseable output"]}
+            elif not raw:
+                pre_failure = {"kind": "no_output", "errors": ["agy returned no output"]}
             else:
-                pre_outer_payload = pre_outer if isinstance(pre_outer, dict) else None
-                _, pre_errors = validate_flash_workhorse_result(pre_outer, package, staged)
-            if pre_errors:
-                pre_validation_failures = pre_errors
-                apply_report = {
-                    "applied": [],
-                    "refused": True,
-                    "reasons": ["structured output failed validation; nothing was written back"]
-                    + pre_errors,
-                    "integrity": "verified",
-                }
-            else:
-                apply_report = flash_manifest.apply_changes(staged, staging_changes)
+                try:
+                    outer = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    pre_failure = {"kind": "invalid_json", "errors": [f"invalid JSON ({exc})"], "exc": str(exc)}
+            if pre_failure is None:
+                structured, validation_errors = validate_flash_workhorse_result(
+                    outer, package, staged, caveats_out=caveats
+                )
+                if validation_errors:
+                    missing_context = (
+                        _flash_needs_context_files(structured, validation_errors, package, staged)
+                        if implementation_mode else None
+                    )
+                    if missing_context:
+                        pre_failure = {
+                            "kind": "needs_context", "errors": validation_errors, "missing": missing_context,
+                        }
+                    else:
+                        pre_failure = {"kind": "validation", "errors": validation_errors}
+            if pre_failure is None:
+                backend_model = outer.get("model") or outer.get("model_id") or None
+                attested_model = backend_model
+                attestation_source = "backend" if backend_model else "none"
+                conversation_id = outer.get("conversation_id")
+                if not attested_model and conversation_id:
+                    if implementation_mode and model_name and not _wait_for_flash_transcript(str(conversation_id)):
+                        pre_failure = {
+                            "kind": "attestation_unavailable",
+                            "errors": [
+                                "model attestation transcript was not available after a bounded wait; "
+                                "an unattested model is never accepted before a workspace write"
+                            ],
+                        }
+                    else:
+                        transcript_attested = _attest_flash_model_from_transcript(str(conversation_id))
+                        if transcript_attested:
+                            attested_model = transcript_attested
+                            attestation_source = "transcript"
+            if pre_failure is None:
+                conflict = attested_model_conflict(model_name, attested_model)
+                if conflict:
+                    pre_failure = {"kind": "attestation", "errors": [conflict]}
+            if implementation_mode:
+                if pre_failure is not None:
+                    apply_report = {
+                        "applied": [],
+                        "refused": True,
+                        "reasons": ["structured output failed validation; nothing was written back"]
+                        + list(pre_failure["errors"]),
+                        "integrity": "verified",
+                    }
+                elif (structured or {}).get("status") != "completed":
+                    # Only a worker that reports full success may write the real tree. A
+                    # blocked or failed worker's edits are salvage for review, never applied.
+                    apply_report = {
+                        "applied": [],
+                        "refused": False,
+                        "skipped": True,
+                        "reasons": [
+                            f"worker status is {(structured or {}).get('status')}; edits are quarantined, never applied"
+                        ],
+                        "integrity": "verified",
+                    }
+                else:
+                    candidates = [str(t) for _rel, _src, t in flash_manifest.planned_targets(staged, staging_changes)]
+                    apply_report = _flash_commit_apply(staged, staging_changes, package_id, candidates, run_token)
     finally:
+        # The staging tree outlives the apply on purpose and is removed only now.
         shutil.rmtree(staged.root, ignore_errors=True)
 
-    containment_report = flash_manifest.containment_receipt(
-        staged, manifest, staging_changes, apply_report
-    )
-    if apply_report is not None and apply_report.get("refused"):
-        # Report and refuse; never "clean up". An unexpected file may belong to the
-        # user or another process, and a deleted one cannot be restored from a hash.
-        # The brain decides what happened here.
-        reasons = apply_report.get("reasons") or []
-        quarantine = _quarantine_rejected(
-            package.get("package_id"), stdout, stderr, pre_outer_payload,
-            pre_validation_failures or reasons, salvage=salvage,
-        )
-        return (
-            "Antigravity CLI structured-output validation failed: the package was refused "
-            "and NOTHING was written back. "
-            + "; ".join(reasons)
-            + f" | integrity: {containment_report['integrity']}"
-            + _quarantine_suffix(quarantine)
-        )
-
-    if code == 124:
-        if timeout_meta_out is not None:
-            timeout_meta_out.update(
-                _classify_flash_timeout(str(package.get("package_id") or ""), flash_launch_epoch)
-            )
-        timeout_quarantine = (
-            _quarantine_rejected(package.get("package_id"), stdout, stderr, None,
-                                 ["agy timed out"], salvage=salvage)
-            if salvage and salvage.get("files") else None
-        )
-        return consult_timeout_message("Antigravity CLI", timeout, stdout) + _quarantine_suffix(timeout_quarantine)
-    if code != 0:
-        exit_quarantine = (
-            _quarantine_rejected(package.get("package_id"), stdout, stderr, None,
-                                 [f"agy exited with code {code}"], salvage=salvage)
-            if salvage and salvage.get("files") else None
-        )
-        return (
-            f"Antigravity CLI exited with code {code}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}".strip()
-            + _quarantine_suffix(exit_quarantine)
-        )
-    raw = stdout or stderr
-    # agy auto-denies every tool in headless print mode and can exit 0 with status
-    # SUCCESS and an empty response; the only explanation for that lives on stderr.
-    # Surface it (bounded, single-line) whenever we report a validation failure below,
-    # instead of discarding it -- that silent discard made real failures undiagnosable.
-    stderr_excerpt, stderr_log = persist_worker_stderr(package.get("package_id"), stderr)
-    stderr_note = f" | worker stderr: {stderr_excerpt}" if stderr_excerpt else ""
-    if stderr_log:
-        stderr_note += f" | full log: {stderr_log}"
-    if not raw:
-        quarantine = _quarantine_rejected(
-            package.get("package_id"), stdout, stderr, None, ["agy returned no output"], salvage=salvage
-        )
-        return (
-            "Antigravity CLI structured-output validation failed: agy returned no output."
-            + stderr_note + _quarantine_suffix(quarantine)
-        )
+    committed_files = _flash_report_committed_files(apply_report)
+    apply_uncertain = bool(apply_report and apply_report.get("apply_outcome_uncertain")) and not committed_files
     try:
-        outer = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        quarantine = _quarantine_rejected(
-            package.get("package_id"), stdout, stderr, None, [f"invalid JSON ({exc})"], salvage=salvage
+        containment_report = flash_manifest.containment_receipt(
+            staged, manifest, staging_changes, apply_report
         )
-        return (
-            f"Antigravity CLI structured-output validation failed: invalid JSON ({exc})."
-            + stderr_note + _quarantine_suffix(quarantine)
-        )
-    caveats: list[dict[str, str]] = []
-    structured, validation_errors = validate_flash_workhorse_result(outer, package, caveats_out=caveats)
-    if validation_errors:
-        quarantine = _quarantine_rejected(
-            package.get("package_id"), stdout, stderr, outer, validation_errors, salvage=salvage
-        )
-        return (
-            "Antigravity CLI structured-output validation failed: " + "; ".join(validation_errors)
-            + stderr_note + _quarantine_suffix(quarantine)
-        )
-    attested_model = outer.get("model") or outer.get("model_id") or None
-    attestation_source = "backend" if attested_model else "none"
-    conversation_id = outer.get("conversation_id")
-    if not attested_model and conversation_id:
-        transcript_attested = _attest_flash_model_from_transcript(str(conversation_id))
-        if transcript_attested:
-            attested_model = transcript_attested
-            attestation_source = "transcript"
-    conflict = attested_model_conflict(model_name, attested_model)
-    if conflict:
-        quarantine = _quarantine_rejected(
-            package.get("package_id"), stdout, stderr, outer, [conflict], salvage=salvage
-        )
-        return (
-            "Antigravity CLI structured-output validation failed: " + conflict
-            + stderr_note + _quarantine_suffix(quarantine)
-        )
-    worker_reported_status = structured.get("status") if structured else "failed"
-    demoted_worker_status = worker_reported_status
-    if caveats and worker_reported_status == "completed":
-        # completed_with_caveats is a broker-assigned envelope status ONLY --
-        # the worker itself never emits it. It records that the structured
-        # payload validated fully but the CLI's own exit/transport status did
-        # not match, so the caller should not treat this as an unqualified
-        # completion without reading the caveat.
-        demoted_worker_status = "completed_with_caveats"
-    normalized = {
-        "package_id": package["package_id"],
-        "worker_status": demoted_worker_status,
-        "structured_output": structured,
-        "caveats": caveats,
-        # The broker's own acceptance verdict. Never infer acceptance from
-        # "a payload exists" or "a path is present" -- key on this field.
-        "disposition": "accepted_with_caveats" if caveats else "accepted",
-        "cli": {
-            "conversation_id": outer.get("conversation_id"),
-            "duration_seconds": outer.get("duration_seconds"),
-            "num_turns": outer.get("num_turns"),
-            "usage": outer.get("usage"),
-            "model": attested_model,
-            "requested_model": model_name,
-            "attestation": attestation_source,
-            "model_attested": bool(
-                attested_model and model_name
-                and normalize_lookup(attested_model) == normalize_lookup(model_name)
-            ),
-        },
-        "containment": containment_report,
-    }
-    if apply_report is not None:
-        normalized["containment_apply"] = apply_report
-    return json.dumps(normalized, ensure_ascii=False)
+        if apply_report is not None and apply_report.get("refused"):
+            if committed_files or apply_uncertain:
+                # Files may be on disk (rollback incomplete, or apply raised). This is
+                # never a clean rejection, and must not read as one.
+                return _flash_applied_envelope(
+                    package_id,
+                    "apply_outcome_uncertain" if apply_uncertain else "applied_then_rejected",
+                    committed_files or list(apply_report.get("candidate_files") or candidates),
+                    "; ".join(str(r) for r in (apply_report.get("reasons") or [])),
+                    rollback_incomplete=bool(apply_report.get("rollback_incomplete")),
+                    structured=structured,
+                    containment=containment_report,
+                    apply_report=apply_report,
+                )
+            # Report and refuse; never "clean up". An unexpected file may belong to the
+            # user or another process, and a deleted one cannot be restored from a hash.
+            # The brain decides what happened here.
+            reasons = apply_report.get("reasons") or []
+            quarantine = _quarantine_rejected(
+                package.get("package_id"), stdout, stderr, outer if isinstance(outer, dict) else None,
+                (pre_failure["errors"] if pre_failure else None) or reasons, salvage=salvage,
+            )
+            if pre_failure and pre_failure.get("kind") == "needs_context":
+                missing_files = list(pre_failure["missing"])
+                return (
+                    "Antigravity CLI needs_context: the worker's failed check(s) were caused only by workspace "
+                    "module files missing from the staging copy, not by the work itself. Nothing was applied. "
+                    f"needs_context_files: {json.dumps(missing_files)} | "
+                    "re-dispatch with these paths in read_context."
+                    + f" | integrity: {containment_report['integrity']}"
+                    + _quarantine_suffix(quarantine)
+                )
+            if apply_report.get("rolled_back"):
+                verdict = (
+                    "the package was refused: the write-back failed part-way and every written file was "
+                    "ROLLED BACK to its baseline (rolled_back). "
+                )
+            else:
+                verdict = "the package was refused and NOTHING was written back. "
+            return (
+                "Antigravity CLI structured-output validation failed: "
+                + verdict
+                + "; ".join(reasons)
+                + f" | integrity: {containment_report['integrity']}"
+                + _quarantine_suffix(quarantine)
+            )
+
+        if code == 124:
+            if timeout_meta_out is not None:
+                timeout_meta_out.update(
+                    _classify_flash_timeout(str(package.get("package_id") or ""), flash_launch_epoch)
+                )
+            timeout_quarantine = (
+                _quarantine_rejected(package.get("package_id"), stdout, stderr, None,
+                                     ["agy timed out"], salvage=salvage)
+                if salvage and salvage.get("files") else None
+            )
+            return consult_timeout_message("Antigravity CLI", timeout, stdout) + _quarantine_suffix(timeout_quarantine)
+        if code != 0:
+            exit_quarantine = (
+                _quarantine_rejected(package.get("package_id"), stdout, stderr, None,
+                                     [f"agy exited with code {code}"], salvage=salvage)
+                if salvage and salvage.get("files") else None
+            )
+            return (
+                f"Antigravity CLI exited with code {code}.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}".strip()
+                + _quarantine_suffix(exit_quarantine)
+            )
+        # agy auto-denies every tool in headless print mode and can exit 0 with status
+        # SUCCESS and an empty response; the only explanation for that lives on stderr.
+        # Surface it (bounded, single-line) whenever we report a validation failure below,
+        # instead of discarding it -- that silent discard made real failures undiagnosable.
+        stderr_excerpt, stderr_log = persist_worker_stderr(package.get("package_id"), stderr)
+        stderr_note = f" | worker stderr: {stderr_excerpt}" if stderr_excerpt else ""
+        if stderr_log:
+            stderr_note += f" | full log: {stderr_log}"
+        if pre_failure is not None:
+            kind = pre_failure["kind"]
+            quarantine = _quarantine_rejected(
+                package.get("package_id"), stdout, stderr,
+                outer if isinstance(outer, dict) else None, list(pre_failure["errors"]), salvage=salvage,
+            )
+            if kind == "no_output":
+                body = "agy returned no output."
+            elif kind == "invalid_json":
+                body = f"invalid JSON ({pre_failure.get('exc')})."
+            else:
+                body = "; ".join(pre_failure["errors"])
+            return (
+                "Antigravity CLI structured-output validation failed: " + body
+                + stderr_note + _quarantine_suffix(quarantine)
+            )
+        worker_reported_status = structured.get("status") if structured else "failed"
+        demoted_worker_status = worker_reported_status
+        if caveats and worker_reported_status == "completed":
+            # completed_with_caveats is a broker-assigned envelope status ONLY --
+            # the worker itself never emits it. It records that the structured
+            # payload validated fully but the CLI's own exit/transport status did
+            # not match, so the caller should not treat this as an unqualified
+            # completion without reading the caveat.
+            demoted_worker_status = "completed_with_caveats"
+        normalized = {
+            "package_id": package["package_id"],
+            "worker_status": demoted_worker_status,
+            "structured_output": structured,
+            "caveats": caveats,
+            # The broker's own acceptance verdict. Never infer acceptance from
+            # "a payload exists" or "a path is present" -- key on this field.
+            "disposition": "accepted_with_caveats" if caveats else "accepted",
+            "cli": {
+                "conversation_id": outer.get("conversation_id"),
+                "duration_seconds": outer.get("duration_seconds"),
+                "num_turns": outer.get("num_turns"),
+                "usage": outer.get("usage"),
+                "model": attested_model,
+                "requested_model": model_name,
+                "attestation": attestation_source,
+                "model_attested": bool(
+                    attested_model and model_name
+                    and normalize_lookup(attested_model) == normalize_lookup(model_name)
+                ),
+            },
+            "containment": containment_report,
+        }
+        if apply_report is not None:
+            normalized["containment_apply"] = apply_report
+            normalized["applied_files"] = committed_files
+            if apply_report.get("skipped"):
+                normalized["apply_skipped_reason"] = "; ".join(apply_report.get("reasons") or [])
+                skipped_q = (
+                    _quarantine_rejected(package.get("package_id"), stdout, stderr, outer,
+                                         list(apply_report.get("reasons") or []), salvage=salvage)
+                    if salvage and salvage.get("files") else None
+                )
+                if skipped_q:
+                    normalized["quarantine_path"] = skipped_q.get("quarantine_path")
+                    normalized["quarantine_sha256"] = skipped_q.get("quarantine_sha256")
+                    normalized["quarantine_files"] = skipped_q.get("quarantine_files") or []
+                    normalized["quarantine_diff"] = skipped_q.get("quarantine_diff")
+        return json.dumps(normalized, ensure_ascii=False)
+    except Exception as exc:  # noqa: BLE001
+        # Anything that fails AFTER a real write must say so. Re-raising here would
+        # surface as a generic failure and let a caller read "nothing happened".
+        if committed_files or apply_uncertain:
+            return _flash_applied_envelope(
+                package_id,
+                "apply_outcome_uncertain" if apply_uncertain else "applied_then_rejected",
+                committed_files or list((apply_report or {}).get("candidate_files") or candidates),
+                f"{type(exc).__name__}: {exc}",
+                structured=structured if isinstance(structured, dict) else None,
+                apply_report=apply_report,
+            )
+        raise
 
 
 # Worker stderr is the only truthful channel the backend has: it exits 0 with
@@ -6583,6 +7023,7 @@ def _quarantine_suffix(quarantine: dict[str, Any] | None) -> str:
 _QUARANTINE_SUFFIX_RE = re.compile(
     r"quarantine_path: (?P<path>.+?) \| quarantine_sha256: (?P<sha>[0-9a-f]{64})"
 )
+_NEEDS_CONTEXT_FILES_RE = re.compile(r"needs_context_files: (?P<files>\[[^\]]*\])")
 _QUARANTINE_FILES_RE = re.compile(r"\| quarantine_files: (?P<files>\[[^\]]*\])")
 _QUARANTINE_DIFF_RE = re.compile(r"\| quarantine_diff: (?P<diff>[^\s|]+)")
 
@@ -6635,6 +7076,17 @@ def classify_flash_outcome(
     # miscounted as plain infrastructure unavailability -- that misclassification
     # is what made native_handoff_for_flash_outcome hand out flash-unavailable
     # for a worker that actually ran for minutes.
+    # A committed (or possibly committed) write-back outranks every text heuristic:
+    # the envelope itself says files are on disk, so it can never classify as a
+    # clean rejection or a pre-mutation failure.
+    head = str(response or "")
+    if head.startswith("{") and any(f'"disposition": "{d}"' in head for d in FLASH_APPLIED_OUTCOMES):
+        try:
+            applied_disposition = json.loads(head).get("disposition")
+        except (json.JSONDecodeError, AttributeError):
+            applied_disposition = None
+        if applied_disposition in FLASH_APPLIED_OUTCOMES:
+            return str(applied_disposition)
     if failure_kind == "timeout_during_execution":
         return "failed_pre_mutation"
     if failure_kind == "startup_stall":
@@ -6644,6 +7096,8 @@ def classify_flash_outcome(
     text = str(response or "")
     if text.startswith(FLASH_INFRASTRUCTURE_PREFIXES):
         return "unavailable_pre_mutation"
+    if text.startswith("Antigravity CLI needs_context:"):
+        return "needs_context"
     if text.startswith("Antigravity CLI structured-output validation failed:"):
         return "rejected"
     if text.startswith("Antigravity CLI Flash safety policy rejected"):
@@ -6660,6 +7114,25 @@ def classify_flash_outcome(
     return "rejected"
 
 
+def _flash_text_is_staging_failure(text: str) -> bool:
+    """True only when staging itself failed -- never because a worker's validation
+    text happens to contain the words "manifest" and "rejected" (it said
+    containment_staging=failed for a worker that ran 106 steps)."""
+    if text.startswith("Antigravity CLI structured-output validation failed: staging failed"):
+        return True
+    if text.startswith("{") and '"rejection"' in text[:4000]:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return False
+        return (
+            isinstance(payload, dict)
+            and payload.get("worker_status") == "rejected"
+            and isinstance(payload.get("rejection"), dict)
+        )
+    return False
+
+
 def flash_terminal_progress(
     outcome: str | None,
     mode: str,
@@ -6668,6 +7141,7 @@ def flash_terminal_progress(
     elapsed_seconds: float | int | None = None,
     worker_executed: bool | None = None,
     failure_kind: str | None = None,
+    apply_state: str | None = None,
 ) -> dict[str, Any]:
     """Return a terminal-only Flash progress receipt for synchronous stdio calls.
 
@@ -6681,7 +7155,7 @@ def flash_terminal_progress(
     }
     text = str(response or "")
     unavailable = outcome == "unavailable_pre_mutation"
-    staging_failed = "staging failed" in text or "manifest" in text.lower() and "rejected" in text.lower()
+    staging_failed = _flash_text_is_staging_failure(text)
     rejected = outcome == "rejected"
     if worker_executed is None:
         worker_executed = not unavailable and not staging_failed
@@ -6712,6 +7186,30 @@ def flash_terminal_progress(
             phase("structured_validation", "not_started"),
             phase("workspace_apply", "not_started" if implementation else "not_applicable"),
         ]
+    elif outcome == "needs_context":
+        state, current_phase = "needs_context", "structured_validation"
+        phases = [
+            phase("model_resolution", "completed"),
+            phase("containment_staging", "completed"),
+            phase("worker_execution", "completed"),
+            phase("structured_validation", "needs_context"),
+            phase("workspace_apply", "not_applied" if implementation else "not_applicable"),
+        ]
+    elif outcome in FLASH_APPLIED_OUTCOMES:
+        # The write-back ran (or may have): the phases must say so, never
+        # "not_applied". worker_execution and structured_validation completed
+        # or there would have been nothing to apply.
+        state, current_phase = str(outcome), "workspace_apply"
+        phases = [
+            phase("model_resolution", "completed"),
+            phase("containment_staging", "completed"),
+            phase("worker_execution", "completed"),
+            phase("structured_validation", "completed"),
+            phase(
+                "workspace_apply",
+                "applied_then_failed" if outcome == "applied_then_rejected" else "outcome_uncertain",
+            ),
+        ]
     elif rejected:
         state, current_phase = "rejected", "structured_validation"
         phases = [
@@ -6719,7 +7217,10 @@ def flash_terminal_progress(
             phase("containment_staging", "failed" if staging_failed else "completed"),
             phase("worker_execution", "completed" if worker_executed else "not_started"),
             phase("structured_validation", "failed"),
-            phase("workspace_apply", "not_applied" if implementation else "not_applicable"),
+            phase(
+                "workspace_apply",
+                ("rolled_back" if apply_state == "rolled_back" else "not_applied") if implementation else "not_applicable",
+            ),
         ]
     elif outcome == FLASH_OUTCOME_CREDITABLE:
         state, current_phase = "completed", "workspace_apply" if implementation else "structured_validation"
@@ -6759,6 +7260,14 @@ def flash_terminal_progress(
         result["follow_up"] = {
             "quarantine": "Inspect the quarantine receipt if one is present; rejected artifacts were not applied.",
             "native_handoff": "Re-scope the rejected package before using any native fallback handoff.",
+        }
+    elif outcome == "needs_context":
+        result["follow_up"] = {
+            "re_dispatch": "Re-dispatch the same package with the listed missing files in read_context; this is not a model failure.",
+        }
+    elif outcome in FLASH_APPLIED_OUTCOMES:
+        result["follow_up"] = {
+            "review": "Files were written to the workspace. Inspect the git diff before any replay; do not re-dispatch blindly.",
         }
     elif unavailable:
         result["follow_up"] = {
@@ -7229,6 +7738,9 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             )
             return queued
     started_at = utc_now()
+    flash_run_token = (
+        str(args.get("_flash_receipt_id") or "").strip() if flash_async_worker else ""
+    ) or uuid.uuid4().hex
     try:
         # The Codex consult runs through the unified ledger+worker path: it either returns
         # the answer inline (fast consults) or a pending id (slow/explicit-max), and the
@@ -7287,7 +7799,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             flash_call_started = time.monotonic()
             response = consult_antigravity_cli(
                 project_info.root_path, prompt, mode, resolved_model, effort, timeout_seconds,
-                flash_package, timeout_meta_out=flash_timeout_meta,
+                flash_package, timeout_meta_out=flash_timeout_meta, run_token=flash_run_token,
             )
             flash_elapsed_seconds = round(max(0.0, time.monotonic() - flash_call_started), 3)
             if not response.startswith(CONSULT_FAILURE_PREFIXES):
@@ -7296,6 +7808,17 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
                     antigravity_structured = antigravity_envelope.get("structured_output")
                 except (json.JSONDecodeError, AttributeError):
                     response = "Antigravity CLI structured-output validation failed: normalized result is invalid."
+            # Safety net: if the write-back journal says files were (or may have been)
+            # written, a failure-shaped response can never stand as a clean rejection.
+            if response.startswith(CONSULT_FAILURE_PREFIXES) and flash_package is not None:
+                post_commit = _flash_apply_lookup_truth(flash_package.get("package_id"), flash_run_token)
+                if post_commit:
+                    response = _flash_applied_envelope(
+                        flash_package.get("package_id"), post_commit["disposition"], post_commit["files"],
+                        response[:400], rollback_incomplete=post_commit["rollback_incomplete"],
+                    )
+                    antigravity_envelope = json.loads(response)
+                    antigravity_structured = None
         elif model == "gemini":
             response = consult_gemini(project_info.root_path, prompt, mode, resolved_model, timeout_seconds)
         else:
@@ -7305,6 +7828,12 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             worker_status = antigravity_structured.get("status")
             if worker_status in {"blocked", "failed"}:
                 status = worker_status
+        if (
+            model == "antigravity"
+            and isinstance(antigravity_envelope, dict)
+            and antigravity_envelope.get("disposition") in FLASH_APPLIED_OUTCOMES
+        ):
+            status = "error"
         error = response if status == "error" else None
         consulted_name = responder_model or (f"{model}:{resolved_model}" if resolved_model else model)
         if effort and model != "codex":
@@ -7416,8 +7945,27 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             if salvage_files or salvage_diff:
                 result["quarantine_files"] = salvage_files
                 result["quarantine_diff"] = salvage_diff
+            if not (salvage_files or salvage_diff) and isinstance(antigravity_envelope, dict):
+                salvage_files = list(antigravity_envelope.get("quarantine_files") or [])
+                salvage_diff = antigravity_envelope.get("quarantine_diff")
+                if salvage_files or salvage_diff:
+                    result["quarantine_files"] = salvage_files
+                    result["quarantine_diff"] = salvage_diff
+                    result["quarantine_path"] = antigravity_envelope.get("quarantine_path")
+                    result["quarantine_sha256"] = antigravity_envelope.get("quarantine_sha256")
+                    result["artifact_disposition"] = "quarantined_untrusted"
+                    result["apply_skipped_reason"] = antigravity_envelope.get("apply_skipped_reason")
+            missing_context_files: list[str] = []
+            if flash_outcome == "needs_context":
+                ctx_match = _NEEDS_CONTEXT_FILES_RE.search(response)
+                if ctx_match:
+                    try:
+                        missing_context_files = [str(x) for x in json.loads(ctx_match.group("files"))]
+                    except (json.JSONDecodeError, TypeError):
+                        missing_context_files = []
             native_handoff = native_handoff_for_flash_outcome(
-                args, flash_outcome, result["receipt"], salvage_files, salvage_diff
+                args, flash_outcome, result["receipt"], salvage_files, salvage_diff,
+                missing_context=missing_context_files,
             )
             if native_handoff is not None:
                 result["native_handoff"] = native_handoff
@@ -7432,18 +7980,45 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             result["usage"] = flash_cli_meta.get("usage")
             if flash_timeout_meta.get("timeout_evidence"):
                 result["timeout_evidence"] = flash_timeout_meta["timeout_evidence"]
+            if (
+                flash_outcome not in FLASH_APPLIED_OUTCOMES
+                and isinstance(antigravity_envelope, dict)
+                and antigravity_envelope.get("applied_files")
+            ):
+                result["applied_files"] = antigravity_envelope["applied_files"]
             result["progress"] = flash_terminal_progress(
                 flash_outcome,
                 mode,
                 response,
                 elapsed_seconds=result["elapsed_seconds"],
                 failure_kind=flash_timeout_meta.get("failure_kind"),
+                apply_state=_flash_apply_state((flash_package or {}).get("package_id"), flash_run_token),
             )
             if flash_outcome == "unavailable_pre_mutation":
                 result["fallback_advice"] = (
                     "Flash was unavailable before any work started. A native cheap role may take "
                     "this package; record the package-specific flash-unavailable reason with this ledger receipt."
                 )
+            elif flash_outcome in FLASH_APPLIED_OUTCOMES:
+                result["fallback_advice"] = (
+                    "The package WROTE files to the workspace before a later step failed (or the write could not be "
+                    "confirmed). Do not replay it; inspect the git diff and the listed files first."
+                )
+                result["disposition"] = flash_outcome
+                for key in ("applied_files", "candidate_files", "rollback_incomplete", "post_commit_error"):
+                    if isinstance(antigravity_envelope, dict) and key in antigravity_envelope:
+                        result[key] = antigravity_envelope[key]
+            elif flash_outcome == "needs_context":
+                result["fallback_advice"] = (
+                    "Not a model failure: the staging copy lacked workspace files the worker's checks needed. "
+                    "Re-dispatch with the listed paths in read_context. Nothing was applied."
+                )
+                result["disposition"] = "needs_context"
+                result["missing_context_files"] = missing_context_files
+                quarantine_match = _QUARANTINE_SUFFIX_RE.search(response)
+                result["quarantine_path"] = quarantine_match.group("path") if quarantine_match else None
+                result["quarantine_sha256"] = quarantine_match.group("sha") if quarantine_match else None
+                result["artifact_disposition"] = "quarantined_untrusted" if quarantine_match else None
             elif flash_outcome == "rejected":
                 result["fallback_advice"] = (
                     "The worker's own output was rejected. Inspect the rejection and re-scope it "
@@ -7486,6 +8061,38 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         return result
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
+        if model == "antigravity" and flash_package is not None:
+            post_commit = _flash_apply_lookup_truth(flash_package.get("package_id"), flash_run_token)
+            if post_commit:
+                # Files were written before this failure: report that, never re-raise as a
+                # generic error a caller could read as "nothing happened".
+                message = _flash_applied_message(
+                    post_commit["disposition"], post_commit["files"], error, post_commit["rollback_incomplete"]
+                )
+                try:
+                    store_consultation(project_info, model, mode, prompt, message, "error", message, started_at)
+                except Exception:  # noqa: BLE001
+                    pass
+                return {
+                    "project": project_info.name,
+                    "root_path": project_info.root_path,
+                    "model": f"antigravity:{resolved_model}" if resolved_model else "antigravity",
+                    "mode": mode,
+                    "status": "error",
+                    "response": message,
+                    "work_package_id": flash_package.get("package_id"),
+                    "structured_output_enforced": True,
+                    "structured_output": None,
+                    "worker_status": post_commit["disposition"],
+                    "disposition": post_commit["disposition"],
+                    "outcome": post_commit["disposition"],
+                    "credit_eligible": False,
+                    "accepted": False,
+                    ("applied_files" if post_commit["disposition"] == "applied_then_rejected" else "candidate_files"): post_commit["files"],
+                    "rollback_incomplete": post_commit["rollback_incomplete"],
+                    "post_commit_error": _flash_scrub_stale_claims(error)[:600],
+                    "progress": flash_terminal_progress(post_commit["disposition"], mode, message),
+                }
         store_consultation(project_info, model, mode, prompt, "", "error", error, started_at)
         raise
 
@@ -9951,6 +10558,7 @@ CONSULT_FAILURE_PREFIXES = (
     "Antigravity CLI timed out after",
     "Antigravity CLI exited with code",
     "Antigravity CLI structured-output validation failed:",
+    "Antigravity CLI needs_context:",
     "Antigravity CLI Flash safety policy rejected",
     "Gemini is not configured.",
     "Gemini CLI timed out after",
@@ -10859,6 +11467,14 @@ def _flash_finalize_failure(
     else:
         meta = {"failure_kind": failure_kind or "worker_failed", "outcome": outcome or "failed_pre_mutation"}
     flash_outcome = meta.get("outcome") or "failed_pre_mutation"
+    # If the write-back journal shows files were (or may have been) written, this is
+    # NOT a pre-mutation failure, whatever stage failed afterwards.
+    post_commit = _flash_apply_lookup_truth(package_id, rid)
+    if post_commit:
+        flash_outcome = post_commit["disposition"]
+        reason = _flash_applied_message(
+            flash_outcome, post_commit["files"], reason, post_commit["rollback_incomplete"]
+        )
     args = _flash_row_args(row)
     mode = str(row.get("mode") or args.get("mode") or "plan")
     elapsed = max(0, int(time.time()) - int(launched))
@@ -10893,6 +11509,11 @@ def _flash_finalize_failure(
     }
     if meta.get("timeout_evidence"):
         envelope["timeout_evidence"] = meta["timeout_evidence"]
+    if post_commit:
+        envelope["disposition"] = flash_outcome
+        envelope["worker_status"] = flash_outcome
+        envelope["rollback_incomplete"] = post_commit["rollback_incomplete"]
+        envelope["applied_files" if flash_outcome == "applied_then_rejected" else "candidate_files"] = post_commit["files"]
     native_handoff = native_handoff_for_flash_outcome(
         {**args, "work_package_id": package_id, "task_kind": args.get("task_kind") or row.get("task_kind")},
         flash_outcome,
@@ -10901,7 +11522,10 @@ def _flash_finalize_failure(
     if native_handoff is not None:
         envelope["native_handoff"] = native_handoff
     envelope["fallback_advice"] = (
-        "Flash was unavailable before any work started. A native cheap role may take this package; "
+        "The package WROTE files to the workspace before it failed (or the write could not be confirmed). "
+        "Do not replay it; inspect the git diff and the listed files first."
+        if post_commit
+        else "Flash was unavailable before any work started. A native cheap role may take this package; "
         "record the package-specific flash-unavailable reason with this ledger receipt."
         if flash_outcome == "unavailable_pre_mutation"
         else "Flash failed before completing. Review the failure and rescope before using the native handoff; "
@@ -11027,6 +11651,19 @@ def run_flash_request_worker(request_id: str) -> dict[str, Any]:
             data, reason, classify=False, failure_kind="worker_exception", outcome="failed_pre_mutation"
         )
         return {"id": rid, "status": "error", "error": reason[:1000]}
+    try:
+        return _flash_finalize_result(rid, data, result)
+    except Exception as exc:  # noqa: BLE001
+        # _flash_finalize_failure consults the write-back journal, so a failure here
+        # after a commit is recorded as applied_then_rejected, never as a clean failure.
+        reason = f"Antigravity CLI async finalizer raised {type(exc).__name__}: {exc}"
+        _flash_finalize_failure(
+            data, reason, classify=False, failure_kind="finalizer_exception", outcome="failed_pre_mutation"
+        )
+        return {"id": rid, "status": "error", "error": reason[:1000]}
+
+
+def _flash_finalize_result(rid: str, data: Mapping[str, Any], result: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         result = {"status": "error", "response": str(result)}
     result["request_id"] = rid
@@ -11087,6 +11724,38 @@ def _flash_status_fields(row: Mapping[str, Any]) -> dict[str, Any]:
     return fields
 
 
+def _flash_apply_guard_envelope(merged: dict[str, Any], row: Mapping[str, Any]) -> dict[str, Any]:
+    """A stored envelope that reads as a clean rejection/failure while the write-back
+    journal shows files were (or may have been) written is corrected on read."""
+    if merged.get("disposition") in FLASH_APPLIED_OUTCOMES:
+        return merged
+    if merged.get("outcome") not in {None, "rejected", "failed_pre_mutation", "unavailable_pre_mutation"}:
+        return merged
+    truth = _flash_apply_lookup_truth(row.get("work_package_id"), row.get("id"))
+    if not truth:
+        return merged
+    disposition = truth["disposition"]
+    message = _flash_applied_message(
+        disposition, truth["files"], str(merged.get("response") or ""), truth["rollback_incomplete"]
+    )
+    merged["outcome"] = disposition
+    merged["disposition"] = disposition
+    merged["worker_status"] = disposition
+    merged["status"] = "error"
+    merged["credit_eligible"] = False
+    merged["response"] = message
+    merged["rollback_incomplete"] = truth["rollback_incomplete"]
+    merged["applied_files" if disposition == "applied_then_rejected" else "candidate_files"] = truth["files"]
+    for stale in ("note_quarantine", "validation_failures", "quarantine_files", "quarantine_diff"):
+        merged.pop(stale, None)
+    merged["fallback_advice"] = (
+        "The package WROTE files to the workspace before it failed (or the write could not be confirmed). "
+        "Do not replay it; inspect the git diff and the listed files first."
+    )
+    merged["progress"] = flash_terminal_progress(disposition, str(merged.get("mode") or "accept-edits"), message)
+    return merged
+
+
 def _flash_request_result(row: dict[str, Any]) -> dict[str, Any]:
     rid = str(row.get("id") or "")
     state = canonical_request_state(row.get("status"))
@@ -11129,6 +11798,10 @@ def _flash_request_result(row: dict[str, Any]) -> dict[str, Any]:
     for key in ("request_id", "work_package_id", "receipt"):
         if not merged.get(key):
             merged[key] = base[key]
+    try:
+        merged = _flash_apply_guard_envelope(merged, row)
+    except Exception as exc:  # noqa: BLE001
+        log(f"flash apply guard failed for {rid}: {exc}")
     merged["answered"] = True
     merged["completed_at"] = row.get("completed_at")
     if created_epoch and merged.get("elapsed_seconds") is None:
@@ -13856,10 +14529,55 @@ TOOLS = [
             "required": ["host"],
         },
     },
+    {
+        "name": "code_graph",
+        "description": "Locate code in a registered project through its code-only knowledge graph (graphify). Returns compact locators: symbol, file:line, relations, confidence, freshness. Results are locators, not answers: read the primary lines before acting. confidence 'low' (or a miss) means fall back to a targeted grep; constants and non-code files are not indexed. Ops: locate, expand, path, stats, health; refresh rebuilds the graph.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["locate", "expand", "path", "stats", "refresh", "health"],
+                    "description": "Operation to perform.",
+                },
+                "project": {"type": "string", "description": "Project name or root path."},
+                "query": {"type": "string", "description": "Search query for locator."},
+                "node_id": {"type": "string", "description": "Graph node id to expand."},
+                "symbol": {"type": "string", "description": "Symbol name to locate or expand."},
+                "file": {"type": "string", "description": "Relative file path."},
+                "source": {"type": "string", "description": "Source symbol/file for path search."},
+                "target": {"type": "string", "description": "Target symbol/file for path search."},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "description": "Max results to return (1-20).",
+                },
+                "max_hops": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8,
+                    "description": "Max hops for path traversal (1-8).",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 500,
+                    "maximum": 6000,
+                    "description": "Max characters in response (500-6000, default 1500).",
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Force refresh even if not stale.",
+                },
+            },
+            "required": ["op"],
+        },
+    },
 ]
 
 
 CLAUDE_LITE_TOOL_NAMES = {
+    "code_graph",
     "consult_decision",
     "consult_codex",
     "consult_antigravity",
@@ -13950,6 +14668,7 @@ COMPACT_TOOL_DESCRIPTIONS = {
     "record_context_event": "Record a compact evidence/context event.",
     "get_context_pack": "Return a compact project/topic context pack.",
     "retrieve_shared_context": "Retrieve stored large context by ref, optionally filtered by query.",
+    "code_graph": "Query code knowledge graph locators; caller must read primary lines before acting, low confidence falls back to grep.",
     "request_context_snapshot": "Request a compact snapshot of another open agent session.",
     "get_latest_context_snapshot": "Read the latest completed snapshot, capped by max_tokens.",
     "list_live_surfaces": "List recent bridge heartbeats and capabilities.",
@@ -15440,6 +16159,8 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 int(args.get("max_chars") or 0) or None,
             )
         )
+    if name == "code_graph":
+        return text_content(code_graph_bridge.call(args))
     if name == "retrieve_shared_context":
         return text_content(
             retrieve_shared_context(

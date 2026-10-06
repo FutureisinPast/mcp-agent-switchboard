@@ -26,3 +26,14 @@ def _no_real_flash_worker():
     stub = mock.Mock(return_value={"started": False, "reason": "disabled by tests/conftest.py"})
     with mock.patch.object(broker, "start_flash_request_worker", stub):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_flash_apply_journal(tmp_path):
+    """The write-back journal is durable evidence under the broker home; no test may
+    read or leave records in the real one, and in-memory records must not leak
+    between tests that reuse a work package id."""
+    flash_dir = mock.patch.object(broker, "_flash_apply_dir", return_value=tmp_path / "flash-apply")
+    memory = mock.patch.dict(broker._FLASH_APPLY_MEMORY, {}, clear=True)
+    with flash_dir, memory:
+        yield

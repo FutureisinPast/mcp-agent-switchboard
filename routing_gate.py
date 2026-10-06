@@ -141,6 +141,8 @@ SWITCHBOARD_EVIDENCE_EXEMPT_TOOLS = {
     "run_evidence_probe", "retrieve_shared_context", "resolve_model_request",
     "request_status", "request_result", "compact_topic",
 }
+CODE_GRAPH_TOOLS = {"code_graph", "code-graph"}
+CODE_GRAPH_EXEMPT_OPS = {"locate", "expand", "path", "stats", "health"}
 # WP-SB6: the narrower set of Switchboard tools a delegated child (a codex/claude CLI
 # subprocess the broker itself launched, AGENT_BROKER_CHILD=1) is never allowed to call --
 # a depth-1 adviser must answer from its brief, not spawn agents or open another
@@ -847,6 +849,11 @@ def _direct_labour_category(tool_name: object, tool_input: object) -> str | None
             or tool_segment.startswith("list_")
         ):
             return None
+        if tool_segment in CODE_GRAPH_TOOLS:
+            op = tool_input.get("op") if isinstance(tool_input, dict) else None
+            op_str = str(op).strip().lower() if op is not None else ""
+            if not op_str or op_str in CODE_GRAPH_EXEMPT_OPS:
+                return None
     if name in READ_TOOL_NAMES:
         return "reads"
     if name in SEARCH_TOOL_NAMES:

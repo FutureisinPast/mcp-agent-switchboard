@@ -188,6 +188,23 @@ On Windows, Switchboard-owned bounded subprocesses use hidden-window flags and a
 
 ## Changelog
 
+### v1.0.56 (WP-FL: validate once, apply last, truthful apply outcomes)
+- **Fixed the apply-then-reject bug:** a Flash accept-edits package could write its files and still be reported `rejected` / "NOT applied". Cause: two validations (the second ran after apply without the staging roots, so staged-path reports became out-of-scope) and model attestation ran after apply.
+- **Validate once, apply last:** one validation against the staging roots, every rejection check (including transcript attestation) before the first real write; staging is removed after apply. Apply happens only for a `completed` worker; `blocked`/`failed` edits are quarantine-only.
+- **Truthful outcomes:** `applied_then_rejected`, `apply_outcome_uncertain` and `needs_context`, backed by a durable write-back journal keyed by package id and a unique run token (committed records are sticky). `apply_changes` rolls back to the baseline on any mid-apply failure and reports `rolled_back` / `rollback_incomplete`.
+- **Prompts and staging:** exact declared paths are remapped to staged paths with a workspace-relative path table (implementation mode only); `.pyc`/`.pytest_cache` artifacts are ignored; the worker runs with `PYTHONDONTWRITEBYTECODE=1` and `-p no:cacheprovider`; any reparse point or junction in staging is refused.
+- **Strict `needs_context`:** only import-only failed checks whose module exists in the workspace but was not staged; nothing is applied and the missing files are listed for `read_context`.
+- **Review:** independent adversarial review, 10 findings fixed and re-verified. **Known limits:** a reparse attribute on dedup/cloud temp volumes refuses the package (safe direction); blocked/failed worker edits are quarantine-only. See `RELEASE_NOTES_v1.0.56.md`.
+
+### v1.0.55 (shared `code_graph` locator tool, gate exemption, host rule, runtime installer)
+- **New MCP tool `code_graph`** (ops `locate`, `expand`, `path`, `stats`, `refresh`, `health`) backed by a supervised, lazily started adapter child running code-only graphify 0.9.77 with no network. Results are locators (file, symbol, line, confidence), not evidence: confirm with a targeted read. Default response 1,500 chars, hard ingress cap 8,000, projects restricted to an allowlist (`projects.json`).
+- **Routing gate:** `code_graph` read ops are exempt from the direct-labour count and grant no relief; `refresh` is counted normally.
+- **Host rule:** one bullet ("locate with `code_graph` before broad grep; low confidence -> targeted grep") is added to the managed rules for every host (also in `COST_AWARE_ROUTING_RULES`); the upgrade path relies on the self-consistent checksum.
+- **Runtime installer:** `code_graph_runtime/` is the single source of truth; `install_code_graph.ps1` (idempotent, `-CodeGraphHome`, default `$HOME\.agent-broker\code-graph`) builds the pinned venv, copies the runtime, registers `agent-broker` in `projects.json` only when missing, then runs `refresh` and `health`. It never touches the exe, the Switchboard DB or host config.
+- **Live regression test** `tests/test_code_graph_live.py` maps Switchboard with its own graph; symbol coverage grows automatically. Add a question to `tests/code_graph_questions.json` per new feature. Skip with `AGENT_BROKER_SKIP_CODE_GRAPH_LIVE=1`.
+- **UTF-8 protocol fix:** the adapter's line protocol now runs private and UTF-8 on Windows pipes (cp1252 default corrupted non-ASCII output).
+- **Known limits:** paraphrase recall is weak; module constants and non-code files are not indexed; never use graphify `update`/`watch`.
+
 ### v1.0.54 (WP-SB12: route approval/effort fixes, false reworded-retry hold, Flash salvage)
 - **`route_agent_task` codex_cli/claude_code now forwards `outbound_reviewed`** to `consult()`, so the stored `codex_requests` row carries the approval and an approved `needs_owner_review` request is no longer held again.
 - **The WP-SB2 effort ladder now actually reaches the dispatch.** The route marks its resolved effort as caller-requested so `consult()` stops forcing every serious Astra consult back to max: bounded -> high, unrated -> xhigh, risk flag -> max, explicit effort wins (sync and async).

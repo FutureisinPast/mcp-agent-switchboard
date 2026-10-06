@@ -759,5 +759,84 @@ class HierarchyInstallTests(unittest.TestCase):
             self.assertIn("Repeat this mandatory coverage/depth contract in every request", text)
 
 
+    def test_code_graph_bullet_present_in_body_for_every_host_target(self):
+        code_graph_bullet = (
+            "- Code graph: for a project registered with the code graph, locate code with the Switchboard "
+            "`code_graph` tool (op `locate`, then `expand` or `path`) before broad Grep/Glob/Read sweeps; "
+            "its read ops do not consume the direct-labour allowance. Results are locators (symbol, file:line, "
+            "confidence, freshness), never answers: read the cited primary lines before relying on them. "
+            "`confidence: low`, a miss, `stale: true`, module constants, and non-code files mean fall back "
+            "to a targeted grep (or `refresh` when stale). A graph miss is not evidence of absence."
+        )
+        body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
+        self.assertIn(code_graph_bullet, body)
+
+        lines = [line.strip() for line in body.splitlines() if line.strip().startswith("- ")]
+        ingress_bullet_start = "- Brain-context ingress is capped"
+        ingress_idx = next(i for i, line in enumerate(lines) if line.startswith(ingress_bullet_start))
+        self.assertEqual(lines[ingress_idx + 1], code_graph_bullet)
+
+        self.refresh()
+        for name, path in (
+            ("Codex", self.paths.codex_agents_md),
+            ("Claude", self.paths.claude_md),
+            ("Gemini", self.paths.gemini_md),
+        ):
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(code_graph_bullet, text, f"Missing code graph bullet in {name} global hierarchy")
+
+    def test_install_over_pre_change_body_upgrades_to_new_body(self):
+        code_graph_bullet = (
+            "- Code graph: for a project registered with the code graph, locate code with the Switchboard "
+            "`code_graph` tool (op `locate`, then `expand` or `path`) before broad Grep/Glob/Read sweeps; "
+            "its read ops do not consume the direct-labour allowance. Results are locators (symbol, file:line, "
+            "confidence, freshness), never answers: read the cited primary lines before relying on them. "
+            "`confidence: low`, a miss, `stale: true`, module constants, and non-code files mean fall back "
+            "to a targeted grep (or `refresh` when stale). A graph miss is not evidence of absence."
+        )
+        current_body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
+        pre_change_body = current_body.replace(code_graph_bullet + "\n", "")
+        self.assertNotIn(code_graph_bullet, pre_change_body)
+
+        pre_change_block = hierarchy_install._render_block(pre_change_body)
+        self.paths.claude_md.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.claude_md.write_text(
+            "# User Header\n\n" + pre_change_block + "\n# User Footer\n", encoding="utf-8"
+        )
+
+        first = self.refresh()["Claude global hierarchy"]
+        self.assertEqual(first, "updated")
+
+        updated_text = self.paths.claude_md.read_text(encoding="utf-8")
+        self.assertIn("# User Header", updated_text)
+        self.assertIn("# User Footer", updated_text)
+        self.assertIn(code_graph_bullet, updated_text)
+        self.assertTrue(hierarchy_install._block_checksum_valid(updated_text))
+        self.assertEqual(updated_text.count("agent-switchboard:cost-routing:begin"), 1)
+
+        second = self.refresh()["Claude global hierarchy"]
+        self.assertEqual(second, "unchanged")
+
+    def test_user_edited_pre_change_block_is_not_clobbered(self):
+        code_graph_bullet = (
+            "- Code graph: for a project registered with the code graph, locate code with the Switchboard "
+            "`code_graph` tool (op `locate`, then `expand` or `path`) before broad Grep/Glob/Read sweeps; "
+            "its read ops do not consume the direct-labour allowance. Results are locators (symbol, file:line, "
+            "confidence, freshness), never answers: read the cited primary lines before relying on them. "
+            "`confidence: low`, a miss, `stale: true`, module constants, and non-code files mean fall back "
+            "to a targeted grep (or `refresh` when stale). A graph miss is not evidence of absence."
+        )
+        current_body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)
+        pre_change_body = current_body.replace(code_graph_bullet + "\n", "")
+        rendered = hierarchy_install._render_block(pre_change_body)
+        tampered = rendered.replace("The model selected for the main session", "User edited policy text")
+        self.paths.claude_md.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.claude_md.write_text(tampered, encoding="utf-8")
+
+        result = self.refresh()["Claude global hierarchy"]
+        self.assertTrue(result.startswith("ERROR: managed routing block was edited"), result)
+        self.assertEqual(self.paths.claude_md.read_text(encoding="utf-8"), tampered)
+
+
 if __name__ == "__main__":
     unittest.main()

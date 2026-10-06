@@ -1,0 +1,131 @@
+{
+ "_how_to_extend": "When you add a feature, add one question here with its defining file and symbol (symbol = the function/class name; alt_symbols = other acceptable defining names). Mark must_hit true only for lexical questions that locate must always HIT. Paraphrase questions are reported, never gated. test_symbol_coverage already covers every new def/class/method automatically.",
+ "questions": [
+  {
+   "id": "Q1",
+   "kind": "lexical",
+   "question": "Where is the PreToolUse labour gate that counts direct Read/Grep/Glob calls?",
+   "file": "routing_gate.py",
+   "symbol": "pre_tool_use",
+   "alt_symbols": [
+    "reserve_direct_labour",
+    "_direct_labour_category"
+   ],
+   "must_hit": true
+  },
+  {
+   "id": "Q2",
+   "kind": "lexical",
+   "question": "How is the Flash worker prompt assembled?",
+   "file": "agent_broker_mcp.py",
+   "symbol": "wrap_flash_workhorse_prompt",
+   "alt_symbols": [
+    "prepare_flash_work_package"
+   ]
+  },
+  {
+   "id": "Q3",
+   "kind": "lexical",
+   "question": "Where are the Flash manifest limits for read_context and staged bytes defined?",
+   "file": "flash_manifest.py",
+   "symbol": "MANIFEST_MAX_READ_CONTEXT",
+   "alt_symbols": [
+    "MANIFEST_MAX_BYTES"
+   ]
+  },
+  {
+   "id": "Q4",
+   "kind": "lexical",
+   "question": "What generates AGENT_GROUND_RULES.md?",
+   "file": "agent_broker_mcp.py",
+   "symbol": "ensure_ground_rules_file",
+   "alt_symbols": [],
+   "must_hit": true
+  },
+  {
+   "id": "Q5",
+   "kind": "lexical",
+   "question": "Where is the managed instruction block written into CLAUDE.md, AGENTS.md and GEMINI.md?",
+   "file": "hierarchy_install.py",
+   "symbol": "update_instruction_block",
+   "alt_symbols": [],
+   "must_hit": true
+  },
+  {
+   "id": "Q6",
+   "kind": "lexical",
+   "question": "How does retrieve_shared_context filter stored text by a query?",
+   "file": "agent_broker_mcp.py",
+   "symbol": "retrieve_shared_context",
+   "alt_symbols": [],
+   "must_hit": true
+  },
+  {
+   "id": "Q7",
+   "kind": "lexical",
+   "question": "How is a context pack assembled for a project and topic?",
+   "file": "agent_broker_mcp.py",
+   "symbol": "get_context_pack",
+   "alt_symbols": [],
+   "must_hit": true
+  },
+  {
+   "id": "Q8",
+   "kind": "lexical",
+   "question": "How does consult_decision handle a missing native consultation?",
+   "file": "agent_broker_mcp.py",
+   "symbol": "consult_decision",
+   "alt_symbols": [],
+   "must_hit": true
+  },
+  {
+   "id": "Q9",
+   "kind": "lexical",
+   "question": "Which MCP tools are exposed for the lite client profile?",
+   "file": "agent_broker_mcp.py",
+   "symbol": "CLAUDE_LITE_TOOL_NAMES",
+   "alt_symbols": []
+  },
+  {
+   "id": "Q10",
+   "kind": "lexical",
+   "question": "Where are oversized MCP responses quarantined to context-evidence?",
+   "file": "routing_gate.py",
+   "symbol": "_store_context_evidence",
+   "alt_symbols": [
+    "EVIDENCE_DIR"
+   ],
+   "must_hit": true
+  },
+  {
+   "id": "Q11",
+   "kind": "paraphrase",
+   "question": "What stops an agent from doing too much reading itself instead of delegating?",
+   "file": "routing_gate.py",
+   "symbol": "pre_tool_use",
+   "alt_symbols": [
+    "reserve_direct_labour",
+    "effective_direct_labour_limit"
+   ]
+  },
+  {
+   "id": "Q12",
+   "kind": "paraphrase",
+   "question": "How do a worker's files get copied into a throwaway folder?",
+   "file": "flash_manifest.py",
+   "symbol": "stage",
+   "alt_symbols": []
+  },
+  {
+   "id": "Q13",
+   "kind": "paraphrase",
+   "question": "When a premium model runs out of credits, how long is it blocked before it is tried again?",
+   "file": "agent_broker_mcp.py",
+   "symbol": "_parse_quota_latch_expiry",
+   "alt_symbols": [
+    "DECISION_QUOTA_LATCH_DEFAULT_MINUTES",
+    "_set_flagship_latch"
+   ]
+  }
+ ]
+}

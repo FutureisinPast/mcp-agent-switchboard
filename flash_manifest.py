@@ -484,15 +484,48 @@ def stage(manifest: dict[str, Any], containment_mode: str = "snapshot") -> Stage
     return staged
 
 
+_CACHE_BYTECODE_SUFFIXES = (".pyc", ".pyo")
+
+
+def _is_cache_artifact_path(rel: str) -> bool:
+    """True only for interpreter/test-runner cache spellings.
+
+    ``*.pyc`` / ``*.pyo`` under a directory named ``__pycache__``, or anything
+    under a ``.pytest_cache`` directory. Deliberately narrow: this is a path
+    SHAPE test only; the caller still requires the entry to be a regular,
+    newly created or modified file that no declaration or baseline mentions.
+    """
+    parts = rel.split("/")
+    parents = parts[:-1]
+    if ".pytest_cache" in parents:
+        return True
+    return "__pycache__" in parents and parts[-1].lower().endswith(_CACHE_BYTECODE_SUFFIXES)
+
+
 def collect_changes(staged: StagedPackage) -> dict[str, Any]:
     """Diff the ENTIRE staging tree against the copy-time baseline.
 
     Scanning only the declared paths would miss the interesting case: a worker
     that created or rewrote something it never mentioned. The staging tree is
     small by construction, so a full walk here is cheap and total.
+
+    Interpreter and test-runner cache files (see ``_is_cache_artifact_path``)
+    are the one exception: a worker that runs the tests always leaves them, they
+    are never applied, and counting them as undeclared rejected otherwise-good
+    packages. They are listed under ``ignored_cache`` rather than silently
+    dropped, and a link planted among them is still refused.
     """
     present: dict[str, str] = {}
-    for dirpath, _dirnames, filenames in os.walk(staged.root):
+    ignored_cache: list[str] = []
+    declared = set(staged.write_targets) | set(staged.create_targets)
+    for dirpath, dirnames, filenames in os.walk(staged.root):
+        for name in dirnames:
+            # os.walk does not descend into a directory link, so a junction or
+            # symlinked directory would otherwise never be looked at. EVERY
+            # directory link anywhere in staging is flagged and refused.
+            dir_path = Path(dirpath) / name
+            if is_reparse_point(dir_path):
+                present[dir_path.relative_to(staged.root).as_posix()] = "__reparse__"
         for name in filenames:
             path = Path(dirpath) / name
             rel = path.relative_to(staged.root).as_posix()
@@ -500,6 +533,13 @@ def collect_changes(staged: StagedPackage) -> dict[str, Any]:
                 # The worker planted a link where a file belonged; write-back
                 # would follow it straight out of the staging tree.
                 present[rel] = "__reparse__"
+                continue
+            if (
+                _is_cache_artifact_path(rel)
+                and rel not in staged.baseline
+                and rel not in declared
+            ):
+                ignored_cache.append(rel)
                 continue
             digest = file_digest(path)
             present[rel] = digest or "__unreadable__"
@@ -532,7 +572,36 @@ def collect_changes(staged: StagedPackage) -> dict[str, Any]:
         "read_context_modified": sorted(r for r in modified if r in staged.read_only),
         "reparse_planted": sorted(r for r, d in present.items() if d == "__reparse__"),
         "unreadable": sorted(r for r, d in present.items() if d == "__unreadable__"),
+        "ignored_cache": sorted(ignored_cache),
     }
+
+
+def planned_targets(staged: StagedPackage, changes: dict[str, Any]) -> list[tuple[str, Path, Path]]:
+    """(rel, staged source, real target) for every declared change to write back."""
+    planned: list[tuple[str, Path, Path]] = []
+    for rel in changes["modified"]:
+        if rel in staged.write_targets:
+            planned.append((rel, staged.staged_path(rel), staged.write_targets[rel]))
+    for rel in changes["created"]:
+        if rel in staged.create_targets:
+            planned.append((rel, staged.staged_path(rel), staged.create_targets[rel]))
+    return planned
+
+
+def _restore_bytes(target: Path, data: bytes) -> None:
+    temp = target.with_name(target.name + ".flash-rollback.tmp")
+    try:
+        temp.write_bytes(data)
+        atomic_io._replace_with_retry(temp, target)
+    finally:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+
+
+def _remove_created(target: Path) -> None:
+    target.unlink()
 
 
 def apply_changes(staged: StagedPackage, changes: dict[str, Any]) -> dict[str, Any]:
@@ -541,6 +610,14 @@ def apply_changes(staged: StagedPackage, changes: dict[str, Any]) -> dict[str, A
     All-or-nothing on purpose. A partial application leaves the real tree in a
     state neither the worker nor the brain described, and "a failure applies
     nothing" is the only rule that stays true under every refusal below.
+
+    Each file is replaced atomically, but the SET is not atomic on a real
+    filesystem, so the pre-write content of every target is captured first. A
+    failure part-way stops the loop and restores every file already written:
+    ``rolled_back: true`` when that restored everything, otherwise
+    ``rollback_incomplete: true`` with ``affected_files`` (and ``applied``) naming
+    what is still changed. A caller must treat any non-empty ``applied`` as a
+    committed write regardless of ``refused``.
     """
     refusals: list[str] = []
     if changes["undeclared"]:
@@ -554,13 +631,7 @@ def apply_changes(staged: StagedPackage, changes: dict[str, Any]) -> dict[str, A
     if changes["unreadable"]:
         refusals.append(f"unreadable staged files: {changes['unreadable']}")
 
-    planned: list[tuple[str, Path, Path]] = []
-    for rel in changes["modified"]:
-        if rel in staged.write_targets:
-            planned.append((rel, staged.staged_path(rel), staged.write_targets[rel]))
-    for rel in changes["created"]:
-        if rel in staged.create_targets:
-            planned.append((rel, staged.staged_path(rel), staged.create_targets[rel]))
+    planned = planned_targets(staged, changes)
 
     # Re-check every precondition against the REAL tree as late as possible.
     # Between staging and now the owner's editor may have saved the same file,
@@ -577,6 +648,19 @@ def apply_changes(staged: StagedPackage, changes: dict[str, Any]) -> dict[str, A
     if conflicted:
         refusals.append(f"real files changed underneath the package: {conflicted}")
 
+    # Capture the pre-write content BEFORE the first write; if it cannot be
+    # read there is no safe rollback, so refuse while nothing has changed.
+    originals: dict[Path, bytes | None] = {}
+    if not refusals:
+        for rel, _source, target in planned:
+            if rel in staged.write_targets:
+                try:
+                    originals[target] = target.read_bytes()
+                except OSError as exc:
+                    refusals.append(f"cannot capture rollback baseline for {target}: {exc}")
+            else:
+                originals[target] = None
+
     if refusals:
         return {
             "applied": [],
@@ -585,26 +669,136 @@ def apply_changes(staged: StagedPackage, changes: dict[str, Any]) -> dict[str, A
             "integrity": "indeterminate" if changes["undeclared"] else "verified",
         }
 
-    applied: list[str] = []
-    failed: list[str] = []
+    written: list[Path] = []
+    created_dirs: list[Path] = []
+    failure: str | None = None
     for _rel, source, target in planned:
+        temp = target.with_name(target.name + ".flash-apply.tmp")
         try:
+            # Remember every directory this apply creates so rollback can remove it.
+            missing_dirs: list[Path] = []
+            probe = target.parent
+            while not probe.exists() and probe != probe.parent:
+                missing_dirs.append(probe)
+                probe = probe.parent
             target.parent.mkdir(parents=True, exist_ok=True)
-            temp = target.with_name(target.name + ".flash-apply.tmp")
+            created_dirs.extend(d for d in missing_dirs if d.exists())
             shutil.copy2(source, temp)
             atomic_io._replace_with_retry(temp, target)
-            applied.append(str(target))
+            written.append(target)
+        except Exception as exc:  # noqa: BLE001 - ANY failure must reach the rollback below
+            failure = f"{target}: {type(exc).__name__}: {exc}"
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+            # The replace may have landed before the error surfaced; treat the
+            # failing target as touched so rollback restores it too.
+            written.append(target)
+            break
+
+    if failure is None:
+        return {
+            "applied": sorted(str(t) for t in written),
+            "refused": False,
+            "reasons": [],
+            "integrity": "verified",
+        }
+
+    unrestored: list[tuple[str, str]] = []
+    restored: list[str] = []
+    for target in reversed(written):
+        try:
+            original = originals.get(target)
+            if original is None:
+                if target.exists():
+                    _remove_created(target)
+            else:
+                try:
+                    unchanged = target.read_bytes() == original
+                except OSError:
+                    unchanged = False
+                if not unchanged:
+                    _restore_bytes(target, original)
+            restored.append(str(target))
         except OSError as exc:
-            failed.append(f"{target}: {exc}")
+            unrestored.append((str(target), f"{target}: {exc}"))
+    # Directories this apply created go too (deepest first); report any that stay.
+    leftover_dirs: list[str] = []
+    for directory in sorted(set(created_dirs), key=lambda d: len(d.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            if directory.exists():
+                leftover_dirs.append(str(directory))
+    if not unrestored:
+        report = {
+            "applied": [],
+            "refused": True,
+            "reasons": [failure],
+            "integrity": "verified",
+            "rolled_back": True,
+            "rolled_back_files": sorted(restored),
+        }
+        if leftover_dirs:
+            report["rollback_leftover_dirs"] = sorted(leftover_dirs)
+        return report
+    affected = sorted(name for name, _ in unrestored)
     return {
-        "applied": sorted(applied),
-        "refused": bool(failed),
-        "reasons": failed,
-        "integrity": "verified" if not failed else "indeterminate",
+        "applied": affected,
+        "refused": True,
+        "reasons": [failure] + [text for _, text in unrestored],
+        "integrity": "indeterminate",
+        "rolled_back": False,
+        "rollback_incomplete": True,
+        "affected_files": affected,
+        "rolled_back_files": sorted(restored),
+        "rollback_leftover_dirs": sorted(leftover_dirs),
     }
 
 
-def prompt_appendix(staged: StagedPackage) -> str:
+def remap_to_staged(text: str, staged: StagedPackage) -> str:
+    """Rewrite the EXACT declared real paths in ``text`` to their staged spelling.
+
+    Only the manifest's own targets (write, create, read_context) are rewritten:
+    any other workspace path in the body may be literal file CONTENT
+    (``DATA_DIR=<ws>\\data``) and is left alone. A match must start and end at a
+    path boundary, so a sibling such as ``<ws>\\data.txt2`` or ``<ws>2\\x`` is
+    never half-rewritten. Case-insensitive, both slash styles, longest first.
+    """
+    import re
+
+    mapping: dict[str, Path] = {}
+
+    def add(real: Path, staged_path: Path) -> None:
+        variants = {str(real), real.as_posix()}
+        try:
+            resolved = real.resolve()
+            variants.update({str(resolved), resolved.as_posix()})
+        except (OSError, RuntimeError):
+            pass
+        for variant in variants:
+            if variant:
+                mapping.setdefault(variant.lower(), staged_path)
+
+    for real_text, staged_text in staged.path_map().items():
+        add(Path(real_text), Path(staged_text))
+    if not mapping:
+        return text
+    ordered = sorted(mapping, key=len, reverse=True)
+    pattern = re.compile(
+        r"(?<![\w\-])(?:" + "|".join(re.escape(v) for v in ordered) + r")(?![\w\-]|\.\w)",
+        re.IGNORECASE,
+    )
+
+    def repl(match: "re.Match[str]") -> str:
+        target = mapping[match.group(0).lower()]
+        return target.as_posix() if "/" in match.group(0) else str(target)
+
+    return pattern.sub(repl, text)
+
+
+def prompt_appendix(staged: StagedPackage, real_table: bool = False) -> str:
     """Tell the worker where its files actually are.
 
     Without this the worker works from the real paths in the brain's prompt,
@@ -626,6 +820,19 @@ def prompt_appendix(staged: StagedPackage) -> str:
         lines.append(f"  CREATE {staged.staged_path(rel)}")
     for rel in sorted(staged.read_only):
         lines.append(f"  READ   {staged.staged_path(rel)}")
+    if real_table:
+        lines.append("")
+        lines.append(
+            "PATH TABLE (workspace-relative path -> staged path). Edit and create files ONLY at the "
+            "staged paths; the left column is the file's path relative to the real workspace, for "
+            "reference in file content when needed."
+        )
+        for real, staged_path in sorted(staged.path_map().items()):
+            try:
+                shown = Path(real).relative_to(staged.workspace_root).as_posix()
+            except ValueError:
+                shown = Path(real).name
+            lines.append(f"  {shown} -> {staged_path}")
     lines.append("")
     lines.append("Do not delete or rename anything. Do not create undeclared files.")
     return "\n".join(lines)
