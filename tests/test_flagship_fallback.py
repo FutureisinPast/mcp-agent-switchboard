@@ -87,7 +87,15 @@ class FlagshipFallbackTestCase(unittest.TestCase):
         home_patch.start()
         self.addCleanup(home_patch.stop)
         env_patch = mock.patch.dict(
-            "os.environ", {"HOME": str(self._home), "USERPROFILE": str(self._home)}
+            "os.environ",
+            {
+                "HOME": str(self._home),
+                "USERPROFILE": str(self._home),
+                # Legacy fallback tests pin the original Fable-by-default,
+                # evaluator-off behaviour (new pipeline: test_decision_evaluator.py).
+                "AGENT_BROKER_DECISION_EVALUATOR_MODEL": "off",
+                "AGENT_BROKER_FABLE_MODE": "default",
+            },
         )
         env_patch.start()
         self.addCleanup(env_patch.stop)
@@ -125,7 +133,7 @@ class OpusHostFallbackTests(FlagshipFallbackTestCase):
 
 
 class SonnetHostChainTests(FlagshipFallbackTestCase):
-    def test_sonnet_host_needs_native_then_completed_has_no_cross_vendor_leg(self):
+    def test_sonnet_host_needs_native_then_completed_adds_final_astra_leg(self):
         first, consult1 = self._run(_args("claude", "sonnet", "bounded"))
         self.assertEqual(first["status"], "needs_native_consultation")
         self.assertEqual(first["native_request"]["model"], "fable")
@@ -135,10 +143,12 @@ class SonnetHostChainTests(FlagshipFallbackTestCase):
             _args("claude", "sonnet", "bounded", native_consultation=_native("claude", "completed"))
         )
         self.assertEqual(second["status"], "complete")
+        # Decision pipeline: Astra always gives the final verdict after Fable.
         self.assertEqual(
-            [item["lane"] for item in second["consultations"]], ["native_same_vendor"]
+            [item["lane"] for item in second["consultations"]],
+            ["native_same_vendor", "switchboard_cross_vendor"],
         )
-        consult2.assert_not_called()
+        self.assertEqual([call.args[0] for call in consult2.call_args_list], ["codex"])
 
     def test_sonnet_host_fable_unavailable_no_opus_offer_astra_consulted(self):
         # WP-SB7: the Claude flagship chain is Fable-only now, so once Fable
@@ -278,6 +288,92 @@ class QuotaLatchExpiryTests(unittest.TestCase):
              mock.patch.object(broker.time, "time", return_value=500.0):
             expiry = broker._parse_quota_latch_expiry("Something went wrong.")
         self.assertAlmostEqual(expiry, 500.0 + 7 * 60, delta=1)
+
+    def test_quota_reason_resets_at_epoch_ms_and_resets_at_utc_yields_parsed_expiry(self):
+        from datetime import datetime, timezone
+        import availability_reset
+
+        fixed_dt = datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc)
+        fixed_now = fixed_dt.timestamp()
+
+        # 1. resetsAt epoch milliseconds
+        future_epoch = fixed_now + 3600.0
+        future_ms = int(future_epoch * 1000)
+        with mock.patch.object(availability_reset.time, "time", return_value=fixed_now), \
+             mock.patch.object(broker.time, "time", return_value=fixed_now):
+            parsed_ms = broker._parse_quota_latch_expiry(f"Rate limit exceeded. resetsAt: {future_ms}")
+        self.assertAlmostEqual(parsed_ms, future_epoch, places=2)
+
+        # 2. resets at 17:00 UTC
+        expected_utc = datetime(2026, 10, 7, 17, 0, 0, tzinfo=timezone.utc).timestamp()
+        with mock.patch.object(availability_reset.time, "time", return_value=fixed_now), \
+             mock.patch.object(broker.time, "time", return_value=fixed_now):
+            parsed_utc = broker._parse_quota_latch_expiry("Usage limit exceeded; resets at 17:00 UTC")
+        self.assertAlmostEqual(parsed_utc, expected_utc, places=2)
+
+
+class PlanLatchExpiryTests(unittest.TestCase):
+    def setUp(self):
+        broker._FLAGSHIP_AVAILABILITY_LATCHES.clear()
+        self._home_dir = tempfile.TemporaryDirectory()
+        self._home = Path(self._home_dir.name)
+        self.addCleanup(self._home_dir.cleanup)
+        home_patch = mock.patch.object(Path, "home", return_value=self._home)
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
+        env_patch = mock.patch.dict(
+            "os.environ", {"HOME": str(self._home), "USERPROFILE": str(self._home)}
+        )
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+
+    def tearDown(self):
+        broker._FLAGSHIP_AVAILABILITY_LATCHES.clear()
+
+    def test_plan_latch_blocks_before_recheck_and_voids_after_with_notice(self):
+        key = ("session-p", "claude", "fable")
+        base_time = 1_000_000.0
+        with mock.patch.object(broker.time, "time", return_value=base_time):
+            broker._set_flagship_latch(key, "plan", "skipped_unavailable", "requires usage credits")
+
+        latch = broker._FLAGSHIP_AVAILABILITY_LATCHES[key]
+        self.assertIn("expires_at", latch)
+        self.assertAlmostEqual(latch["expires_at"], base_time + 3600.0, delta=1)
+
+        # Before expiry window: blocks
+        with mock.patch.object(broker.time, "time", return_value=base_time + 3599.0):
+            active, notice = broker._latch_active(key)
+        self.assertTrue(active)
+        self.assertIsNone(notice)
+        self.assertIn(key, broker._FLAGSHIP_AVAILABILITY_LATCHES)
+
+        # After expiry window: voided with notice
+        with mock.patch.object(broker.time, "time", return_value=base_time + 3601.0):
+            active, notice = broker._latch_active(key)
+        self.assertFalse(active)
+        self.assertEqual(notice, "retrying claude:fable: recheck window passed")
+        self.assertNotIn(key, broker._FLAGSHIP_AVAILABILITY_LATCHES)
+
+    def test_plan_latch_honours_recheck_minutes_env_var(self):
+        key = ("session-p2", "codex", "gpt-6-astra")
+        base_time = 1_000_000.0
+        with mock.patch.dict("os.environ", {"AGENT_BROKER_UNAVAILABLE_RECHECK_MINUTES": "15"}), \
+             mock.patch.object(broker.time, "time", return_value=base_time):
+            broker._set_flagship_latch(key, "plan", "skipped_unavailable", "credit expired")
+
+        latch = broker._FLAGSHIP_AVAILABILITY_LATCHES[key]
+        self.assertAlmostEqual(latch["expires_at"], base_time + 15 * 60.0, delta=1)
+
+        # Bad env values fall back to default 60 minutes
+        key_bad = ("session-p3", "codex", "gpt-6-astra")
+        for bad_val in ("invalid", "-10", "0"):
+            with self.subTest(bad_val=bad_val):
+                with mock.patch.dict("os.environ", {"AGENT_BROKER_UNAVAILABLE_RECHECK_MINUTES": bad_val}), \
+                     mock.patch.object(broker.time, "time", return_value=base_time):
+                    broker._set_flagship_latch(key_bad, "plan", "skipped_unavailable", "credit expired")
+
+                latch_bad = broker._FLAGSHIP_AVAILABILITY_LATCHES[key_bad]
+                self.assertAlmostEqual(latch_bad["expires_at"], base_time + 60 * 60.0, delta=1)
 
 
 class AccountHashVoidingTests(unittest.TestCase):
@@ -477,7 +573,15 @@ class ReconciliationIgnoresSuccessfulAdviceTextTests(unittest.TestCase):
         home_patch = mock.patch.object(Path, "home", return_value=home)
         home_patch.start()
         self.addCleanup(home_patch.stop)
-        env_patch = mock.patch.dict("os.environ", {"HOME": str(home), "USERPROFILE": str(home)})
+        env_patch = mock.patch.dict(
+            "os.environ",
+            {
+                "HOME": str(home),
+                "USERPROFILE": str(home),
+                "AGENT_BROKER_DECISION_EVALUATOR_MODEL": "off",
+                "AGENT_BROKER_FABLE_MODE": "default",
+            },
+        )
         env_patch.start()
         self.addCleanup(env_patch.stop)
         broker._FLAGSHIP_AVAILABILITY_LATCHES.clear()

@@ -133,7 +133,7 @@ if (Test-Path -LiteralPath $markerPath) {
 $markerObj = [ordered]@{ release = $releaseId; hash = $fullHash; installed_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
 $markerTmp = $markerPath + '.tmp'
 [IO.File]::WriteAllText($markerTmp, ($markerObj | ConvertTo-Json), $utf8)
-if (Test-Path -LiteralPath $markerPath) { [IO.File]::Replace($markerTmp, $markerPath, $null) } else { [IO.File]::Move($markerTmp, $markerPath) }
+if (Test-Path -LiteralPath $markerPath) { [IO.File]::Replace($markerTmp, $markerPath, [NullString]::Value) } else { [IO.File]::Move($markerTmp, $markerPath) }
 Write-Host "runtime.json -> release $releaseId"
 
 # prune: keep current + previous; remove older only when no process is using them (unsure -> keep)

@@ -72,6 +72,9 @@ def run() -> int:
     if first == "code-graph-usage":
         import routing_gate
         return routing_gate.code_graph_usage_cli(sys.argv[2:])
+    if first == "tidy":
+        import broker_layout
+        return broker_layout.tidy_cli(sys.argv[2:])
     if first == "routing-hook":
         import routing_gate
         return routing_gate.main(sys.argv[2:])

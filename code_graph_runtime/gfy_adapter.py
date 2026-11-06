@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import ast
 import bisect
+import collections
 import hashlib
 import importlib.metadata
+import inspect
 import json
+import math
 import os
 import re
 import shutil
@@ -18,6 +21,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -169,9 +173,189 @@ def jdump(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
+# ---------------------------------------------------------------- secret hygiene
+PEM_RE = re.compile(r'-----BEGIN[^\r\n]*PRIVATE KEY', re.I)
+AWS_RE = re.compile(r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b')
+GH_RE = re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{20,})\b')
+SLACK_RE = re.compile(r'\bxox[abprs]-[A-Za-z0-9-]{10,}\b')
+KEY_RE = re.compile(r'\b(?:sk-|sk_live_|rk_live_|pk_live_)[A-Za-z0-9_-]{16,}\b')
+GOOGLE_RE = re.compile(r'\bAIza[0-9A-Za-z_-]{35}\b')
+JWT_RE = re.compile(r'\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+')
+TELEGRAM_RE = re.compile(r'\b\d{8,10}:[A-Za-z0-9_-]{35}\b')
+URL_CRED_RE = re.compile(r'[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:[^/\s:@]+@')
+BEARER_RE = re.compile(r'(?i)\bBearer\s+[A-Za-z0-9_.-]{16,}')
+ASSIGN_RE = re.compile(
+    r'(?i)\b[a-zA-Z0-9_]*?(?:password|passwd|secret|api_key|apikey|token)[a-zA-Z0-9_]*?\s*[:=]\s*(?:["\']([^"\'\r\n]+)["\']|([^\s,;}{)\]]+))'
+)
+UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+HEX_RE = re.compile(r'^[0-9a-fA-F]{32,128}$')
+
+SECRET_PATTERNS = [
+    PEM_RE, AWS_RE, GH_RE, SLACK_RE, KEY_RE, GOOGLE_RE,
+    JWT_RE, TELEGRAM_RE, URL_CRED_RE, BEARER_RE, ASSIGN_RE
+]
+
+
+def _is_file_path(token: str) -> bool:
+    if ("/" in token or "\\" in token) and "://" not in token:
+        parts = re.split(r"[/\\]", token)
+        if parts and all(p and re.match(r"^[a-zA-Z0-9_.-]+$", p) for p in parts if p):
+            return True
+    return False
+
+
+def _shannon_entropy(s: str) -> float:
+    counts = collections.Counter(s)
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def looks_secret(text: str) -> bool:
+    if not isinstance(text, str) or not text:
+        return False
+    for pat in SECRET_PATTERNS:
+        if pat.search(text):
+            return True
+    runs = re.findall(r'\S{32,}', text)
+    for run in runs:
+        if UUID_RE.fullmatch(run) or HEX_RE.fullmatch(run) or _is_file_path(run):
+            continue
+        if "://" in run:
+            continue
+        has_lower = bool(re.search(r'[a-z]', run))
+        has_upper = bool(re.search(r'[A-Z]', run))
+        has_digit = bool(re.search(r'[0-9]', run))
+        has_symbol = bool(re.search(r'[^a-zA-Z0-9\s]', run))
+        if sum([has_lower, has_upper, has_digit, has_symbol]) >= 3:
+            if _shannon_entropy(run) >= 4.0:
+                return True
+    return False
+
+
+def redact_text(s: str) -> str:
+    if not isinstance(s, str) or not s:
+        return s
+    for pat in SECRET_PATTERNS:
+        s = pat.sub("[redacted]", s)
+    runs = re.findall(r'\S{32,}', s)
+    for run in runs:
+        if UUID_RE.fullmatch(run) or HEX_RE.fullmatch(run) or _is_file_path(run):
+            continue
+        if "://" in run:
+            continue
+        has_lower = bool(re.search(r'[a-z]', run))
+        has_upper = bool(re.search(r'[A-Z]', run))
+        has_digit = bool(re.search(r'[0-9]', run))
+        has_symbol = bool(re.search(r'[^a-zA-Z0-9\s]', run))
+        if sum([has_lower, has_upper, has_digit, has_symbol]) >= 3:
+            if _shannon_entropy(run) >= 4.0:
+                s = s.replace(run, "[redacted]")
+    return s
+
+
+def _is_secret_filename(rel: str) -> bool:
+    name = os.path.basename(rel).lower()
+    if name == ".env" or name.endswith(".env"):
+        return True
+    if name.endswith(".pem") or name.endswith(".key"):
+        return True
+    if "secret" in name or "credential" in name:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------- outgoing sanitization
+_KNOWN_PROJECTS: dict[str, Project] = {}
+_PROJECTS_FILE: Path | None = None
+
+
+def _load_redact_terms_file() -> list[re.Pattern]:
+    if _PROJECTS_FILE is None:
+        return []
+    rt_file = _PROJECTS_FILE.parent / "redact_terms.json"
+    if not rt_file.is_file():
+        return []
+    try:
+        data = json.loads(rt_file.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return []
+        pats = []
+        valid = [t for t in data if isinstance(t, str) and t]
+        for t in sorted(valid, key=len, reverse=True):
+            pats.append(re.compile(re.escape(t), re.IGNORECASE))
+        return pats
+    except Exception:
+        return []
+
+
+def _get_sanitization_rules(projects: dict[str, Project] | None = None):
+    projs = dict(_KNOWN_PROJECTS)
+    if projects:
+        projs.update(projects)
+    raw_targets = []
+    for pid, p in projs.items():
+        if getattr(p, "root", None):
+            r = os.path.realpath(p.root).rstrip("\\/")
+            raw_targets.append((r.replace("/", "\\"), f"<root:{pid}>"))
+            raw_targets.append((r.replace("\\", "/"), f"<root:{pid}>"))
+        if getattr(p, "out_dir", None):
+            o = os.path.realpath(p.out_dir).rstrip("\\/")
+            raw_targets.append((o.replace("/", "\\"), f"<out:{pid}>"))
+            raw_targets.append((o.replace("\\", "/"), f"<out:{pid}>"))
+
+    try:
+        home = os.path.realpath(str(Path.home())).rstrip("\\/")
+        raw_targets.append((home.replace("/", "\\"), "~"))
+        raw_targets.append((home.replace("\\", "/"), "~"))
+    except Exception:
+        pass
+
+    seen = set()
+    targets = []
+    for s, repl in sorted(raw_targets, key=lambda x: len(x[0]), reverse=True):
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        targets.append((re.compile(re.escape(s), re.IGNORECASE), repl))
+
+    term_pats = _load_redact_terms_file()
+    return targets, term_pats
+
+
+def sanitize_in_place(obj, targets, term_pats):
+    if isinstance(obj, dict):
+        for k, v in list(obj.items()):
+            if isinstance(v, str):
+                s = v
+                for pat, repl in targets:
+                    s = pat.sub(repl, s)
+                for tpat in term_pats:
+                    s = tpat.sub("<masked>", s)
+                obj[k] = s
+            elif isinstance(v, (dict, list)):
+                sanitize_in_place(v, targets, term_pats)
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            if isinstance(item, str):
+                s = item
+                for pat, repl in targets:
+                    s = pat.sub(repl, s)
+                for tpat in term_pats:
+                    s = tpat.sub("<masked>", s)
+                obj[idx] = s
+            elif isinstance(item, (dict, list)):
+                sanitize_in_place(item, targets, term_pats)
+    return obj
+
+
 # ---------------------------------------------------------------- project registry
 class Project:
-    def __init__(self, pid: str, root: str, out_dir: str):
+    def __init__(self, pid: str, root: str, out_dir: str,
+                 exclude: list[str] | None = None,
+                 aliases: list[str] | None = None,
+                 group: str | None = None,
+                 related: list[str] | None = None,
+                 label: str | None = None):
         self.id = pid
         self.root = os.path.realpath(root)
         if not os.path.isabs(out_dir):
@@ -179,13 +363,74 @@ class Project:
         self.out_dir = os.path.realpath(out_dir)
         if _inside(self.out_dir, self.root) or _inside(self.root, self.out_dir):
             raise ValueError(f"{pid}: out_dir must be outside root (and not contain it)")
+
+        if exclude is not None:
+            if not isinstance(exclude, list) or not all(isinstance(x, str) for x in exclude):
+                raise TypeError(f"{pid}: exclude must be list[str]")
+            self.exclude = list(exclude)
+        else:
+            self.exclude = []
+
+        if aliases is not None:
+            if not isinstance(aliases, list) or not all(isinstance(x, str) for x in aliases):
+                raise TypeError(f"{pid}: aliases must be list[str]")
+            self.aliases = list(aliases)
+        else:
+            self.aliases = None
+
+        if group is not None:
+            if not isinstance(group, str):
+                raise TypeError(f"{pid}: group must be str")
+            self.group = group
+        else:
+            self.group = None
+
+        if related is not None:
+            if not isinstance(related, list) or not all(isinstance(x, str) for x in related):
+                raise TypeError(f"{pid}: related must be list[str]")
+            self.related = list(related)
+        else:
+            self.related = None
+
+        if label is not None:
+            if not isinstance(label, str):
+                raise TypeError(f"{pid}: label must be str")
+            if len(label) > 120:
+                raise ValueError(f"{pid}: label exceeds 120 chars")
+            self.label = label
+        else:
+            self.label = None
+
         self.work = Path(self.out_dir) / "work"
         self.published = Path(self.out_dir) / "published"
         self.lock = Path(self.out_dir) / "refresh.lock"
+        self._thread_lock = threading.Lock()
+        self._status_lock = threading.Lock()
+        self._status = {
+            "state": "idle",
+            "started_at": None,
+            "finished_at": None,
+            "wall_s": None,
+            "attempts": 0,
+            "detail": None,
+        }
+        self.last_finished_monotonic = None
         self._G = None
         self._G_sha = None
         self._L = None          # literal index of the generation being served (None = absent/unavailable)
         self._L_key = None
+        _KNOWN_PROJECTS[self.id] = self
+
+    def get_refresh_status(self) -> dict:
+        with self._status_lock:
+            return dict(self._status)
+
+    def set_refresh_status(self, **kwargs):
+        with self._status_lock:
+            self._status.update(kwargs)
+
+    def ignored_pred(self):
+        return S_detect.ignored_predicate(Path(self.root), extra_excludes=self.exclude or None)
 
     # --- pointer / snapshot
     def pointer(self):
@@ -296,6 +541,7 @@ class Project:
         """Code files the project would now contain, as posix relpaths (git when available, else a pruned scan)."""
         from graphify.detect import CODE_EXTENSIONS, _is_noise_dir
         exts = set(CODE_EXTENSIONS)
+        pred = self.ignored_pred()
         out = set()
         if os.path.exists(os.path.join(self.root, ".git")):
             try:
@@ -304,22 +550,26 @@ class Project:
                 if p.returncode == 0:
                     for rel in p.stdout.decode("utf-8", "replace").split("\0"):
                         if rel and os.path.splitext(rel)[1] in exts and os.path.isfile(os.path.join(self.root, rel)):
-                            out.add(rel.replace("\\", "/"))
+                            norm = rel.replace("\\", "/")
+                            if not pred(Path(self.root) / norm):
+                                out.add(norm)
                     return out
             except Exception:
                 pass
         for d, dirs, files in os.walk(self.root):
-            dirs[:] = [x for x in dirs if not _is_noise_dir(x, Path(d))]
+            dirs[:] = [x for x in dirs if not _is_noise_dir(x, Path(d)) and not pred(Path(d) / x)]
             for n in files:
                 if os.path.splitext(n)[1] in exts:
-                    out.add(os.path.relpath(os.path.join(d, n), self.root).replace("\\", "/"))
+                    full = Path(d) / n
+                    if not pred(full):
+                        out.add(os.path.relpath(full, self.root).replace("\\", "/"))
         return out
 
     def new_files(self, known: set):
         cand = sorted(self.code_files_now() - known)
         if not cand:
             return []
-        pred = S_detect.ignored_predicate(Path(self.root))  # graphify's own ignore rules (.gitignore/.graphifyignore/noise dirs)
+        pred = self.ignored_pred()
         return [c for c in cand if not pred(Path(self.root) / c)]
 
     # --- fingerprint
@@ -389,13 +639,23 @@ class Project:
 
 
 def load_projects(path: Path) -> dict[str, Project]:
+    global _PROJECTS_FILE
+    _PROJECTS_FILE = path
     cfg = json.loads(path.read_text(encoding="utf-8"))
     out = {}
     for pid, v in cfg.items():
         try:
-            out[pid] = Project(pid, v["root"], v["out_dir"])
+            if not isinstance(v, dict):
+                raise TypeError(f"{pid}: project config must be dict")
+            out[pid] = Project(pid, v["root"], v["out_dir"],
+                               exclude=v.get("exclude"),
+                               aliases=v.get("aliases"),
+                               group=v.get("group"),
+                               related=v.get("related"),
+                               label=v.get("label"))
         except Exception as e:  # invalid config entries are refused, not served
             sys.stderr.write(f"gfy_adapter: project {pid} refused: {e}\n")
+    _KNOWN_PROJECTS.update(out)
     return out
 
 
@@ -411,8 +671,10 @@ def envelope(op, proj, ptr, stale, why):
             "stale": stale, "stale_reason": why, "served": proj.served if proj else None, "chars": 0, "hits": 0}
 
 
-def finalize(resp: dict, max_chars: int, trimmers=()) -> str:
+def finalize(resp: dict, max_chars: int, trimmers=(), projects: dict[str, Project] | None = None) -> str:
     """Serialize; apply trimmers (callables dropping content, returning a label) until <= max_chars."""
+    targets, term_pats = _get_sanitization_rules(projects)
+    sanitize_in_place(resp, targets, term_pats)
     dropped = {}
     for _ in range(200):
         for _ in range(4):  # chars field is self-referential; iterate to a fixed point
@@ -446,6 +708,9 @@ def finalize(resp: dict, max_chars: int, trimmers=()) -> str:
             break
     # last resort: minimal error-free stub that still fits
     stub = {k: resp.get(k) for k in ("ok", "op", "project", "snapshot", "built_at", "stale", "stale_reason", "hits")}
+    for k in ("revalidating", "building"):
+        if k in resp:
+            stub[k] = resp[k]
     stub.update({"truncated": True, "dropped": {"all": 1}, "chars": 0})
     for _ in range(4):
         s = jdump(stub)
@@ -517,7 +782,9 @@ def short(loc: dict) -> str:
 def op_locate(proj: Project, req: dict) -> str:
     G, ptr = proj.graph()
     if G is None:
-        return err("locate", proj, proj.missing_code(), req)
+        flag = maybe_trigger_auto_refresh(proj, is_missing=True, is_stale=False)
+        extra = {flag: True} if flag else None
+        return err("locate", proj, proj.missing_code(), req, extra=extra)
     query = str(req.get("query") or "")
     limit = max(1, min(int(req.get("limit") or 8), 20))
     max_chars = int(req.get("max_chars") or DEFAULT_MAX_CHARS)
@@ -575,7 +842,10 @@ def op_locate(proj: Project, req: dict) -> str:
             exact = True
             break
     stale, why = proj.staleness(ptr)
+    flag = maybe_trigger_auto_refresh(proj, is_missing=False, is_stale=stale)
     resp = envelope("locate", proj, ptr, stale, why)
+    if flag:
+        resp[flag] = True
     if lit_locs:
         locs = lit_locs + locs
         exact = True
@@ -629,7 +899,9 @@ def _resolve(G, req, key_id="node_id", key_sym="symbol"):
 def op_expand(proj, req):
     G, ptr = proj.graph()
     if G is None:
-        return err("expand", proj, proj.missing_code(), req)
+        flag = maybe_trigger_auto_refresh(proj, is_missing=True, is_stale=False)
+        extra = {flag: True} if flag else None
+        return err("expand", proj, proj.missing_code(), req, extra=extra)
     max_chars = int(req.get("max_chars") or DEFAULT_MAX_CHARS)
     limit = max(1, min(int(req.get("limit") or 10), 40))
     nid = _resolve(G, req)
@@ -643,7 +915,10 @@ def op_expand(proj, req):
     rank = {"EXTRACTED": 0, "INFERRED": 1}
     items.sort(key=lambda x: (rank.get(x[2].get("confidence"), 2), -G.degree(x[1]), x[1]))
     stale, why = proj.staleness(ptr)
+    flag = maybe_trigger_auto_refresh(proj, is_missing=False, is_stale=stale)
     resp = envelope("expand", proj, ptr, stale, why)
+    if flag:
+        resp[flag] = True
     resp["node"] = locator(G, nid, 0, [])
     resp["neighbors"] = [dict(locator(G, v, 0, []), dir=d, rel=e.get("relation"), conf=e.get("confidence"))
                          for d, v, e in items[:limit]]
@@ -662,7 +937,9 @@ def op_path(proj, req):
     import networkx as nx
     G, ptr = proj.graph()
     if G is None:
-        return err("path", proj, proj.missing_code(), req)
+        flag = maybe_trigger_auto_refresh(proj, is_missing=True, is_stale=False)
+        extra = {flag: True} if flag else None
+        return err("path", proj, proj.missing_code(), req, extra=extra)
     max_chars = int(req.get("max_chars") or DEFAULT_MAX_CHARS)
     hops = max(1, min(int(req.get("max_hops") or 6), 12))
     s = _resolve(G, {"node_id": req.get("source_id"), "symbol": req.get("source"), "file": req.get("source_file")})
@@ -670,7 +947,10 @@ def op_path(proj, req):
     if not s or not t:
         return err("path", proj, "endpoint_not_found", req)
     stale, why = proj.staleness(ptr)
+    flag = maybe_trigger_auto_refresh(proj, is_missing=False, is_stale=stale)
     resp = envelope("path", proj, ptr, stale, why)
+    if flag:
+        resp[flag] = True
     try:
         p = nx.shortest_path(G.to_undirected(as_view=True), s, t)
     except nx.NetworkXNoPath:
@@ -692,15 +972,27 @@ def op_path(proj, req):
 def op_stats(proj, req):
     G, ptr = proj.graph()
     if G is None:
-        return err("stats", proj, proj.missing_code(), req)
+        flag = maybe_trigger_auto_refresh(proj, is_missing=True, is_stale=False)
+        extra = {"refresh": proj.get_refresh_status()}
+        if flag:
+            extra[flag] = True
+        return err("stats", proj, proj.missing_code(), req, extra=extra)
     stale, why = proj.staleness(ptr)
+    flag = maybe_trigger_auto_refresh(proj, is_missing=False, is_stale=stale)
     fp = proj._fp_files(ptr) or {}
     resp = envelope("stats", proj, ptr, stale, why)
+    if flag:
+        resp[flag] = True
+    lit_info = ptr.get("literals") or {}
     resp.update({"nodes": G.number_of_nodes(), "edges": G.number_of_edges(),
                  "communities": len({d.get("community") for _, d in G.nodes(data=True)}),
                  "fingerprint_files": len(fp.get("files", [])), "git_head": fp.get("git_head"),
-                 "fingerprint": ptr.get("fingerprint"), "literals": (ptr.get("literals") or {}).get("count"),
-                 "stale_cache": {"hits": proj.cache_hits, "computes": proj.cache_computes}})
+                 "fingerprint": ptr.get("fingerprint"), "literals": lit_info.get("count"),
+                 "secrets_dropped": lit_info.get("secrets_dropped", 0),
+                 "stale_cache": {"hits": proj.cache_hits, "computes": proj.cache_computes},
+                 "refresh": proj.get_refresh_status()})
+    if "changed_during_build" in ptr:
+        resp["changed_during_build"] = ptr["changed_during_build"]
     return finalize(resp, int(req.get("max_chars") or DEFAULT_MAX_CHARS))
 
 
@@ -750,6 +1042,11 @@ class _LitVisitor(ast.NodeVisitor):
         if text is None or len(text) < LIT_MIN:
             self.short += 1
             return
+        l1 = node.lineno
+        if 1 <= l1 <= len(self.lines):
+            line_str = self.lines[l1 - 1].decode("utf-8", "replace")
+            if ASSIGN_RE.search(line_str):
+                text = line_str.strip()
         sym = ".".join(n for n, _ in self.stack) or None
         self.out.append((node.lineno, node.end_lineno if node.end_lineno != node.lineno else None, sym, text,
                          self.stack[-1][1] if self.stack else None))
@@ -802,13 +1099,19 @@ def extract_text_literals(data: bytes):
     """Regex candidates for non-Python code: single-line quoted strings; the owner is NEVER inferred."""
     text = data.decode("utf-8", "replace")
     starts = [0] + [m.end() for m in re.finditer("\n", text)]
+    lines = text.splitlines()
     out, short = [], 0
     for m in _Q_RE.finditer(text):
         t = m.group(0)
         if len(t) < LIT_MIN:
             short += 1
             continue
-        out.append((bisect.bisect_right(starts, m.start()), None, None, t, None))
+        line_idx = bisect.bisect_right(starts, m.start())
+        if 1 <= line_idx <= len(lines):
+            line_str = lines[line_idx - 1]
+            if ASSIGN_RE.search(line_str):
+                t = line_str.strip()
+        out.append((line_idx, None, None, t, None))
     return out, short
 
 
@@ -826,7 +1129,7 @@ def _manifest_rels(proj, work: Path):
 
 def hash_sources(proj: Project) -> dict:
     """Short sha256 of every code file the project currently contains (graphify's ignore rules applied)."""
-    pred = S_detect.ignored_predicate(Path(proj.root))
+    pred = proj.ignored_pred()
     out = {}
     for rel in sorted(proj.code_files_now()):
         if pred(Path(proj.root) / rel):
@@ -843,6 +1146,7 @@ def build_literals(proj: Project, graph_path: Path, pre):
     """Extract the literal index from the SAME bytes the graph build saw.
     pre = {rel: hash} taken BEFORE the build (None when no build ran). Returns (artifact_dict, error)."""
     max_bytes, max_text = _lit_cfg()
+    pred = proj.ignored_pred()
     rels = _manifest_rels(proj, proj.work)
     try:
         gd = json.loads(graph_path.read_text(encoding="utf-8"))
@@ -854,7 +1158,10 @@ def build_literals(proj: Project, graph_path: Path, pre):
     excl = {"short": 0, "truncated": 0}
     first = {}
     unverified = 0
+    secrets_dropped = 0
     for rel in sorted(set(rels)):
+        if pred(Path(proj.root) / rel):
+            continue
         ap = os.path.join(proj.root, rel)
         try:
             with open(ap, "rb") as f:
@@ -875,6 +1182,9 @@ def build_literals(proj: Project, graph_path: Path, pre):
         lang = _lang_of(rel)
         ent = {"h": h, "lang": lang}
         files[rel] = ent
+        if _is_secret_filename(rel):
+            ent["skip"] = "secret_file"
+            continue
         if len(data) > max_bytes:
             skipped["size"] += 1
             ent["skip"] = "size"
@@ -891,6 +1201,9 @@ def build_literals(proj: Project, graph_path: Path, pre):
         excl["short"] += short
         rows = []
         for (ln, eln, sym, text, sym_line) in lits:
+            if looks_secret(text):
+                secrets_dropped += 1
+                continue
             if len(text) > max_text:
                 text = text[:max_text]
                 excl["truncated"] += 1
@@ -903,6 +1216,8 @@ def build_literals(proj: Project, graph_path: Path, pre):
     # files tracked before the build but absent from the manifest: still verify they did not move
     if pre is not None:
         for rel, h0 in pre.items():
+            if pred(Path(proj.root) / rel):
+                continue
             if rel in first:
                 continue
             try:
@@ -922,7 +1237,7 @@ def build_literals(proj: Project, graph_path: Path, pre):
             return None, f"source_changed_during_extract:{rel}"
     art = {"version": 1, "files": files, "literals": literals, "by_lang": by_lang,
            "count": sum(by_lang.values()), "skipped": skipped, "excluded_literals": excl,
-           "unverified_files": unverified,
+           "unverified_files": unverified, "secrets_dropped": secrets_dropped,
            "limits": {"max_file_bytes": max_bytes, "max_text": max_text, "min_len": LIT_MIN}}
     return art, None
 
@@ -930,7 +1245,9 @@ def build_literals(proj: Project, graph_path: Path, pre):
 def op_find_text(proj: Project, req: dict) -> str:
     G, ptr = proj.graph()
     if G is None:
-        return err("find_text", proj, proj.missing_code(), req)
+        flag = maybe_trigger_auto_refresh(proj, is_missing=True, is_stale=False)
+        extra = {flag: True} if flag else None
+        return err("find_text", proj, proj.missing_code(), req, extra=extra)
     text = req.get("text")
     max_chars = int(req.get("max_chars") or DEFAULT_MAX_CHARS)
     if not isinstance(text, str) or not (3 <= len(text) <= 200):
@@ -938,8 +1255,10 @@ def op_find_text(proj: Project, req: dict) -> str:
     limit = max(1, min(int(req.get("limit") or 5), 10))
     L = proj.lits
     stale, why = proj.staleness(ptr)
+    flag = maybe_trigger_auto_refresh(proj, is_missing=False, is_stale=stale)
     if L is None:
-        return err("find_text", proj, "literal_index_unavailable", req)
+        extra = {flag: True} if flag else None
+        return err("find_text", proj, "literal_index_unavailable", req, extra=extra)
     found = []
     for rel, rows in L["literals"].items():
         for r in rows:
@@ -948,6 +1267,8 @@ def op_find_text(proj: Project, req: dict) -> str:
     total = len(found)
     found.sort(key=lambda x: (x[1][4] != text, x[1][3] != "ast", _is_test(x[0]), x[0], x[1][0]))
     resp = envelope("find_text", proj, ptr, stale, why)
+    if flag:
+        resp[flag] = True
     hc, matches = {}, []
     for rel, r in found[:limit]:
         i = r[4].index(text)
@@ -956,7 +1277,7 @@ def op_find_text(proj: Project, req: dict) -> str:
             hc[rel] = proj.live_hash(rel)
         fm = L["files"].get(rel, {})
         m = {"file": rel, "line": r[0], "end_line": r[1], "symbol": r[2], "owner": r[3],
-             "lang": fm.get("lang"), "excerpt": r[4][a:a + 100], "stale": hc[rel] != fm.get("h")}
+             "lang": fm.get("lang"), "excerpt": redact_text(r[4][a:a + 100]), "stale": hc[rel] != fm.get("h")}
         if r[5]:
             m["in_graph"] = True
         matches.append(m)
@@ -964,7 +1285,8 @@ def op_find_text(proj: Project, req: dict) -> str:
     resp.update({"matches": matches, "omitted": total - len(matches), "hits": len(matches),
                  "coverage": {"files_indexed": len([1 for f in L["files"].values() if "skip" not in f]),
                               "files_skipped": sum(sk.values()), "literal_count": L.get("count", 0),
-                              "by_lang": L.get("by_lang", {})},
+                              "by_lang": L.get("by_lang", {}),
+                              "secrets_dropped": L.get("secrets_dropped", 0)},
                  "not_indexed": NOT_INDEXED_LIT})
 
     def t_m():
@@ -1012,7 +1334,8 @@ def literal_locators(proj: Project, phrases, cap: int):
     for ph, rel, r in found[:cap]:
         i = r[4].index(ph)
         out.append({"symbol": r[2] or "<module>", "kind": "literal", "file": rel, "line": r[0], "community": None,
-                    "degree": 0, "score": 0.0, "owner": r[3], "excerpt": r[4][max(0, i - 20):i + len(ph) + 20][:80]})
+                    "degree": 0, "score": 0.0, "owner": r[3],
+                    "excerpt": redact_text(r[4][max(0, i - 20):i + len(ph) + 20][:80])})
     return out
 
 
@@ -1148,7 +1471,9 @@ def _used_fixtures(tree):
 def op_context_for(proj: Project, req: dict) -> str:
     G, ptr = proj.graph()
     if G is None:
-        return err("context_for", proj, proj.missing_code(), req)
+        flag = maybe_trigger_auto_refresh(proj, is_missing=True, is_stale=False)
+        extra = {flag: True} if flag else None
+        return err("context_for", proj, proj.missing_code(), req, extra=extra)
     max_chars = int(req.get("max_chars") or DEFAULT_MAX_CHARS)
     files = req.get("files")
     if not isinstance(files, list) or not (1 <= len(files) <= 5) or not all(isinstance(f, str) and f for f in files):
@@ -1156,8 +1481,9 @@ def op_context_for(proj: Project, req: dict) -> str:
     limit = max(1, min(int(req.get("limit") or 5), 5))
     root = proj.root
     stale, why = proj.staleness(ptr)
+    flag = maybe_trigger_auto_refresh(proj, is_missing=False, is_stale=stale)
     gen_files = (proj.lits or {}).get("files", {})
-    pred = S_detect.ignored_predicate(Path(root))
+    pred = proj.ignored_pred()
     unresolved, declared = [], []
     ext_total = 0
     for f in files:
@@ -1230,10 +1556,10 @@ def op_context_for(proj: Project, req: dict) -> str:
                 test_files = sorted(r for r in gen_files if r.endswith(".py") and _is_test(r))
                 if not test_files:
                     for dp, dn, fn in os.walk(root):
-                        dn[:] = [x for x in dn if not S_detect._is_noise_dir(x, Path(dp))]
+                        dn[:] = [x for x in dn if not S_detect._is_noise_dir(x, Path(dp)) and not pred(Path(dp) / x)]
                         for n in fn:
                             r = os.path.relpath(os.path.join(dp, n), root).replace("\\", "/")
-                            if n.endswith(".py") and _is_test(r):
+                            if n.endswith(".py") and _is_test(r) and not pred(Path(dp) / n):
                                 test_files.append(r)
                     test_files.sort()
             stem = os.path.splitext(os.path.basename(d))[0]
@@ -1274,6 +1600,8 @@ def op_context_for(proj: Project, req: dict) -> str:
                      "stale": (proj.live_hash(rel) != gen_files[rel]["h"]) if rel in gen_files else True})
         total_bytes += size
     resp = envelope("context_for", proj, ptr, stale, why)
+    if flag:
+        resp[flag] = True
     resp.update({"suggestions": sugg, "unresolved": unresolved[:5], "omitted": omitted, "bytes_total": total_bytes,
                  "hits": len(sugg), "note": CTX_NOTE})
     if len(unresolved) > 5:
@@ -1336,48 +1664,109 @@ def _acquire_lock(lock: Path) -> bool:
     return False
 
 
-def op_refresh(proj: Project, req: dict) -> str:
-    max_chars = int(req.get("max_chars") or DEFAULT_MAX_CHARS)
+def _is_source_changed(msg: str | None) -> bool:
+    return bool(msg and "source_changed_during_build" in str(msg))
+
+
+def _extract_changed_files(msg: str | None, pre: dict | None, proj: Project) -> list[str]:
+    changed = []
+    if msg:
+        s = str(msg)
+        if "source_changed_during_build" in s:
+            part = s.split("source_changed_during_build", 1)[1]
+            part = part.lstrip(":").strip()
+            if part:
+                if part.startswith("[") and part.endswith("]"):
+                    try:
+                        parsed = json.loads(part)
+                        if isinstance(parsed, list):
+                            changed.extend(str(x) for x in parsed)
+                    except Exception:
+                        pass
+                if not changed:
+                    for item in re.split(r'[,;\s]+', part):
+                        item = item.strip("'\"")
+                        if item:
+                            changed.append(item)
+    if not changed and pre:
+        post = hash_sources(proj)
+        for rel, h0 in pre.items():
+            if post.get(rel) != h0:
+                changed.append(rel)
+    return changed
+
+
+def run_build(proj: Project, env: dict) -> str | None:
+    delay_s = float(os.environ.get("GFY_BUILD_DELAY_S", "0"))
+    if delay_s > 0:
+        time.sleep(delay_s)
+    proj.work.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-m", "graphify", "extract", proj.root, "--code-only"]
+    for pat in proj.exclude:
+        cmd.extend(["--exclude", pat])
+    p = subprocess.run(cmd,
+                       env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       timeout=900, cwd=str(proj.out_dir))
+    if p.returncode != 0:
+        return f"graphify extract rc={p.returncode}: {(p.stderr or p.stdout)[-200:]}"
+    return None
+
+
+def _call_build_fn(fn, proj: Project, env: dict):
+    params = None
+    try:
+        sig = inspect.signature(fn)
+        params = len(sig.parameters)
+    except (ValueError, TypeError):
+        params = None
+
+    if params == 0:
+        return fn()
+    elif params == 1:
+        return fn(proj)
+    elif params is not None:
+        return fn(proj, env)
+
+    try:
+        return fn(proj, env)
+    except TypeError:
+        return fn()
+
+
+def perform_refresh(proj: Project, req: dict | None = None, build_fn=None, lock_already_held: bool = False) -> dict:
+    req = req or {}
     force = bool(req.get("force"))
+    want_lits = not req.get("no_literals")
+    skip_build = bool(req.get("skip_build"))
+    actual_build_fn = build_fn or run_build
+
+    if not lock_already_held:
+        proj._thread_lock.acquire()
+
+    t0 = time.perf_counter()
     ptr0 = proj.pointer()
     stale0, why0 = (proj.staleness(ptr0) if ptr0 else (True, "no_snapshot"))
+
     if not _acquire_lock(proj.lock):
         resp = envelope("refresh", proj, ptr0, stale0, why0)
         resp.update({"ok": False, "error": "refresh_busy"})
-        return finalize(resp, max_chars)
-    t0 = time.perf_counter()
+        try:
+            proj._thread_lock.release()
+        except RuntimeError:
+            pass
+        return resp
+
+    proj.set_refresh_status(
+        state="running",
+        started_at=now_iso(),
+        finished_at=None,
+        wall_s=None,
+        attempts=0,
+        detail=None,
+    )
     proj._scache = None
+
     try:
-        err_msg = None
-        info = None
-        want_lits = not req.get("no_literals")
-        tm = {}
-        pre = None
-        if want_lits and not req.get("skip_build"):
-            t1 = time.perf_counter()
-            pre = hash_sources(proj)
-            tm["hash_pre_s"] = round(time.perf_counter() - t1, 2)
-        t1 = time.perf_counter()
-        if not req.get("skip_build"):
-            env = child_env({"GRAPHIFY_OUT": str(proj.work)})
-            def build():
-                proj.work.mkdir(parents=True, exist_ok=True)
-                p = subprocess.run([sys.executable, "-m", "graphify", "extract", proj.root, "--code-only"],
-                                   env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                   timeout=900, cwd=str(proj.out_dir))
-                if p.returncode != 0:
-                    return f"graphify extract rc={p.returncode}: {(p.stderr or p.stdout)[-200:]}"
-                return None
-            err_msg = build()
-            if err_msg is None:
-                try:
-                    json.loads((proj.work / "graph.json").read_text(encoding="utf-8"))
-                except Exception:
-                    err_msg = "work graph unreadable"
-            if err_msg:  # a corrupt incremental work dir must not wedge refresh: rebuild once from scratch
-                shutil.rmtree(proj.work, ignore_errors=True)
-                err_msg = build()
-        tm["build_s"] = round(time.perf_counter() - t1, 2)
         gp = proj.work / "graph.json"
         prev_nodes = None
         if ptr0:
@@ -1386,19 +1775,109 @@ def op_refresh(proj: Project, req: dict) -> str:
                 prev_nodes = len(prev_nodes)
             except Exception:
                 prev_nodes = None
-        if not err_msg:
-            info, verr = validate_graph(gp, prev_nodes, force)
-            err_msg = verr
+
+        tm = {}
+        all_changed_files = []
+        max_attempts = 3
+        attempts = 0
+        err_msg = None
+        info = None
         lit_art = None
-        if not err_msg and want_lits:
+        pre = None
+
+        for attempt in range(1, max_attempts + 1):
+            attempts = attempt
+            proj.set_refresh_status(attempts=attempts)
+            err_msg = None
+            info = None
+            lit_art = None
+
+            if want_lits and not skip_build:
+                t1 = time.perf_counter()
+                pre = hash_sources(proj)
+                tm["hash_pre_s"] = round(time.perf_counter() - t1, 2)
+
             t1 = time.perf_counter()
-            lit_art, err_msg = build_literals(proj, gp, pre)
-            tm["literals_s"] = round(time.perf_counter() - t1, 2)
+            if not skip_build:
+                env = child_env({"GRAPHIFY_OUT": str(proj.work)})
+                try:
+                    err_msg = _call_build_fn(actual_build_fn, proj, env)
+                except Exception as e:
+                    err_msg = str(e)
+
+                if err_msg is None:
+                    try:
+                        json.loads((proj.work / "graph.json").read_text(encoding="utf-8"))
+                    except Exception:
+                        err_msg = "work graph unreadable"
+
+                if err_msg and not _is_source_changed(err_msg):
+                    shutil.rmtree(proj.work, ignore_errors=True)
+                    try:
+                        err_msg = _call_build_fn(actual_build_fn, proj, env)
+                    except Exception as e:
+                        err_msg = str(e)
+            tm["build_s"] = round(time.perf_counter() - t1, 2)
+
+            if not err_msg:
+                info, verr = validate_graph(gp, prev_nodes, force)
+                err_msg = verr
+
+            if not err_msg and want_lits:
+                t1 = time.perf_counter()
+                lit_art, lerr = build_literals(proj, gp, pre)
+                err_msg = lerr
+                tm["literals_s"] = round(time.perf_counter() - t1, 2)
+
+            if err_msg and _is_source_changed(err_msg):
+                files = _extract_changed_files(err_msg, pre, proj)
+                all_changed_files.extend(files)
+                if attempt < max_attempts:
+                    pause_s = float(os.environ.get("GFY_RETRY_PAUSE_S", "5"))
+                    if pause_s > 0:
+                        time.sleep(pause_s)
+                    continue
+            break
+
+        publish_anyway = False
         if err_msg:
-            resp = envelope("refresh", proj, ptr0, stale0, why0)
-            resp.update({"ok": False, "error": "refresh_failed", "detail": err_msg[:300],
-                         "serving": "last-good" if ptr0 else "nothing"})
-            return finalize(resp, max_chars)
+            if _is_source_changed(err_msg) and not ptr0:
+                publish_anyway = True
+            else:
+                wall_s = round(time.perf_counter() - t0, 2)
+                proj.set_refresh_status(
+                    state="failed",
+                    finished_at=now_iso(),
+                    wall_s=wall_s,
+                    attempts=attempts,
+                    detail=str(err_msg)[:300],
+                )
+                proj.last_finished_monotonic = time.monotonic()
+                resp = envelope("refresh", proj, ptr0, stale0, why0)
+                resp.update({
+                    "ok": False,
+                    "error": "refresh_failed",
+                    "detail": str(err_msg)[:300],
+                    "serving": "last-good" if ptr0 else "nothing",
+                    "refresh": proj.get_refresh_status(),
+                })
+                return resp
+
+        if publish_anyway:
+            if not info:
+                info, _ = validate_graph(gp, prev_nodes=None, force=True)
+            if not info:
+                try:
+                    gd = json.loads(gp.read_text("utf-8"))
+                    info = {"nodes": len(gd.get("nodes", [])), "edges": len(gd.get("links", gd.get("edges", [])))}
+                except Exception:
+                    info = {"nodes": 0, "edges": 0}
+            if not lit_art and want_lits:
+                try:
+                    lit_art, _ = build_literals(proj, gp, pre=None)
+                except Exception:
+                    lit_art = None
+
         sha = semantic_id(gp)
         proj.published.mkdir(parents=True, exist_ok=True)
         snap = proj.published / f"graph-{sha[:12]}.json"
@@ -1410,7 +1889,7 @@ def op_refresh(proj: Project, req: dict) -> str:
             os.replace(tmp, snap)
         file_sha = sha256_file(snap)
         lit_desc = None
-        if lit_art is not None:  # sibling artifact of the snapshot; written BEFORE the pointer swap
+        if lit_art is not None:
             lit_art["graph_sha"] = sha
             raw = jdump(lit_art).encode("utf-8")
             lsha = hashlib.sha256(raw).hexdigest()
@@ -1421,15 +1900,18 @@ def op_refresh(proj: Project, req: dict) -> str:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, proj.published / lname)
-            lit_desc = {"name": lname, "file_sha": lsha, "count": lit_art["count"]}
+            lit_desc = {"name": lname, "file_sha": lsha, "count": lit_art["count"],
+                        "secrets_dropped": lit_art.get("secrets_dropped", 0)}
             tm["graph_bytes"] = snap.stat().st_size
             tm["literals_bytes"] = len(raw)
-        # fingerprint from the graphify manifest (stat only)
+
         rels = []
         try:
             rels = list(json.loads((proj.work / "manifest.json").read_text("utf-8")).keys())
         except Exception:
             pass
+        pred = proj.ignored_pred()
+        rels = [r for r in rels if not pred(Path(proj.root) / r)]
         entries, head = proj.compute_fingerprint(rels)
         fp_digest = hashlib.sha256(jdump([entries, head]).encode()).hexdigest()[:16]
         atomic_write_json(proj.published / f"graph-{sha[:12]}.fp.json", {"files": entries, "git_head": head})
@@ -1437,16 +1919,25 @@ def op_refresh(proj: Project, req: dict) -> str:
         newptr = {"snapshot": sha[:12], "sha": sha, "file_sha": file_sha, "built_at": built, "fingerprint": fp_digest}
         if lit_desc:
             newptr["literals"] = lit_desc
-        if ptr0 and changed:  # previous generation (graph + its literals) becomes last-good
+        if publish_anyway:
+            seen_c = set()
+            dedup_c = []
+            for c in all_changed_files:
+                if c not in seen_c:
+                    seen_c.add(c)
+                    dedup_c.append(c)
+            newptr["changed_during_build"] = dedup_c[:20]
+
+        if ptr0 and changed:
             newptr.update({"prev": ptr0["sha"][:12], "prev_sha": ptr0["sha"], "prev_file_sha": ptr0.get("file_sha"),
-                           "prev_built_at": ptr0.get("built_at")})
+                            "prev_built_at": ptr0.get("built_at")})
             if ptr0.get("literals"):
                 newptr["prev_literals"] = ptr0["literals"]
         elif ptr0:
             newptr.update({k: ptr0[k] for k in ("prev", "prev_sha", "prev_file_sha", "prev_built_at", "prev_literals")
-                           if k in ptr0})
+                            if k in ptr0})
         atomic_write_json(proj.published / "current.json", newptr)
-        # keep current + previous (last-good); prune the rest
+
         keep = {sha[:12]}
         if newptr.get("prev"):
             keep.add(newptr["prev"])
@@ -1463,28 +1954,145 @@ def op_refresh(proj: Project, req: dict) -> str:
                     f.unlink()
                 except OSError:
                     pass
-        proj._scache = None  # a successful refresh invalidates the staleness cache
+
+        proj._scache = None
+        wall_s = round(time.perf_counter() - t0, 2)
+        proj.set_refresh_status(
+            state="ok",
+            finished_at=now_iso(),
+            wall_s=wall_s,
+            attempts=attempts,
+            detail=None,
+        )
+        proj.last_finished_monotonic = time.monotonic()
+
         ptr = proj.pointer()
         resp = envelope("refresh", proj, ptr, False, None)
-        resp.update({"graph_changed": changed, "nodes": info["nodes"], "edges": info["edges"],
+        sec_drop = lit_art.get("secrets_dropped", 0) if lit_art is not None else 0
+        resp.update({"graph_changed": changed, "nodes": info["nodes"] if info else 0, "edges": info["edges"] if info else 0,
                      "literals": lit_art["count"] if lit_art is not None else None,
-                     "wall_s": round(time.perf_counter() - t0, 2), "timing": tm})
-        return finalize(resp, max_chars)
+                     "secrets_dropped": sec_drop,
+                     "coverage": {"secrets_dropped": sec_drop} if lit_art is not None else {},
+                     "wall_s": wall_s, "timing": tm,
+                     "refresh": proj.get_refresh_status()})
+        if "changed_during_build" in newptr:
+            resp["changed_during_build"] = newptr["changed_during_build"]
+        return resp
     except subprocess.TimeoutExpired:
+        wall_s = round(time.perf_counter() - t0, 2)
+        proj.set_refresh_status(
+            state="failed",
+            finished_at=now_iso(),
+            wall_s=wall_s,
+            attempts=attempts,
+            detail="timeout",
+        )
+        proj.last_finished_monotonic = time.monotonic()
         resp = envelope("refresh", proj, ptr0, stale0, why0)
-        resp.update({"ok": False, "error": "refresh_failed", "detail": "timeout"})
-        return finalize(resp, max_chars)
+        resp.update({"ok": False, "error": "refresh_failed", "detail": "timeout", "refresh": proj.get_refresh_status()})
+        return resp
+    except Exception as e:
+        wall_s = round(time.perf_counter() - t0, 2)
+        proj.set_refresh_status(
+            state="failed",
+            finished_at=now_iso(),
+            wall_s=wall_s,
+            attempts=attempts,
+            detail=str(e)[:300],
+        )
+        proj.last_finished_monotonic = time.monotonic()
+        resp = envelope("refresh", proj, ptr0, stale0, why0)
+        resp.update({"ok": False, "error": "refresh_failed", "detail": str(e)[:300], "refresh": proj.get_refresh_status()})
+        return resp
     finally:
         try:
             proj.lock.unlink()
         except OSError:
             pass
+        try:
+            proj._thread_lock.release()
+        except RuntimeError:
+            pass
+
+
+def maybe_trigger_auto_refresh(proj: Project, is_missing: bool, is_stale: bool) -> str | None:
+    if not (is_missing or is_stale):
+        return None
+
+    status = proj.get_refresh_status()
+    if status.get("state") == "running":
+        return "building" if is_missing else "revalidating"
+
+    try:
+        min_s = float(os.environ.get("GFY_AUTO_REFRESH_MIN_S", "600"))
+    except ValueError:
+        min_s = 600.0
+
+    if min_s < 0:
+        return None
+
+    now = time.monotonic()
+    last_fin = proj.last_finished_monotonic
+    if last_fin is not None and (now - last_fin) < min_s:
+        return None
+
+    if not proj._thread_lock.acquire(blocking=False):
+        return "building" if is_missing else "revalidating"
+
+    proj.set_refresh_status(
+        state="running",
+        started_at=now_iso(),
+        finished_at=None,
+        wall_s=None,
+        attempts=0,
+        detail=None,
+    )
+
+    def bg_worker():
+        try:
+            perform_refresh(proj, req={"no_literals": False}, lock_already_held=True)
+        except Exception as e:
+            proj.set_refresh_status(
+                state="failed",
+                finished_at=now_iso(),
+                detail=str(e)[:300],
+            )
+            proj.last_finished_monotonic = time.monotonic()
+
+    t = threading.Thread(target=bg_worker, daemon=True, name=f"gfy-refresh-{proj.id}")
+    t.start()
+
+    return "building" if is_missing else "revalidating"
+
+
+def op_refresh(proj: Project, req: dict) -> str:
+    max_chars = int(req.get("max_chars") or DEFAULT_MAX_CHARS)
+    status = proj.get_refresh_status()
+    if status.get("state") == "running":
+        ptr0 = proj.pointer()
+        stale0, why0 = (proj.staleness(ptr0) if ptr0 else (True, "no_snapshot"))
+        resp = envelope("refresh", proj, ptr0, stale0, why0)
+        resp.update({"ok": True, "refresh": status})
+        return finalize(resp, max_chars)
+
+    if not proj._thread_lock.acquire(blocking=False):
+        status = proj.get_refresh_status()
+        ptr0 = proj.pointer()
+        stale0, why0 = (proj.staleness(ptr0) if ptr0 else (True, "no_snapshot"))
+        resp = envelope("refresh", proj, ptr0, stale0, why0)
+        resp.update({"ok": True, "refresh": status})
+        return finalize(resp, max_chars)
+
+    resp = perform_refresh(proj, req, lock_already_held=True)
+    return finalize(resp, max_chars)
 
 
 # ---------------------------------------------------------------- dispatch
-def err(op, proj, code, req=None) -> str:
+def err(op, proj, code, req=None, extra=None) -> str:
     r = {"ok": False, "op": op, "project": proj.id if proj else None, "snapshot": None, "built_at": None,
          "stale": None, "stale_reason": None, "chars": 0, "hits": 0, "error": code}
+    if extra:
+        r.update(extra)
     return finalize(r, int((req or {}).get("max_chars") or DEFAULT_MAX_CHARS))
 
 
@@ -1493,6 +2101,9 @@ def resolve_project(projects: dict[str, Project], ref):
         return None
     if ref in projects:
         return projects[ref]
+    for p in projects.values():
+        if p.aliases and ref in p.aliases:
+            return p
     try:
         rp = os.path.realpath(str(ref))
     except Exception:
@@ -1504,16 +2115,34 @@ def resolve_project(projects: dict[str, Project], ref):
 
 
 def handle(projects, req: dict) -> str:
+    _KNOWN_PROJECTS.update(projects)
     op = req.get("op")
     if op == "health":
         info = {}
+        reg = {}
         for pid, p in projects.items():
             ptr = p.pointer()
             info[pid] = ptr["sha"][:12] if ptr else None
+            entry = {}
+            if p.group is not None:
+                entry["group"] = p.group
+            if p.aliases is not None:
+                entry["aliases"] = p.aliases
+            if p.related is not None:
+                entry["related"] = p.related
+            if p.label is not None:
+                entry["label"] = p.label
+            if p.get_refresh_status().get("state") == "running":
+                entry["building"] = True
+            reg[pid] = entry
         r = {"ok": True, "op": "health", "project": None, "snapshot": None, "built_at": None, "stale": None,
              "stale_reason": None, "chars": 0, "hits": 0, "graphify": VERSION, "net_guard": net_guard_selfcheck(),
-             "projects": info, "roots": {k: p.root for k, p in projects.items()}}
-        return finalize(r, int(req.get("max_chars") or DEFAULT_MAX_CHARS))
+             "projects": info, "registry": reg}
+        def t_reg():
+            if "registry" in r:
+                r.pop("registry")
+                return "registry"
+        return finalize(r, int(req.get("max_chars") or DEFAULT_MAX_CHARS), (t_reg,), projects=projects)
     proj = resolve_project(projects, req.get("project"))
     if proj is None:
         return err(op, None, "project_not_allowed", req)

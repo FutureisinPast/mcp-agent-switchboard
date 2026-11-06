@@ -454,8 +454,8 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
             self.assertIn("search", properties["task_kind"]["enum"])
             self.assertEqual(properties["research_questions"]["maxItems"], 3)
         rules = " ".join(broker.COST_AWARE_ROUTING_RULES)
-        self.assertIn("native child-agent mechanism", rules)
-        self.assertIn("compact native result to consult_decision", rules)
+        self.assertIn("spawns its native Astra subagent", rules)
+        self.assertIn("result to consult_decision as native_consultation", rules)
         self.assertIn("must never replace this with a nested same-vendor CLI call", rules)
         self.assertIn("never substitute Flash for flagship judgment", rules)
         self.assertIn("Every factual investigation sent to Flash MUST use task_kind=research", rules)
@@ -474,6 +474,19 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
 
     def setUp(self):
         broker._FLAGSHIP_AVAILABILITY_LATCHES.clear()
+        # The evaluator pipeline and opt-in Fable are covered by
+        # tests/test_decision_evaluator.py; these legacy tests pin the original
+        # Fable-by-default, evaluator-off behaviour and must never reach a real CLI.
+        env_patcher = mock.patch.dict(
+            broker.os.environ,
+            {
+                "AGENT_BROKER_CHILD": "",
+                "AGENT_BROKER_DECISION_EVALUATOR_MODEL": "off",
+                "AGENT_BROKER_FABLE_MODE": "default",
+            },
+        )
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
 
     @staticmethod
     def _args(vendor: str, model: str, complexity: str = "architecture", **extra):
@@ -560,7 +573,7 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         self.assertEqual(astra["consultations"][0]["resolved_model"], "fable")
         self.assertEqual(fable["consultations"][0]["resolved_model"], "gpt-6-astra")
 
-    def test_bounded_opus_uses_only_native_fable_and_gemini_uses_both(self):
+    def test_bounded_opus_native_fable_then_astra_final_and_gemini_uses_both(self):
         opus, opus_consult = self._run(
             self._args(
                 "claude",
@@ -570,8 +583,13 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
             )
         )
         _, gemini_consult = self._run(self._args("gemini", "gemini-3.8-flash-high", "bounded"))
-        opus_consult.assert_not_called()
-        self.assertEqual([item["lane"] for item in opus["consultations"]], ["native_same_vendor"])
+        # Decision pipeline: a completed native Fable no longer ends a bounded
+        # decision; Astra gives the final verdict via Switchboard.
+        self.assertEqual([call.args[0] for call in opus_consult.call_args_list], ["codex"])
+        self.assertEqual(
+            [item["lane"] for item in opus["consultations"]],
+            ["native_same_vendor", "switchboard_cross_vendor"],
+        )
         self.assertEqual([call.args[0] for call in gemini_consult.call_args_list], ["codex", "claude"])
 
     def test_gemini_complexity_routes_both_flagships_at_progressive_effort(self):
@@ -861,6 +879,8 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         self.assertEqual(locator["description"], broker.RESEARCH_LOCATOR_DESCRIPTION)
         self.assertIn("lines 12-18", locator["description"])
         self.assertIn("pages 3-4", locator["description"])
+        self.assertIn("file.py:L12", locator["description"])
+        self.assertIn("L12, L40-L44", locator["description"])
 
     def test_valid_code_web_and_well_supported_not_found_research(self):
         questions = ("Code question", "Web question", "Missing question")
@@ -893,6 +913,122 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
             self._research_outer(package, coverage), package
         )
         self.assertEqual(errors, [])
+
+    def test_research_accepts_lenient_code_locators(self):
+        accepted = [
+            "routing_gate.py:L12-L18",
+            "code_graph_runtime/gfy_adapter.py:1365",
+            "C:/repo/x.py:12",
+            "L33, L42, L48",
+            "L291, L381-L382",
+            "gfy_adapter.py:L12, L40-L44",
+            "L12\u2013L18",
+            "line 7",
+        ]
+        package = self._research_package("Q1")
+        for loc in accepted:
+            with self.subTest(locator=loc):
+                coverage = [{
+                    "question": "Q1",
+                    "status": "answered",
+                    "answer": "Answer",
+                    "confidence": "high",
+                    "evidence": [
+                        {**self._research_evidence("code"), "locator": loc, "primary": True},
+                        {**self._research_evidence("command"), "primary": False},
+                    ],
+                    "competing_explanations_checked": ["Alternative checked."],
+                    "gaps": [],
+                }]
+                _, errors = broker.validate_flash_workhorse_result(
+                    self._research_outer(package, coverage), package
+                )
+                self.assertEqual(errors, [])
+
+    def test_research_accepts_lenient_document_locators(self):
+        accepted = [
+            "lines 8-12",
+            "L3",
+            "page 3",
+            "HANDOFF.md:L10-L20",
+        ]
+        package = self._research_package("Q1")
+        for loc in accepted:
+            with self.subTest(locator=loc):
+                coverage = [{
+                    "question": "Q1",
+                    "status": "answered",
+                    "answer": "Answer",
+                    "confidence": "high",
+                    "evidence": [
+                        {**self._research_evidence("document"), "locator": loc, "primary": True},
+                        {**self._research_evidence("command"), "primary": False},
+                    ],
+                    "competing_explanations_checked": ["Alternative checked."],
+                    "gaps": [],
+                }]
+                _, errors = broker.validate_flash_workhorse_result(
+                    self._research_outer(package, coverage), package
+                )
+                self.assertEqual(errors, [])
+
+    def test_research_rejects_invalid_code_locators(self):
+        rejected = [
+            "somewhere nearby",
+            "path:nearby",
+            "L12, nearby",
+            "",
+            ", ".join(f"L{i}" for i in range(25)),
+        ]
+        package = self._research_package("Q1")
+        for loc in rejected:
+            with self.subTest(locator=loc):
+                coverage = [{
+                    "question": "Q1",
+                    "status": "answered",
+                    "answer": "Answer",
+                    "confidence": "high",
+                    "evidence": [
+                        {**self._research_evidence("code"), "locator": loc, "primary": True},
+                        {**self._research_evidence("command"), "primary": False},
+                    ],
+                    "competing_explanations_checked": ["Alternative checked."],
+                    "gaps": [],
+                }]
+                _, errors = broker.validate_flash_workhorse_result(
+                    self._research_outer(package, coverage), package
+                )
+                joined = " | ".join(errors)
+                self.assertIn("code locator is invalid", joined)
+                self.assertIn(broker.RESEARCH_LOCATOR_DESCRIPTION, joined)
+
+    def test_research_rejects_invalid_document_locators(self):
+        rejected = [
+            "somewhere nearby",
+            "vague",
+            "path:nearby",
+        ]
+        package = self._research_package("Q1")
+        for loc in rejected:
+            with self.subTest(locator=loc):
+                coverage = [{
+                    "question": "Q1",
+                    "status": "answered",
+                    "answer": "Answer",
+                    "confidence": "high",
+                    "evidence": [
+                        {**self._research_evidence("document"), "locator": loc, "primary": True},
+                        {**self._research_evidence("command"), "primary": False},
+                    ],
+                    "competing_explanations_checked": ["Alternative checked."],
+                    "gaps": [],
+                }]
+                _, errors = broker.validate_flash_workhorse_result(
+                    self._research_outer(package, coverage), package
+                )
+                joined = " | ".join(errors)
+                self.assertIn("document locator is invalid", joined)
+                self.assertIn(broker.RESEARCH_LOCATOR_DESCRIPTION, joined)
 
     # NOTE: staging/write-back coverage (agy schema+staging dispatch, plus the
     # three-way write-back apply/conflict/deletion tests that used to live
@@ -1000,7 +1136,7 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
              mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
              mock.patch.object(broker, "consult_antigravity_cli", return_value=normalized), \
              mock.patch.object(broker, "store_consultation"):
-            result = broker.consult("antigravity", args)
+            result = broker.consult("antigravity", {**args, "async": False})
         self.assertEqual(result["status"], "ok")
         self.assertFalse(result["accepted"])
         self.assertEqual(result["brain_verification"]["status"], "pending")
@@ -1027,7 +1163,7 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
              mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
              mock.patch.object(broker, "consult_antigravity_cli", return_value=normalized), \
              mock.patch.object(broker, "store_consultation"):
-            result = broker.consult("antigravity", args)
+            result = broker.consult("antigravity", {**args, "async": False})
         progress = result["progress"]
         self.assertEqual(progress["state"], "completed")
         self.assertEqual(progress["current_phase"], "structured_validation")
@@ -1058,7 +1194,7 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
                  mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
                  mock.patch.object(broker, "consult_antigravity_cli", return_value=response), \
                  mock.patch.object(broker, "store_consultation"):
-                result = broker.consult("antigravity", args)
+                result = broker.consult("antigravity", {**args, "async": False})
             progress = result["progress"]
             self.assertEqual(progress["state"], outcome)
             self.assertFalse(progress["live_updates_available"])
@@ -1099,7 +1235,7 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
                  mock.patch.object(broker, "consult_antigravity_cli", return_value=response), \
                  mock.patch.object(broker, "store_consultation"), \
                  mock.patch.object(broker, "current_codex_role_model", return_value="gpt-live-terra"):
-                result = broker.consult("antigravity", args)
+                result = broker.consult("antigravity", {**args, "async": False})
             self.assertEqual(result["outcome"], expected_outcome)
             handoff = result["native_handoff"]
             self.assertEqual(handoff["semantic_lane"], "workhorse")

@@ -64,6 +64,20 @@ class BackgroundConsoleTests(unittest.TestCase):
         for name in ("agent_broker_mcp.py", "setup.py", "evidence_probe.py"):
             source = (REPO_ROOT / name).read_text(encoding="utf-8")
             tree = ast.parse(source)
+            # ast.get_source_segment re-splits the whole file per call (quadratic on a
+            # 19k-line module); split once and slice.
+            source_lines = source.encode("utf-8").splitlines(True)
+
+            def segment(node):
+                if node.end_lineno is None:
+                    return None
+                if node.lineno == node.end_lineno:
+                    return source_lines[node.lineno - 1][node.col_offset:node.end_col_offset].decode("utf-8")
+                parts = [source_lines[node.lineno - 1][node.col_offset:]]
+                parts.extend(source_lines[node.lineno:node.end_lineno - 1])
+                parts.append(source_lines[node.end_lineno - 1][:node.end_col_offset])
+                return b"".join(parts).decode("utf-8")
+
             missing = []
             weak = []
             flag_assignments = {}
@@ -73,7 +87,7 @@ class BackgroundConsoleTests(unittest.TestCase):
                     value = candidate.value
                     for target in targets:
                         if isinstance(target, ast.Name) and value is not None:
-                            flag_assignments.setdefault(target.id, []).append(ast.get_source_segment(source, value) or "")
+                            flag_assignments.setdefault(target.id, []).append(segment(value) or "")
             for node in ast.walk(tree):
                 func = node.func if isinstance(node, ast.Call) else None
                 if not (
@@ -87,7 +101,7 @@ class BackgroundConsoleTests(unittest.TestCase):
                     missing.append(node.lineno)
                     continue
                 value = next(keyword.value for keyword in node.keywords if keyword.arg == "creationflags")
-                expression = ast.get_source_segment(source, value) or ""
+                expression = segment(value) or ""
                 carries_no_window = "NO_WINDOW" in expression
                 if isinstance(value, ast.Name):
                     carries_no_window = carries_no_window or any(

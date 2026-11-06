@@ -358,5 +358,165 @@ class GateChildGuardTests(unittest.TestCase):
         self.assertFalse(routing_gate._is_child_guarded_tool("mcp__agent_switchboard__request_result"))
 
 
+# Codex execution modes and immediate parallel dispatch (1.0.64).
+class CodexExecutionModeTests(unittest.TestCase):
+    def test_aliases_defaults_and_invalid_modes(self):
+        for mode, expected in (
+            ("plan", "read-only"), ("read-only", "read-only"),
+            ("accept-edits", "workspace-write"), ("acceptEdits", "workspace-write"),
+            ("workspace-write", "workspace-write"), ("danger-full-access", "danger-full-access"),
+        ):
+            with self.subTest(mode=mode):
+                self.assertEqual(broker.normalize_codex_mode(mode, "implementation"), expected)
+        self.assertEqual(broker.normalize_codex_mode(None, "implementation"), "workspace-write")
+        for task in (None, "research", "implementation_plan", "quick_check"):
+            self.assertEqual(broker.normalize_codex_mode(None, task), "read-only")
+        for mode in ("typo", "bypassPermissions", "unrestricted", "danger full access"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "Unsupported Codex mode"):
+                broker.normalize_codex_mode(mode, "implementation")
+
+    def test_leaf_uses_canonical_sandbox_and_rejects_before_discovery(self):
+        stream = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}})
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(broker, "BROKER_DIR", Path(tmp) / "broker"), \
+             mock.patch.object(broker, "load_config", return_value={}), \
+             mock.patch.object(broker, "discover_codex", return_value="codex") as discover, \
+             mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", tmp)), \
+             mock.patch.object(broker, "run_process", return_value=(0, stream, "")) as run:
+            for mode, expected in (("plan", "read-only"), ("acceptEdits", "workspace-write"),
+                                   ("workspace-write", "workspace-write"), (None, "read-only")):
+                broker.consult_codex(tmp, "check", mode)
+                command = run.call_args.args[0]
+                self.assertEqual(command[command.index("--sandbox") + 1], expected)
+            discover.reset_mock()
+            with self.assertRaises(ValueError):
+                broker.consult_codex(tmp, "check", "typo")
+            discover.assert_not_called()
+
+
+class CodexExecutionPipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        for name, value in (
+            ("DB_PATH", self.root / "broker.db"), ("BROKER_DIR", self.root / "broker"),
+            ("resolve_project", mock.Mock(return_value=broker.ProjectInfo("p", str(self.root)))),
+            ("render_request_ledger", mock.Mock()),
+            ("start_codex_request_worker", mock.Mock(return_value={"started": True})),
+        ):
+            patcher = mock.patch.object(broker, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        env = mock.patch.dict(broker.os.environ, {"AGENT_BROKER_CHILD": "0"})
+        env.start()
+        self.addCleanup(env.stop)
+        broker.init_db()
+
+    def test_queue_persists_defaults_and_explicit_modes_without_promoting_read_only(self):
+        for index, (mode, task, expected) in enumerate((
+            (None, "implementation", "workspace-write"),
+            (None, "research", "read-only"),
+            ("plan", "implementation", "read-only"),
+            ("read-only", "implementation", "read-only"),
+            ("accept-edits", "research", "workspace-write"),
+            ("acceptEdits", "implementation", "workspace-write"),
+        )):
+            row = broker.queue_codex_request("p", f"task {index}", mode=mode, task_kind=task, autorun=False)
+            self.assertEqual(row["mode"], expected)
+            with broker.db_connect() as conn:
+                stored = conn.execute("SELECT mode FROM codex_requests WHERE id = ?", (row["id"],)).fetchone()
+            self.assertEqual(stored[0], expected)
+        with self.assertRaisesRegex(ValueError, "Unsupported Codex mode"):
+            broker.queue_codex_request("p", "bad", mode="typo", autorun=True)
+        broker.start_codex_request_worker.assert_not_called()
+
+    def test_worker_forwards_stored_aliases_and_keeps_legacy_null_read_only(self):
+        result = broker.CodexConsultResult("ok", "gpt-6-luna", "gpt-6-luna", "low", "low", True)
+        with mock.patch.object(broker, "consult_codex", return_value=result) as consult, \
+             mock.patch.object(broker, "resolve_cli_model_and_effort", return_value=("gpt-6-luna", "low")), \
+             mock.patch.object(broker, "enforce_codex_effort_policy", return_value=("low", None)), \
+             mock.patch.object(broker, "store_consultation"), \
+             mock.patch.object(broker, "record_agent_event"):
+            for index, (mode, expected) in enumerate(((None, "read-only"), ("acceptEdits", "workspace-write"),
+                                                     ("plan", "read-only"), ("workspace-write", "workspace-write"))):
+                row = broker.queue_codex_request("p", f"worker {index}", task_kind="implementation", autorun=False)
+                with broker.db_connect() as conn:
+                    conn.execute("UPDATE codex_requests SET mode = ? WHERE id = ?", (mode, row["id"]))
+                broker.run_codex_request_worker(row["id"])
+                self.assertEqual(consult.call_args.args[2], expected)
+                with broker.db_connect() as conn:
+                    stored = conn.execute("SELECT mode FROM codex_requests WHERE id = ?", (row["id"],)).fetchone()
+                self.assertEqual(stored[0], expected)
+
+    def test_router_cli_and_inbox_forward_canonical_modes_and_async_boolean(self):
+        resolution = {"status": "resolved", "target_agent": "codex_cli", "target_model": "gpt-6-luna",
+                      "effort": "low", "source": "explicit_request"}
+        with mock.patch.object(broker, "resolve_model_request", return_value=resolution), \
+             mock.patch.object(broker, "apply_codex_model_policy", return_value=("gpt-6-luna", "low", None)), \
+             mock.patch.object(broker, "enforce_native_first_broker_fallback"), \
+             mock.patch.object(broker, "_is_frontier_target", return_value=False), \
+             mock.patch.object(broker, "resolve_ide_host", return_value=None), \
+             mock.patch.object(broker, "load_config", return_value={}), \
+             mock.patch.object(broker, "surface_available", return_value=True), \
+             mock.patch.object(broker, "consult", side_effect=lambda model, args: {"mode": args["mode"]}) as consult:
+            for surface in ("cli", "extension"):
+                for mode, expected in ((None, "workspace-write"), ("accept-edits", "workspace-write"),
+                                       ("plan", "read-only"), ("read-only", "read-only")):
+                    args = {"target_agent": "codex", "target_model": "gpt-6-luna", "surface": surface,
+                            "task_kind": "implementation", "project": "p", "prompt": f"{surface} {mode}",
+                            "mode": mode, "async": False}
+                    routed = broker._route_agent_task_impl(args)
+                    self.assertEqual(routed["mode"], expected)
+                    if surface == "cli":
+                        self.assertIs(consult.call_args.args[1]["async"], False)
+            args.update(surface="cli", mode="workspace-write", **{"async": True})
+            broker._route_agent_task_impl(args)
+            self.assertIs(consult.call_args.args[1]["async"], True)
+            consult.reset_mock()
+            with self.assertRaises(ValueError):
+                broker._route_agent_task_impl(dict(args, mode="typo"))
+            consult.assert_not_called()
+
+    def test_consult_resolves_mode_before_default_and_forwards_explicit_async(self):
+        with mock.patch.object(broker, "enforce_native_first_broker_fallback"), \
+             mock.patch.object(broker, "apply_codex_model_policy", return_value=("gpt-6-luna", "low", None)), \
+             mock.patch.object(broker, "resolve_cli_model_and_effort", return_value=("gpt-6-luna", "low")), \
+             mock.patch.object(broker, "enforce_codex_effort_policy", return_value=("low", None)), \
+             mock.patch.object(broker, "_enforce_frontier_prompt_cap", return_value=("standard", None)), \
+             mock.patch.object(broker, "_run_codex_consult", return_value={"pending": True, "payload": {}}) as run:
+            for mode, expected in ((None, "workspace-write"), ("plan", "read-only"), ("acceptEdits", "workspace-write")):
+                broker.consult("codex", {"prompt": "check", "task_kind": "implementation", "mode": mode, "async": True})
+                self.assertEqual(run.call_args.args[2], expected)
+                self.assertIs(run.call_args.kwargs["async_requested"], True)
+
+    def test_explicit_async_returns_distinct_requests_without_waiting_and_keeps_sync_default(self):
+        with mock.patch.object(broker, "_await_codex_row", return_value=None) as wait, \
+             mock.patch.object(broker, "_refresh_stale_codex_request", side_effect=lambda table, row: row):
+            results = []
+            for prompt in ("parallel one", "parallel two"):
+                result = broker._run_codex_consult(
+                    broker.ProjectInfo("p", str(self.root)), prompt, "workspace-write", "gpt-6-luna", "low",
+                    30, None, "implementation", 1000, async_requested=True)
+                self.assertTrue(result["pending"])
+                self.assertEqual(result["payload"]["routing"], "explicit_async")
+                self.assertIs(result["payload"]["async"], True)
+                self.assertEqual(result["payload"]["retry_after_seconds"], 20)
+                self.assertIsNone(result["payload"]["typical_wait"])
+                results.append(result["request_id"])
+            self.assertNotEqual(*results)
+            wait.assert_not_called()
+            broker._run_codex_consult(broker.ProjectInfo("p", str(self.root)), "sync", "read-only",
+                                      "gpt-6-luna", "low", 30, None, "research", 1000)
+            wait.assert_called_once()
+            with broker.db_connect() as conn:
+                conn.execute("UPDATE codex_requests SET status='completed', response='done' WHERE id=?", (results[0],))
+            terminal = broker._run_codex_consult(
+                broker.ProjectInfo("p", str(self.root)), "parallel one", "workspace-write", "gpt-6-luna", "low",
+                30, None, "implementation", 1000, async_requested=True)
+            self.assertFalse(terminal["pending"])
+            self.assertEqual(terminal["response"], "done")
+
+
 if __name__ == "__main__":
     unittest.main()

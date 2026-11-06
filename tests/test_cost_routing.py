@@ -396,8 +396,8 @@ class RoutingContractStringsTests(unittest.TestCase):
         self.assertIn("newer gemini flash remains a non-authoritative labour workhorse", text)
         self.assertIn("never becomes an astra/fable decision consultant", text)
         self.assertIn("consult_decision", text)
-        self.assertIn("codex uses native astra and claude uses native fable", text)
-        self.assertIn("architecture/critical work adds only the opposite-vendor adviser", text)
+        self.assertIn("a codex host below astra spawns its native astra subagent", text)  # owner flow 2026-10-16
+        self.assertIn("astra gives the final verdict", text)  # evaluator then Astra at every complexity
         self.assertIn("must never replace this with a nested same-vendor cli call", text)
         self.assertIn("never substitute flash for flagship judgment", text)
 
@@ -563,6 +563,11 @@ class AsyncDecisionReconciliationTests(unittest.TestCase):
         # keeps this hermetic test from turning that platform quirk into a false
         # product failure.
         self.tmpdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        # These tests exercise async reconciliation of two flagship targets, which needs
+        # Fable in the pipeline; since 2026-10-16 Fable is opt-in (Max-plan mode).
+        _fable_env = mock.patch.dict(os.environ, {"AGENT_BROKER_FABLE_MODE": "default"})
+        _fable_env.start()
+        self.addCleanup(_fable_env.stop)
         root = Path(self.tmpdir.name)
         self.paths = {
             "DB_PATH": root / "broker.db",

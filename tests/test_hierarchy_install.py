@@ -293,11 +293,12 @@ class HierarchyInstallTests(unittest.TestCase):
         self.assertIn("capability tier outranks model version", hierarchy_lower)
         self.assertIn("newer gemini flash remains a non-authoritative labour workhorse", hierarchy_lower)
         self.assertIn("never becomes an astra/fable decision consultant", hierarchy_lower)
-        self.assertIn("same-vendor flagship consultation through its native child-agent mechanism", hierarchy_lower)
+        self.assertIn("spawns its native astra subagent", hierarchy_lower)
+        self.assertIn("gemini 4 argon high as a short evaluator", hierarchy_lower)
         self.assertIn("pass its compact structured outcome to `consult_decision`", hierarchy_lower)
         self.assertIn("must never replace this step with a nested same-vendor cli call", hierarchy_lower)
-        self.assertIn("returns `needs_native_consultation` without contacting a provider", hierarchy_lower)
-        self.assertIn("architecture/critical work adds only the opposite-vendor consultant", hierarchy_lower)
+        self.assertIn("receives `needs_native_consultation`", hierarchy_lower)  # evaluator now runs first
+        self.assertIn("astra gives the final verdict", hierarchy_lower)  # owner flow: evaluator then Astra at every level
         self.assertIn("never substitute flash for flagship judgment", hierarchy_lower)
         self.assertIn("external antigravity flash lane", hierarchy_lower)
         self.assertIn("not a native child agent", hierarchy_lower)
@@ -613,8 +614,12 @@ class HierarchyInstallTests(unittest.TestCase):
             "never substitute Flash for flagship judgment",
             "include every returned `handoff_notices` item in the final response",
             "Do not retry a latched provider in the same main session",
+            "latches until a recheck window passes (`AGENT_BROKER_UNAVAILABLE_RECHECK_MINUTES`, default 60 minutes), then the model is tried again",
+            "until its latch expires; the hook announces when the window has passed and the normal hierarchy applies again",
+            "If the user explicitly asks for a latched model, attempt it once (`retry_unavailable=true`) and report the real result - never say a model is unavailable without a fresh attempt in that turn",
         ):
             self.assertIn(phrase, body, phrase)
+        self.assertNotIn("latches for the whole session.", body)
 
     def test_body_forces_depth_contract_on_every_flash_research_request(self):
         body = hierarchy_install.routing_rules_body(CODEX_ROLES, CLAUDE_ROLES)

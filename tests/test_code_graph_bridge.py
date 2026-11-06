@@ -315,6 +315,7 @@ def test_tool_registration_and_dispatcher(monkeypatch: pytest.MonkeyPatch):
     assert schema.get("required") == ["op"]
     assert set(props["op"]["enum"]) == {
         "locate", "expand", "path", "stats", "refresh", "health", "find_text", "context_for",
+        "resolve",
     }
     assert props["limit"]["type"] == "integer"
     assert props["limit"]["minimum"] == 1 and props["limit"]["maximum"] == 20

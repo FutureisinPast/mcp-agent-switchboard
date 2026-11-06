@@ -10,6 +10,7 @@ import types
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -724,10 +725,10 @@ class RoutingGateTests(unittest.TestCase):
                     self.claude_post_payload(wrapper, session_id=session_id)
                 )
                 self.assertEqual(
-                    routing_gate._read_state(session_id).get("claude_unavailable"),
+                    routing_gate._read_state(session_id).get("claude_unavailable")["kind"],
                     "quota",
                 )
-                self.assertIn("Do not retry Claude", json.dumps(result))
+                self.assertIn("automatic routing skips it until", json.dumps(result))
 
     def test_claude_unavailable_recognizes_only_terminal_availability_classes(self):
         cases = {
@@ -748,7 +749,7 @@ class RoutingGateTests(unittest.TestCase):
                     )
                 )
                 self.assertEqual(
-                    routing_gate._read_state(session_id).get("claude_unavailable"),
+                    routing_gate._read_state(session_id).get("claude_unavailable")["kind"],
                     expected,
                 )
 
@@ -814,12 +815,12 @@ class RoutingGateTests(unittest.TestCase):
         )
         self.assertNotIn(secret, json.dumps(marked))
         state_before_reset = routing_gate._read_state("session-1")
-        self.assertEqual(state_before_reset.get("claude_unavailable"), "quota")
+        self.assertEqual(state_before_reset.get("claude_unavailable")["kind"], "quota")
         self.assertEqual(set(state_before_reset), {"claude_unavailable", "updated_at"})
 
         prompt_result = routing_gate.user_prompt_submit({"session_id": "session-1"})
         state = routing_gate._read_state("session-1")
-        self.assertEqual(state.get("claude_unavailable"), "quota")
+        self.assertEqual(state.get("claude_unavailable")["kind"], "quota")
         self.assertNotIn("mutated", state)
         self.assertIn(
             "degraded, non-authoritative fallback",
@@ -831,6 +832,7 @@ class RoutingGateTests(unittest.TestCase):
         same_session = self.pre_payload(
             "retry-claude", tool_name="mcp__agent_switchboard__consult_claude"
         )
+        same_session["tool_input"] = {"target_model": "fable"}
         denied = routing_gate.pre_tool_use(same_session)
         self.assertEqual(
             denied["hookSpecificOutput"]["permissionDecision"], "deny"
@@ -910,10 +912,10 @@ class RoutingGateTests(unittest.TestCase):
         output = result["hookSpecificOutput"]
         self.assertIn("updatedToolOutput", output)
         self.assertIn("quarantined", output["updatedToolOutput"])
-        self.assertIn("Do not retry Claude", output["additionalContext"])
+        self.assertIn("automatic routing skips it until", output["additionalContext"])
         self.assertNotIn(secret, json.dumps(result))
         self.assertEqual(
-            routing_gate._read_state("session-1").get("claude_unavailable"), "quota"
+            routing_gate._read_state("session-1").get("claude_unavailable")["kind"], "quota"
         )
         self.assertNotIn(secret, json.dumps(routing_gate._read_state("session-1")))
         log_text = routing_gate._session_log_path("session-1").read_text(encoding="utf-8")
@@ -925,7 +927,7 @@ class RoutingGateTests(unittest.TestCase):
             codex_result = routing_gate.post_tool_use(codex_payload)
         self.assertEqual(codex_result.get("decision"), "block")
         self.assertIn("quarantined", codex_result.get("reason", ""))
-        self.assertIn("Do not retry Claude", codex_result.get("reason", ""))
+        self.assertIn("automatic routing skips it until", codex_result.get("reason", ""))
         self.assertNotIn(secret, json.dumps(codex_result))
 
     def test_oversized_mcp_is_counted_once_by_pretool_before_posttool(self):
@@ -1753,6 +1755,218 @@ class RoutingGateTests(unittest.TestCase):
         self.assertIn("event:1083", table)
         self.assertIn("terminal=event:1085", table)
         self.assertIn("HTTP 403", table)
+
+    # -- WP-AVL-I1: Claude availability reset and session circuit breaker semantics --
+
+    def test_marker_dict_stored_with_until_from_clock_reset(self):
+        fixed_now = datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+        with mock.patch("time.time", return_value=fixed_now):
+            payload = self.claude_post_payload(
+                {"status": "error", "error": "Quota limit reached; resets at 15:30 UTC"},
+                session_id="session-until",
+                tool_input={"target_model": "fable"},
+            )
+            routing_gate.post_tool_use(payload)
+        marker = routing_gate._read_state("session-until").get("claude_unavailable")
+        self.assertIsInstance(marker, dict)
+        self.assertEqual(marker.get("kind"), "quota")
+        self.assertEqual(marker.get("model"), "fable")
+        self.assertEqual(marker.get("since"), fixed_now)
+        expected_until = datetime(2026, 10, 7, 15, 30, 0, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(marker.get("until"), expected_until)
+
+    def test_deny_while_active_for_matching_model(self):
+        fixed_now = 1000.0
+        with mock.patch("time.time", return_value=fixed_now):
+            routing_gate._write_state("session-match", {
+                "claude_unavailable": {
+                    "kind": "quota",
+                    "model": "opus",
+                    "since": fixed_now,
+                    "until": fixed_now + 1800.0,
+                }
+            })
+            # Exact match
+            req1 = self.pre_payload("call-exact", tool_name="mcp__agent_switchboard__consult_claude")
+            req1["session_id"] = "session-match"
+            req1["tool_input"] = {"target_model": "opus"}
+            denied1 = routing_gate.pre_tool_use(req1)
+            self.assertEqual(denied1.get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+            # Substring/normalized match (e.g. 'claude-opus-5-5')
+            req2 = self.pre_payload("call-sub", tool_name="mcp__agent_switchboard__route_agent_task")
+            req2["session_id"] = "session-match"
+            req2["tool_input"] = {"target_agent": "claude", "target_model": "claude-opus-5-5"}
+            denied2 = routing_gate.pre_tool_use(req2)
+            self.assertEqual(denied2.get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+            self.assertIn("automatic routing skips it until", denied2["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_allow_for_non_matching_model(self):
+        fixed_now = 1000.0
+        with mock.patch("time.time", return_value=fixed_now):
+            routing_gate._write_state("session-nonmatch", {
+                "claude_unavailable": {
+                    "kind": "quota",
+                    "model": "opus",
+                    "since": fixed_now,
+                    "until": fixed_now + 1800.0,
+                }
+            })
+            # Call for fable should be allowed
+            req = self.pre_payload("call-diff", tool_name="mcp__agent_switchboard__consult_claude")
+            req["session_id"] = "session-nonmatch"
+            req["tool_input"] = {"target_model": "fable"}
+            self.assertEqual(routing_gate.pre_tool_use(req), {})
+
+    def test_allow_after_until_monkeypatch_time(self):
+        start_now = 1000.0
+        routing_gate._write_state("session-expiry", {
+            "claude_unavailable": {
+                "kind": "quota",
+                "model": "fable",
+                "since": start_now,
+                "until": start_now + 500.0,
+            }
+        })
+        req = self.pre_payload("call-exp", tool_name="mcp__agent_switchboard__consult_claude")
+        req["session_id"] = "session-expiry"
+        req["tool_input"] = {"target_model": "fable"}
+
+        # While active (< until): denied
+        with mock.patch("time.time", return_value=start_now + 100.0):
+            self.assertEqual(
+                routing_gate.pre_tool_use(req).get("hookSpecificOutput", {}).get("permissionDecision"),
+                "deny",
+            )
+
+        # After until: allowed
+        with mock.patch("time.time", return_value=start_now + 600.0):
+            self.assertEqual(routing_gate.pre_tool_use(req), {})
+
+    def test_expired_marker_removed_on_user_prompt_submit_with_one_time_notice(self):
+        start_now = 1000.0
+        until_time = start_now + 500.0
+        routing_gate._write_state("session-notice", {
+            "claude_unavailable": {
+                "kind": "quota",
+                "model": "fable",
+                "since": start_now,
+                "until": until_time,
+            }
+        })
+        # Past until: marker is removed and one-time notice injected
+        with mock.patch("time.time", return_value=until_time + 100.0):
+            res1 = routing_gate.user_prompt_submit({"session_id": "session-notice", "prompt": "Hello"})
+            ctx1 = res1.get("hookSpecificOutput", {}).get("additionalContext", "")
+            self.assertIn("Claude availability window has passed", ctx1)
+            self.assertIn("the normal hierarchy applies again", ctx1)
+            self.assertNotIn("claude_unavailable", routing_gate._read_state("session-notice"))
+
+            # Next UserPromptSubmit does not repeat the notice
+            res2 = routing_gate.user_prompt_submit({"session_id": "session-notice", "prompt": "Next turn"})
+            ctx2 = res2.get("hookSpecificOutput", {}).get("additionalContext", "")
+            self.assertNotIn("Claude availability window has passed", ctx2)
+
+    def test_explicit_user_request_clears_active_marker_and_injects_try_now(self):
+        fixed_now = 1000.0
+        with mock.patch("time.time", return_value=fixed_now):
+            routing_gate._write_state("session-override", {
+                "claude_unavailable": {
+                    "kind": "quota",
+                    "model": "opus",
+                    "since": fixed_now,
+                    "until": fixed_now + 3600.0,
+                }
+            })
+            # "update CLAUDE.md" does not clear the active marker
+            res_md = routing_gate.user_prompt_submit({
+                "session_id": "session-override",
+                "prompt": "update CLAUDE.md",
+            })
+            ctx_md = res_md.get("hookSpecificOutput", {}).get("additionalContext", "")
+            self.assertNotIn("The user explicitly asked for Claude", ctx_md)
+            self.assertIn("claude_unavailable", routing_gate._read_state("session-override"))
+
+            # "please use opus 5.5 for this" DOES clear the active marker and injects try-now text
+            res_clear = routing_gate.user_prompt_submit({
+                "session_id": "session-override",
+                "prompt": "please use opus 5.5 for this",
+            })
+            ctx_clear = res_clear.get("hookSpecificOutput", {}).get("additionalContext", "")
+            self.assertIn("The user explicitly asked for Claude: attempt it now", ctx_clear)
+            self.assertIn("is not proof it is unavailable now", ctx_clear)
+            self.assertNotIn("claude_unavailable", routing_gate._read_state("session-override"))
+
+    def test_legacy_string_marker_is_inactive_and_cleared_with_notice(self):
+        routing_gate._write_state("session-legacy", {
+            "claude_unavailable": "quota",
+        })
+        self.assertIsNone(routing_gate.active_claude_unavailable_marker("session-legacy"))
+        self.assertIsNone(routing_gate._claude_unavailable_reason("session-legacy"))
+
+        # PreToolUse is NOT denied by legacy string marker
+        req = self.pre_payload("call-legacy", tool_name="mcp__agent_switchboard__consult_claude")
+        req["session_id"] = "session-legacy"
+        req["tool_input"] = {"target_model": "fable"}
+        self.assertEqual(routing_gate.pre_tool_use(req), {})
+
+        # UserPromptSubmit clears legacy marker and injects notice
+        res = routing_gate.user_prompt_submit({"session_id": "session-legacy", "prompt": "Check status"})
+        ctx = res.get("hookSpecificOutput", {}).get("additionalContext", "")
+        self.assertIn("Claude availability window has passed (earlier)", ctx)
+        self.assertNotIn("claude_unavailable", routing_gate._read_state("session-legacy"))
+
+    def test_five_hour_and_rate_limit_texts_classify_as_quota(self):
+        quota_phrases = (
+            "five-hour limit reached",
+            "five_hour usage limit exceeded",
+            "5-hour limit was reached",
+            "5 hour limit reached",
+            "weekly limit reached",
+            "seven_day usage limit exceeded",
+            "7-day limit hit",
+            "rate limit exceeded",
+            "rate_limit reached",
+            "rate limit was hit",
+            "rate limit rejected",
+            "your limit was rejected",
+        )
+        for index, phrase in enumerate(quota_phrases):
+            with self.subTest(phrase=phrase):
+                payload = self.claude_post_payload(
+                    {"status": "error", "error": f"Error: {phrase}"},
+                    session_id=f"session-q-{index}",
+                )
+                self.assertEqual(routing_gate._claude_failure_reason(payload), "quota")
+
+    def test_no_provider_text_appears_in_state_logs_or_context(self):
+        secret = "SUPER_SECRET_INTERNAL_PROVIDER_DATA_12345"
+        failure_msg = f"five-hour limit reached: {secret}"
+        payload = self.claude_post_payload(
+            {"status": "error", "error": failure_msg},
+            session_id="session-secret",
+            tool_input={"target_model": "fable"},
+        )
+        post_result = routing_gate.post_tool_use(payload)
+        self.assertNotIn(secret, json.dumps(post_result))
+
+        # Check state
+        state = routing_gate._read_state("session-secret")
+        self.assertNotIn(secret, json.dumps(state))
+
+        # Check log
+        log_text = routing_gate._session_log_path("session-secret").read_text(encoding="utf-8")
+        self.assertNotIn(secret, log_text)
+
+        # Check PreToolUse deny text
+        retry = self.pre_payload("retry-secret", tool_name="mcp__agent_switchboard__consult_claude")
+        retry["session_id"] = "session-secret"
+        retry["tool_input"] = {"target_model": "fable"}
+        pre_result = routing_gate.pre_tool_use(retry)
+        self.assertNotIn(secret, json.dumps(pre_result))
+
+        # Check UserPromptSubmit text
+        prompt_result = routing_gate.user_prompt_submit({"session_id": "session-secret", "prompt": "what now?"})
+        self.assertNotIn(secret, json.dumps(prompt_result))
 
 
 if __name__ == "__main__":

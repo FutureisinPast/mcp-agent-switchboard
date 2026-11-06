@@ -68,8 +68,10 @@ if ($running -and -not $NoReuseWindow) {
 
 $command = Resolve-AntigravityCommand
 $args = @("--remote-debugging-address=127.0.0.1", "--remote-debugging-port=$Port")
-if (-not $NoReuseWindow) {
-  $args += "--reuse-window"
+$args += @("--enable-proposed-api", "openai.chatgpt")
+$args += "--new-window"
+if ($RemainingArgs.Count -eq 0) {
+  $args += (Get-Location).Path
 }
 $args += $RemainingArgs
 

@@ -1189,6 +1189,9 @@ def latest_vsix() -> Path | None:
 
 
 BRIDGE_EXTENSION_ID = "futureisinpast.antigravity-agent-broker-bridge"
+# Earlier builds published the bridge under the "local" publisher; the host
+# treats that as a separate extension, so both loaded and the old one failed on duplicate command ids.
+LEGACY_BRIDGE_EXTENSION_IDS = ("local.antigravity-agent-broker-bridge",)
 
 
 def _host_cli(host_cli: str) -> str | None:
@@ -1222,6 +1225,36 @@ def durable_vsix() -> Path | None:
         return vsix
 
 
+def _uninstall_extension(cli: str, ext_id: str) -> str:
+    proc = subprocess.run(
+        [cli, "--uninstall-extension", ext_id],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        creationflags=WINDOWS_NO_WINDOW,
+    )
+    if "not installed" in (proc.stdout + proc.stderr).lower():
+        return "not installed"
+    return f"uninstalled {ext_id}"
+
+
+def remove_legacy_bridges(cli: str, dry: bool) -> list[str]:
+    """Uninstall earlier publisher variants of the bridge extension."""
+    out: list[str] = []
+    for ext_id in LEGACY_BRIDGE_EXTENSION_IDS:
+        if dry:
+            out.append(f"would run {cli} --uninstall-extension {ext_id}")
+        else:
+            try:
+                res = _uninstall_extension(cli, ext_id)
+                if res != "not installed":
+                    out.append(f"removed legacy {ext_id}")
+            except Exception as exc:  # noqa: BLE001
+                out.append(f"legacy {ext_id}: ERROR: {exc}")
+    return out
+
+
 def install_bridge(host_cli: str, dry: bool) -> str:
     cli = _host_cli(host_cli)
     vsix = durable_vsix()
@@ -1230,12 +1263,13 @@ def install_bridge(host_cli: str, dry: bool) -> str:
     if not vsix:
         return "skipped (no .vsix found)"
     if dry:
-        return f"would run {cli} --install-extension {vsix.name}"
+        return "; ".join([*remove_legacy_bridges(cli, True), f"would run {cli} --install-extension {vsix.name}"])
+    legacy = remove_legacy_bridges(cli, False)
     try:
         subprocess.run([cli, "--install-extension", str(vsix), "--force"],
                        capture_output=True, text=True, timeout=120, check=False,
                        creationflags=WINDOWS_NO_WINDOW)
-        return f"installed {vsix.name}"
+        return "; ".join([*legacy, f"installed {vsix.name}"])
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: {exc}"
 
@@ -1245,17 +1279,12 @@ def uninstall_bridge(host_cli: str, dry: bool) -> str:
     if not cli:
         return f"skipped ({host_cli} CLI not found)"
     if dry:
-        return f"would run {cli} --uninstall-extension {BRIDGE_EXTENSION_ID}"
+        return "; ".join([f"would run {cli} --uninstall-extension {BRIDGE_EXTENSION_ID}", *remove_legacy_bridges(cli, True)])
     try:
-        proc = subprocess.run([cli, "--uninstall-extension", BRIDGE_EXTENSION_ID],
-                              capture_output=True, text=True, timeout=120, check=False,
-                              creationflags=WINDOWS_NO_WINDOW)
-        out = (proc.stdout + proc.stderr).lower()
-        if "not installed" in out or "is not installed" in out:
-            return "not installed"
-        return f"uninstalled {BRIDGE_EXTENSION_ID}"
+        result = _uninstall_extension(cli, BRIDGE_EXTENSION_ID)
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: {exc}"
+    return "; ".join([result, *remove_legacy_bridges(cli, False)])
 
 
 # --- installer-managed hierarchy ------------------------------------------

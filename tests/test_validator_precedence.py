@@ -234,6 +234,7 @@ class AntigravityDispatchDispositionTests(unittest.TestCase):
                     "target_model": "gemini-3.7-flash-high",
                     "effort": "high",
                     "work_package_id": package["package_id"],
+                    "async": False,
                     "allowed_files": package["allowed_files"],
                     "acceptance_criteria": package["acceptance_criteria"],
                 },

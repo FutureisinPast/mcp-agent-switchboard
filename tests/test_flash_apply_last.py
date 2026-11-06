@@ -956,7 +956,7 @@ class StaleJournalTests(FlashAsyncBase):
              mock.patch.object(broker, "resolve_cli_model_and_effort", return_value=("gemini-3.7-flash-high", "high")), \
              mock.patch.object(broker, "antigravity_model_for_effort", side_effect=lambda m, e: m), \
              mock.patch.object(broker, "load_config", return_value={"compact_task_contract": False}):
-            return broker.consult("antigravity", self.impl_args(max_response_chars=100000))
+            return broker.consult("antigravity", self.impl_args(max_response_chars=100000, **{"async": False}))
 
     def test_direct_consult_path_reports_clean_rejection(self):
         result = self._consult()
@@ -976,8 +976,8 @@ class StaleJournalTests(FlashAsyncBase):
              mock.patch.object(broker, "resolve_cli_model_and_effort", return_value=("gemini-3.7-flash-high", "high")), \
              mock.patch.object(broker, "antigravity_model_for_effort", side_effect=lambda m, e: m), \
              mock.patch.object(broker, "load_config", return_value={"compact_task_contract": False}):
-            broker.consult("antigravity", self.impl_args(max_response_chars=100000))
-            broker.consult("antigravity", self.impl_args(max_response_chars=100000))
+            broker.consult("antigravity", self.impl_args(max_response_chars=100000, **{"async": False}))
+            broker.consult("antigravity", self.impl_args(max_response_chars=100000, **{"async": False}))
         self.assertEqual(len(set(tokens)), 2)
         self.assertTrue(all(tokens))
 

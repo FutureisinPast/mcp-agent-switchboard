@@ -221,6 +221,7 @@ def test_exactly_one_usage_event_written_without_private_fields(
     monkeypatch.setattr(agent_broker_mcp, "DB_PATH", db_file)
     monkeypatch.setattr(routing_gate, "DB_PATH", db_file)
     monkeypatch.setattr(agent_broker_mcp, "_MCP_CLIENT_NAME", "codex-test-client")
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
     monkeypatch.setenv("CODEX_SESSION_ID", "test-session-xyz")
 
     agent_broker_mcp.init_db()

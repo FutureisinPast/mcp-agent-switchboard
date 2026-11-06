@@ -6,13 +6,18 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 
 os.environ["GFY_STALE_TTL_S"] = "0"  # default tests expect immediate staleness; TTL tests override via monkeypatch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from gfy_client import Adapter, PY  # noqa: E402
+import gfy_client  # noqa: E402
+if not os.path.exists(gfy_client.PY):
+    gfy_client.PY = sys.executable
+from gfy_client import Adapter
+PY = gfy_client.PY
 
 FIX = {
     "billing.py": "import math\n\n\ndef compute_invoice_total(items):\n    return sum(i * 2 for i in items)\n\n\nclass InvoiceLedger:\n    def add_entry(self, e):\n        return compute_invoice_total([e])\n",
@@ -511,6 +516,7 @@ def _inproc_project(cfg):
 
 
 def test_source_change_during_build_is_rejected_keeps_last_good(tmp_path, monkeypatch):
+    monkeypatch.setenv("GFY_RETRY_PAUSE_S", "0")
     root, out, cfg = make_lit_project(tmp_path, "mid")
     ga, proj = _inproc_project(cfg)
     r1 = json.loads(ga.op_refresh(proj, {}))
@@ -518,10 +524,12 @@ def test_source_change_during_build_is_rejected_keeps_last_good(tmp_path, monkey
     good = (out / "published" / "current.json").read_text()
     real_run = ga.subprocess.run
 
+    mutation = [0]
     def run_and_mutate(cmd, *a, **kw):
         res = real_run(cmd, *a, **kw)
         if isinstance(cmd, list) and "graphify" in cmd:
-            (root / "svc.py").write_text(LIT_FILES["svc.py"] + "\n\ndef sneaky():\n    return 'edited during the build'\n",
+            mutation[0] += 1
+            (root / "svc.py").write_text(LIT_FILES["svc.py"] + f"\n\ndef sneaky_{mutation[0]}():\n    return 'edited during the build'\n",
                                          encoding="utf-8")
         return res
     monkeypatch.setattr(ga.subprocess, "run", run_and_mutate)
@@ -666,3 +674,423 @@ def test_every_response_within_budget_and_has_hits(lit):
         assert isinstance(r["hits"], int) and r["chars"] == len(raw), (c, r)
     h = a.call(op="health")[0]
     assert h["hits"] == 0
+
+
+# ---------------------------------------------------------------- WP-CGX-I1 tests (T1-T6)
+def test_t1_exclude_patterns(tmp_path):
+    root = tmp_path / "t1_repo"
+    root.mkdir()
+    (root / "main.py").write_text("def main_work():\n    return 'hello from main'\n", encoding="utf-8")
+    vendor_dir = root / "vendor_copy"
+    vendor_dir.mkdir()
+    (vendor_dir / "vend.py").write_text("def vend_work():\n    return 'hello from vend'\n", encoding="utf-8")
+    out = tmp_path / "t1_out"
+    cfg = tmp_path / "t1.json"
+    cfg.write_text(json.dumps({PID: {"root": str(root), "out_dir": str(out), "exclude": ["vendor_copy/"]}}), encoding="utf-8")
+    a = Adapter(projects=str(cfg))
+    try:
+        r1 = a.call(op="refresh", project=PID)[0]
+        assert r1["ok"] is True
+        # locate never returns files under vendor_copy/
+        loc = a.call(op="locate", project=PID, query="vend_work")[0]
+        assert loc["ok"] is True
+        assert all("vendor_copy" not in l.get("file", "") for l in loc.get("locators", []))
+        # find_text never returns files under vendor_copy/
+        ft = a.find_text(PID, "hello from vend")[0]
+        assert ft["hits"] == 0
+        assert all("vendor_copy" not in m.get("file", "") for m in ft.get("matches", []))
+        # editing a file under vendor_copy/ does not make stats stale
+        s1 = a.call(op="stats", project=PID)[0]
+        assert s1["ok"] is True and s1["stale"] is False
+        with open(vendor_dir / "vend.py", "a", encoding="utf-8") as f:
+            f.write("\n# modified vendor file\n")
+        s2 = a.call(op="stats", project=PID)[0]
+        assert s2["ok"] is True
+        assert s2["stale"] is False
+    finally:
+        a.close()
+
+
+def test_t2_secret_hygiene(tmp_path):
+    root = tmp_path / "t2_repo"
+    root.mkdir()
+    code = (
+        'AWS_KEY = "AKIAIOSFODNN7EXAMPLE"\n'
+        'JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"\n'
+        'ENTROPY_TOKEN = "aB9$kL2#mP9!xY8*qR1@zW5&vN7^tJ3~dF4+hG6="\n'
+        'def get_creds():\n'
+        '    password="hunter2hunter2-long"\n'
+        '    normal_literal = "this is a normal non-secret literal text"\n'
+        '    return password, normal_literal\n'
+    )
+    (root / "mod.py").write_text(code, encoding="utf-8")
+    out = tmp_path / "t2_out"
+    cfg = tmp_path / "t2.json"
+    cfg.write_text(json.dumps({PID: {"root": str(root), "out_dir": str(out)}}), encoding="utf-8")
+    a = Adapter(projects=str(cfg))
+    try:
+        r_ref = a.call(op="refresh", project=PID)[0]
+        assert r_ref["ok"] is True
+        s = a.call(op="stats", project=PID)[0]
+        assert s["ok"] is True
+        # secrets_dropped >= 3 is visible in stats or refresh coverage
+        dropped_ref = r_ref.get("secrets_dropped", 0) or r_ref.get("coverage", {}).get("secrets_dropped", 0)
+        dropped_stats = s.get("secrets_dropped", 0)
+        assert dropped_ref >= 3 or dropped_stats >= 3
+        # find_text never returns a fake AWS key, a fake JWT, a 40-char high-entropy mixed token, or password="hunter2hunter2-long"
+        assert a.find_text(PID, "AKIAIOSFODNN7EXAMPLE")[0]["hits"] == 0
+        assert a.find_text(PID, "eyJhbGciOiJIUzI1Ni")[0]["hits"] == 0
+        assert a.find_text(PID, "aB9$kL2#mP9!xY8*qR1@zW5&vN7^tJ3~dF4+hG6=")[0]["hits"] == 0
+        assert a.find_text(PID, 'password="hunter2hunter2-long"')[0]["hits"] == 0
+        assert a.find_text(PID, "hunter2hunter2-long")[0]["hits"] == 0
+        # a normal literal of 12+ chars is still found
+        r_norm = a.find_text(PID, "this is a normal non-secret")[0]
+        assert r_norm["hits"] >= 1
+    finally:
+        a.close()
+
+
+def test_t3_health_path_hygiene_and_budget(env):
+    a = env["a"]
+    h, raw, _ = a.call(op="health")
+    assert h["ok"] is True
+    # health no longer contains a roots key
+    assert "roots" not in h
+    # serialized JSON contains no absolute path of fixture roots/out_dirs or home
+    root_str = str(env["root"])
+    out_str = str(env["out"])
+    home_str = str(os.path.expanduser("~"))
+    assert root_str not in raw
+    assert root_str.replace("\\", "/") not in raw
+    assert out_str not in raw
+    assert out_str.replace("\\", "/") not in raw
+    assert home_str not in raw
+    assert home_str.replace("\\", "/") not in raw
+    # health with max_chars=500 still returns ok:true
+    h500, raw500, _ = a.call(op="health", max_chars=500)
+    assert h500["ok"] is True
+    assert len(raw500) <= 500
+
+
+def test_t4_redact_terms_masking(tmp_path):
+    root = tmp_path / "t4_repo"
+    root.mkdir()
+    sub = root / "custom_secret_dir"
+    sub.mkdir()
+    (sub / "worker.py").write_text("def unique_worker_task():\n    return 'done'\n", encoding="utf-8")
+    out = tmp_path / "t4_out"
+    cfg = tmp_path / "t4.json"
+    cfg.write_text(json.dumps({PID: {"root": str(root), "out_dir": str(out)}}), encoding="utf-8")
+    rt = tmp_path / "redact_terms.json"
+    rt.write_text(json.dumps(["custom_secret_dir"]), encoding="utf-8")
+    a = Adapter(projects=str(cfg))
+    try:
+        r_ref = a.call(op="refresh", project=PID)[0]
+        assert r_ref["ok"] is True
+        r_loc, raw, _ = a.call(op="locate", project=PID, query="unique_worker_task")
+        assert r_loc["ok"] is True
+        assert "<masked>" in raw
+        assert "custom_secret_dir" not in raw.lower()
+        hit = [l for l in r_loc["locators"] if l["symbol"] == "unique_worker_task"]
+        assert hit and "<masked>" in hit[0]["file"]
+        assert "custom_secret_dir" not in hit[0]["file"].lower()
+    finally:
+        a.close()
+
+
+def test_t5_exclude_as_string_refused(tmp_path):
+    r1, o1, _ = make_project(tmp_path, name="bad_proj")
+    r2, o2, _ = make_project(tmp_path, name="good_proj")
+    cfg = tmp_path / "multi.json"
+    cfg.write_text(json.dumps({
+        "bad": {"root": str(r1), "out_dir": str(o1), "exclude": "vendor_copy/"},
+        "good": {"root": str(r2), "out_dir": str(o2)}
+    }), encoding="utf-8")
+    a = Adapter(projects=str(cfg))
+    try:
+        r_bad, _, _ = a.call(op="locate", project="bad", query="compute_invoice_total")
+        assert r_bad["ok"] is False and r_bad["error"] == "project_not_allowed"
+        r_good = a.call(op="refresh", project="good")[0]
+        assert r_good["ok"] is True
+        r_loc = a.call(op="locate", project="good", query="compute_invoice_total")[0]
+        assert r_loc["ok"] is True
+    finally:
+        a.close()
+
+
+def test_t6_looks_secret_unit_cases():
+    import gfy_adapter
+    looks_secret = gfy_adapter.looks_secret
+    redact_text = gfy_adapter.redact_text
+
+    # Positives for each listed family:
+    # 1. PEM private-key blocks
+    assert looks_secret("-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0...\n-----END RSA PRIVATE KEY-----") is True
+    assert looks_secret("-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----") is True
+    # 2. AWS key ids
+    assert looks_secret("AKIAIOSFODNN7EXAMPLE") is True
+    assert looks_secret("ASIAIOSFODNN7EXAMPLE") is True
+    # 3. GitHub tokens
+    assert looks_secret("ghp_1234567890abcdefghijklmnopqrstuvwxyz1234") is True
+    assert looks_secret("github_pat_1234567890abcdefghijklmnopqrstuvwxyz") is True
+    # 4. Slack tokens
+    assert looks_secret("-".join(("xoxb", "0" * 10, "a" * 16))) is True
+    assert looks_secret("-".join(("xoxp", "0" * 10, "a" * 16))) is True
+    # 5. keys beginning sk-, sk_live_, rk_live_, pk_live_ followed by 16+ token chars
+    assert looks_secret("sk-1234567890abcdef1234567890") is True
+    assert looks_secret("_".join(("sk", "live", "0" * 24))) is True
+    assert looks_secret("_".join(("rk", "live", "0" * 24))) is True
+    assert looks_secret("pk_live_1234567890abcdef1234567890") is True
+    # 6. Google API keys
+    assert looks_secret("AIzaSyD-1234567890abcdefghijklmnopqrstuv") is True
+    # 7. JWTs
+    assert looks_secret("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c") is True
+    # 8. Telegram bot tokens
+    assert looks_secret("123456789:ABCDefghijk-1234567890abcdefghijkl") is True
+    # 9. URLs with inline credentials
+    assert looks_secret("https://user:password@example.com/api") is True
+    # 10. Bearer
+    assert looks_secret("Bearer 1234567890abcdef1234567890") is True
+    # 11. Assignments with password|passwd|secret|api_key|apikey|token
+    assert looks_secret('password="hunter2hunter2-long"') is True
+    assert looks_secret('api_key: "my_api_key_12345"') is True
+    assert looks_secret('token = "secrettokenval123"') is True
+    # 12. 32+ chars, >=3 classes, Shannon entropy >= 4.0
+    assert looks_secret("aB9$kL2#mP9!xY8*qR1@zW5&vN7^tJ3~dF4+hG6=") is True
+
+    # Negatives:
+    # sha256 hex digest
+    assert looks_secret("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") is False
+    # UUID
+    assert looks_secret("123e4567-e89b-12d3-a456-426614174000") is False
+    # ordinary sentence
+    assert looks_secret("The quick brown fox jumps over the lazy dog near the river bank.") is False
+    # relative file path
+    assert looks_secret("code_graph_runtime/tests/sub/test_app2.py") is False
+    # the message 'out-of-scope file reported'
+    assert looks_secret("out-of-scope file reported") is False
+
+    # Redact test
+    assert redact_text("token AKIAIOSFODNN7EXAMPLE secret") == "token [redacted] secret"
+
+
+# ---------------------------------------------------------------- WP-CGX-I2 tests (B1-B6)
+def test_b1_explicit_refresh_synchronous(env):
+    a = env["a"]
+    r, raw, _ = a.call(op="refresh", project=PID)
+    assert r["ok"] is True
+    assert r["nodes"] > 5
+    assert r["stale"] is False
+    assert r["snapshot"] is not None
+    assert "wall_s" in r
+    assert r.get("refresh", {}).get("state") == "ok"
+
+
+def test_b2_auto_revalidate_background(tmp_path, monkeypatch):
+    monkeypatch.setenv("GFY_AUTO_REFRESH_MIN_S", "0")
+    monkeypatch.setenv("GFY_RETRY_PAUSE_S", "0")
+    monkeypatch.setenv("GFY_BUILD_DELAY_S", "0")
+    root, out, cfg = make_project(tmp_path, name="b2")
+    a = Adapter(projects=cfg)
+    try:
+        r_init = a.call(op="refresh", project=PID)[0]
+        assert r_init["ok"] is True
+
+        with open(root / "util.py", "a", encoding="utf-8") as f:
+            f.write("\n# touched for b2\n")
+
+        # Locate returns immediately with revalidating:true
+        r_loc, _, _ = a.call(op="locate", project=PID, query="normalize_label")
+        assert r_loc["ok"] is True
+        assert r_loc.get("revalidating") is True
+        assert r_loc.get("stale") is True
+
+        # Second stale query during run does not start another refresh
+        r_loc2, _, _ = a.call(op="locate", project=PID, query="compute_invoice_total")
+        assert r_loc2["ok"] is True
+
+        # Polling stats shows refresh.state becoming ok within bounded time and snapshot no longer stale
+        deadline = time.time() + 15
+        ok_seen = False
+        while time.time() < deadline:
+            s = a.call(op="stats", project=PID)[0]
+            st = s.get("refresh", {})
+            if st.get("state") == "ok" and s.get("stale") is False:
+                ok_seen = True
+                break
+            time.sleep(0.05)
+        assert ok_seen is True
+
+        r_after = a.call(op="locate", project=PID, query="normalize_label")[0]
+        assert r_after["ok"] is True
+        assert r_after.get("stale") is False
+        assert "revalidating" not in r_after
+    finally:
+        a.close()
+
+
+def test_b3_explicit_refresh_while_running(tmp_path, monkeypatch):
+    monkeypatch.setenv("GFY_AUTO_REFRESH_MIN_S", "0")
+    monkeypatch.setenv("GFY_RETRY_PAUSE_S", "0")
+    monkeypatch.setenv("GFY_BUILD_DELAY_S", "0.6")
+    root, out, cfg = make_project(tmp_path, name="b3")
+    a = Adapter(projects=cfg)
+    try:
+        r0 = a.call(op="refresh", project=PID)[0]
+        assert r0["ok"] is True
+
+        with open(root / "util.py", "a", encoding="utf-8") as f:
+            f.write("\n# touch b3\n")
+
+        # locate triggers background refresh which has a 0.6s delay
+        r_loc = a.call(op="locate", project=PID, query="normalize_label")[0]
+        assert r_loc.get("revalidating") is True
+
+        # explicit refresh arrives while background refresh is building
+        t0 = time.perf_counter()
+        r_ref, raw, dt = a.call(op="refresh", project=PID)
+        elapsed = time.perf_counter() - t0
+
+        assert elapsed < 0.4
+        assert r_ref["ok"] is True
+        assert r_ref.get("refresh", {}).get("state") == "running"
+
+        # wait for background refresh to finish
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            s = a.call(op="stats", project=PID)[0]
+            if s.get("refresh", {}).get("state") == "ok":
+                break
+            time.sleep(0.05)
+    finally:
+        a.close()
+
+
+def test_b4_retry_publish_loop(tmp_path, monkeypatch):
+    import gfy_adapter
+    monkeypatch.setenv("GFY_RETRY_PAUSE_S", "0")
+
+    def make_p(name):
+        root = tmp_path / f"{name}_repo"
+        root.mkdir()
+        for n, t in FIX.items():
+            (root / n).write_text(t, encoding="utf-8")
+        out = tmp_path / f"{name}_out"
+        return gfy_adapter.Project(name, str(root), str(out))
+
+    # 1. raises/returns source_changed_during_build twice then succeeds
+    p1 = make_p("p1")
+    calls1 = [0]
+    def build_retry_twice(proj, env):
+        calls1[0] += 1
+        if calls1[0] == 1:
+            return "source_changed_during_build:billing.py"
+        elif calls1[0] == 2:
+            raise RuntimeError("source_changed_during_build:shipping.py")
+        return gfy_adapter.run_build(proj, env)
+
+    r1 = gfy_adapter.perform_refresh(p1, build_fn=build_retry_twice)
+    assert r1["ok"] is True
+    st1 = p1.get_refresh_status()
+    assert st1["state"] == "ok"
+    assert st1["attempts"] == 3
+    ptr1 = p1.pointer()
+    assert ptr1 is not None
+    assert "changed_during_build" not in ptr1
+
+    # 2. always fails with source_changed_during_build and NO last-good snapshot
+    p2 = make_p("p2")
+    p2.work.mkdir(parents=True, exist_ok=True)
+    gfy_adapter.run_build(p2, gfy_adapter.child_env({"GRAPHIFY_OUT": str(p2.work)}))
+    calls2 = [0]
+    def build_always_fail(proj, env):
+        calls2[0] += 1
+        return "source_changed_during_build:util.py"
+
+    r2 = gfy_adapter.perform_refresh(p2, build_fn=build_always_fail)
+    assert r2["ok"] is True
+    st2 = p2.get_refresh_status()
+    assert st2["state"] == "ok"
+    assert st2["attempts"] == 3
+    ptr2 = p2.pointer()
+    assert ptr2 is not None
+    assert ptr2.get("changed_during_build") == ["util.py"]
+    s2 = json.loads(gfy_adapter.op_stats(p2, {}))
+    assert s2["changed_during_build"] == ["util.py"]
+
+    # 3. always fails with source_changed_during_build and last-good snapshot EXISTS
+    p3 = make_p("p3")
+    r_init = gfy_adapter.perform_refresh(p3)
+    assert r_init["ok"] is True
+    good_sha = p3.pointer()["sha"]
+    calls3 = [0]
+    def build_always_fail_kept(proj, env):
+        calls3[0] += 1
+        raise RuntimeError("source_changed_during_build:app.py")
+
+    r3 = gfy_adapter.perform_refresh(p3, build_fn=build_always_fail_kept)
+    assert r3["ok"] is False
+    assert r3["error"] == "refresh_failed"
+    assert r3["serving"] == "last-good"
+    st3 = p3.get_refresh_status()
+    assert st3["state"] == "failed"
+    assert st3["attempts"] == 3
+    assert p3.pointer()["sha"] == good_sha
+
+
+def test_b5_missing_snapshot_building(tmp_path, monkeypatch):
+    monkeypatch.setenv("GFY_AUTO_REFRESH_MIN_S", "0")
+    monkeypatch.setenv("GFY_RETRY_PAUSE_S", "0")
+    monkeypatch.setenv("GFY_BUILD_DELAY_S", "0")
+    root, out, cfg = make_project(tmp_path, name="b5")
+    a = Adapter(projects=cfg)
+    try:
+        r1, _, _ = a.call(op="locate", project=PID, query="compute_invoice_total")
+        assert r1["ok"] is False
+        assert r1["error"] == "no_snapshot"
+        assert r1.get("building") is True
+
+        deadline = time.time() + 15
+        succeeded = False
+        while time.time() < deadline:
+            r2, _, _ = a.call(op="locate", project=PID, query="compute_invoice_total")
+            if r2["ok"] is True:
+                succeeded = True
+                assert len(r2["locators"]) >= 1
+                break
+            time.sleep(0.05)
+        assert succeeded is True
+    finally:
+        a.close()
+
+
+def test_b6_secret_hygiene_url(tmp_path):
+    root = tmp_path / "b6_repo"
+    root.mkdir()
+    code = (
+        'MARKET_URL = "https://api.example.com/v1/markets?symbol=BTC9&limit=50"\n'
+        'CRED_URL = "https://user:hunter2pass@db.example.com/x"\n'
+        'KEY_URL = "https://api.example.com/v1/data?api_key=AbC123xYz789QwE456"\n'
+        'def get_urls():\n'
+        '    return MARKET_URL, CRED_URL, KEY_URL\n'
+    )
+    (root / "urls.py").write_text(code, encoding="utf-8")
+    out = tmp_path / "b6_out"
+    cfg = tmp_path / "b6.json"
+    cfg.write_text(json.dumps({PID: {"root": str(root), "out_dir": str(out)}}), encoding="utf-8")
+    a = Adapter(projects=str(cfg))
+    try:
+        r_ref = a.call(op="refresh", project=PID)[0]
+        assert r_ref["ok"] is True
+
+        r_norm = a.find_text(PID, "https://api.example.com/v1/markets?symbol=BTC9&limit=50")[0]
+        assert r_norm["hits"] >= 1
+        assert "https://api.example.com/v1/markets" in r_norm["matches"][0]["excerpt"]
+
+        assert a.find_text(PID, "hunter2pass")[0]["hits"] == 0
+        assert a.find_text(PID, "https://user:hunter2pass@db.example.com/x")[0]["hits"] == 0
+
+        assert a.find_text(PID, "AbC123xYz789QwE456")[0]["hits"] == 0
+        assert a.find_text(PID, "api_key=AbC123xYz789QwE456")[0]["hits"] == 0
+    finally:
+        a.close()

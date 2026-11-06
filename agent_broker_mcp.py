@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 import atomic_io
+import availability_reset
 import code_graph_bridge
 import flash_manifest
 import hierarchy_install
@@ -253,8 +254,60 @@ BUDGET_REASON_MAX_CHARS = 200
 # and its duplicate copy inside "response" could still blow the cap wide open).
 RESPONSE_ENVELOPE_DEFAULT_CHARS = 6_000
 DECISION_QUOTA_LATCH_DEFAULT_MINUTES = 30
+# Decision pipeline: the brain drafts brief.proposed_choice, a short Gemini
+# evaluator pass reviews it, then the flagship (Astra) gives the final verdict.
+# Fable is opt-in (include_fable=true, or AGENT_BROKER_FABLE_MODE=default).
+DECISION_EVALUATOR_DEFAULT_MODEL = "gemini-4-argon-high"
+# Background cap for the detached evaluator worker (never an inline MCP-call run).
+DECISION_EVALUATOR_DEFAULT_TIMEOUT_SECONDS = 1800
+DECISION_EVALUATOR_MIN_TIMEOUT_SECONDS = 240
+DECISION_EVALUATOR_MAX_TIMEOUT_SECONDS = 10800
+DECISION_EVALUATOR_DEFAULT_REUSE_HOURS = 24.0
+DECISION_EVALUATOR_TASK_KIND = "decision_evaluator"
+DECISION_EVALUATOR_REVIEW_MAX_CHARS = 1200
+DECISION_FINAL_UNAVAILABLE_NOTICE = (
+    "Final Astra verdict unavailable; the brain decides using the evaluator review."
+)
+GEMINI_CONSULT_TASK_KIND = "gemini_consult"
+GEMINI_CONSULT_DEFAULT_TIMEOUT_SECONDS = 1800
+GEMINI_CONSULT_MIN_TIMEOUT_SECONDS = 240
+GEMINI_CONSULT_MAX_TIMEOUT_SECONDS = 10800
+
+INLINE_WAIT_DEFAULT_SECONDS = 200
+INLINE_WAIT_MIN_SECONDS = 15
+INLINE_WAIT_MAX_SECONDS = 220
+
+
+def bounded_gemini_consult_timeout(value: Any = None) -> int:
+    try:
+        val = int(str(value).strip()) if value is not None and str(value).strip() else _env_int("AGENT_BROKER_GEMINI_CONSULT_TIMEOUT", GEMINI_CONSULT_DEFAULT_TIMEOUT_SECONDS)
+    except (TypeError, ValueError):
+        val = _env_int("AGENT_BROKER_GEMINI_CONSULT_TIMEOUT", GEMINI_CONSULT_DEFAULT_TIMEOUT_SECONDS)
+    return max(GEMINI_CONSULT_MIN_TIMEOUT_SECONDS, min(val, GEMINI_CONSULT_MAX_TIMEOUT_SECONDS))
+
+
+def get_inline_wait_seconds(timeout_seconds: Any = None) -> int:
+    """Clamped inline wait for background worker consults [15..220s], default 200s.
+    Can be configured via AGENT_BROKER_INLINE_WAIT_SECONDS."""
+    raw = os.environ.get("AGENT_BROKER_INLINE_WAIT_SECONDS")
+    if raw is None or str(raw).strip() == "":
+        val = INLINE_WAIT_DEFAULT_SECONDS
+    else:
+        try:
+            val = int(str(raw).strip())
+        except (TypeError, ValueError):
+            val = INLINE_WAIT_DEFAULT_SECONDS
+    clamped = max(INLINE_WAIT_MIN_SECONDS, min(val, INLINE_WAIT_MAX_SECONDS))
+    if timeout_seconds is not None:
+        try:
+            t = int(timeout_seconds)
+            if t > 0:
+                clamped = min(clamped, t)
+        except (TypeError, ValueError):
+            pass
+    return clamped
 # Keyed (session_key, family, normalized_model). Each value carries
-# kind ("plan"|"quota"), status, reason, created_at, expires_at (quota only),
+# kind ("plan"|"quota"), status, reason, created_at, expires_at (quota and plan),
 # and account_hash (see _account_identity_hash).
 _FLAGSHIP_AVAILABILITY_LATCHES: dict[tuple[str, str, str], dict[str, Any]] = {}
 
@@ -697,11 +750,11 @@ GENERIC_GROUND_RULES = [
 
 COST_AWARE_ROUTING_RULES = [
     "The model selected for the main session is the brain; never rewrite that user choice. It owns requirements, architecture, planning, hard diagnosis, risk decisions, and final signoff.",
-    "For important architecture, compatibility, or hard decisions, the initiating Codex or Claude host first sends one structured bounded brief to its same-vendor flagship through its native child-agent mechanism. Codex uses native Astra and Claude uses native Fable; the Switchboard process must never replace this with a nested same-vendor CLI call.",
-    "Pass the compact native result to consult_decision as native_consultation. Bounded work ends after that native result; architecture/critical work adds only the opposite-vendor adviser through Switchboard. A missing native result returns needs_native_consultation without contacting a provider. Astra and Fable hosts consult the opposite vendor, while Gemini hosts consult both through Switchboard. Complexity maps to high/xhigh/max effort.",
+    "For important architecture, compatibility, or hard decisions, the brain drafts its own choice first, then consult_decision runs Gemini 4 Argon High as a short evaluator and Astra gives the final verdict: Claude and Gemini hosts get Astra through Switchboard; a Codex host below Astra spawns its native Astra subagent with the evaluator's review. Fable joins only when the user asks (include_fable=true) or AGENT_BROKER_FABLE_MODE=default. The Switchboard process must never replace this with a nested same-vendor CLI call.",
+    "Pass a native Astra (or requested Fable) result to consult_decision as native_consultation. If the evaluator fails, continue to Astra; if Astra is unavailable, the evaluator's review returns with a handoff notice -- never step down to a weaker model. Complexity maps Astra effort to high/xhigh/max.",
     "Decision briefs are hard-capped: one decision, at most three questions, four options, eight evidence refs, 4,000 excerpt bytes, 12,000 total UTF-8 bytes, and about 3,000 tokens. Send summaries, precise excerpts, and immutable refs -- never whole files, articles, logs, or chat histories.",
     "Flagship availability and quota failures are isolated. Continue with available targets, never substitute Flash for flagship judgment, and include every consult_decision handoff_notices item in the final response.",
-    "Capability tier outranks model version: a newer Gemini Flash remains a non-authoritative labour workhorse and never becomes an Astra/Fable decision consultant.",
+    "Capability tier outranks model version: a newer Gemini Flash remains a non-authoritative labour workhorse and never becomes an Astra/Fable decision consultant; Gemini 4 Argon High is the advisory decision evaluator, never the final verdict.",
     "The owner has issued a STANDING REQUEST to delegate eligible labour: dispatching a bounded package to the Flash workhorse or to a managed native subagent is pre-authorized work, not an optional extra that needs fresh permission each turn.",
     "For Codex and Claude brains, DEFAULT WORKHORSE = the newest live Antigravity Gemini Flash High through Agent Switchboard. For a bounded package -- reading, search, extraction, summaries, drafting/writing, independent parallel read-only packages, and (once containment is enabled) light implementation and tests from an approved plan when isolated and low-risk -- the default lane is route_agent_task with target_agent=antigravity, surface=cli, target_model=gemini flash, effort=high, a work_package_id, the correct task_kind, and mode=plan or mode=accept-edits with the implementation envelope. It is roughly a tenth the cost of the same-vendor native workhorse and several times faster.",
     "Gemini, Antigravity, and unknown hosts receive no automatic downward cost routing. Their user-selected brain remains in place; explicit routing is still allowed, and Gemini upward flagship consultation through consult_decision is unchanged.",
@@ -1160,6 +1213,19 @@ def normalize_project_name(path: Path) -> str:
 def resolve_project(project: str | None) -> ProjectInfo:
     init_db()
     raw = (project or "").strip()
+    try:
+        import project_resolver
+        registry = project_resolver.load_registry()
+        if registry:
+            cid, reason, _ = project_resolver.canonical_project(
+                raw or None,
+                cwd=None if raw else str(Path.cwd()),
+                registry=registry,
+            )
+            if cid is not None and cid in registry:
+                return ProjectInfo(cid, str(registry[cid].root))
+    except Exception:
+        pass
     if raw:
         possible_path = Path(raw).expanduser()
         if possible_path.exists():
@@ -4416,7 +4482,7 @@ def prepare_flash_work_package(args: dict[str, Any], task_kind: str, prompt: str
 
 
 RESEARCH_LOCATOR_DESCRIPTION = (
-    "Exact source locator. code: L12, 12, lines 12-18, or L12:L18; "
+    "Exact source locator. code: L12, 12, lines 12-18, or L12:L18 (a file prefix like file.py:L12 and comma lists like L12, L40-L44 are accepted); "
     "document: page 3, pages 3-4, section 2.1, chapter 4, lines 8-12, or #anchor; "
     "web/command/provided_context: a nonempty precise locator (web location must be an http(s) URL)."
 )
@@ -4679,14 +4745,60 @@ def _scope_roots(staged: Any, package: dict[str, Any]) -> list[Path]:
     return roots
 
 
+def _valid_research_code_part(part: str) -> bool:
+    part = part.strip()
+    if not part:
+        return False
+    if RESEARCH_CODE_LOCATOR_RE.fullmatch(part):
+        return True
+    for idx, char in enumerate(part):
+        if char == ":":
+            cand_prefix = part[:idx].strip()
+            cand_remainder = part[idx + 1:].strip()
+            if not cand_prefix or not cand_remainder:
+                continue
+            if not any(c in cand_prefix for c in (".", "/", "\\")):
+                continue
+            is_win_drive = (
+                len(cand_prefix) >= 3
+                and cand_prefix[0].isalpha()
+                and cand_prefix[1] == ":"
+                and cand_prefix[2] in ("/", "\\")
+            )
+            if is_win_drive:
+                if cand_prefix[2:].count(":") != 0:
+                    continue
+            else:
+                if ":" in cand_prefix:
+                    continue
+            if " " in cand_prefix and not is_win_drive:
+                continue
+            if RESEARCH_CODE_LOCATOR_RE.fullmatch(cand_remainder):
+                return True
+    return False
+
+
+def _valid_research_code_locator(locator: str) -> bool:
+    if not isinstance(locator, str):
+        return False
+    locator = locator.strip().replace("–", "-").replace("—", "-")
+    if not locator:
+        return False
+    raw_parts = re.split(r"[,;]", locator)
+    parts = [p.strip() for p in raw_parts if p.strip()]
+    if not parts or len(parts) > 20:
+        return False
+    return all(_valid_research_code_part(p) for p in parts)
+
+
 def _valid_research_locator(source_kind: str, location: str, locator: str) -> bool:
     if source_kind == "web":
         parsed = urllib.parse.urlparse(location)
         return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
     if source_kind == "code":
-        return bool(RESEARCH_CODE_LOCATOR_RE.fullmatch(locator))
+        return _valid_research_code_locator(locator)
     if source_kind == "document":
-        return bool(RESEARCH_DOCUMENT_LOCATOR_RE.fullmatch(locator))
+        return bool(RESEARCH_DOCUMENT_LOCATOR_RE.fullmatch(locator)) or _valid_research_code_locator(locator)
     return True
 
 
@@ -5045,7 +5157,15 @@ def wants_async_claude(args: dict[str, Any]) -> bool:
     )
 
 
+def explicit_async_false(args: Mapping[str, Any]) -> bool:
+    """True when the caller passed an explicit async that is falsy ('an explicit async always wins')."""
+    explicit = args.get("async")
+    return explicit is not None and str(explicit).strip() != "" and not truthy(explicit)
+
+
 def wants_direct_claude(args: dict[str, Any]) -> bool:
+    if explicit_async_false(args):
+        return True
     return truthy(
         args.get("force_sync")
         or args.get("sync")
@@ -5063,39 +5183,15 @@ def should_queue_heavy_claude_consult(
     effort: str | None,
     model_name: str | None = None,
 ) -> tuple[bool, str | None]:
+    if explicit_async_false(args):
+        return False, "caller_forced_sync"
     if wants_async_claude(args):
         return True, "caller_requested_async"
     if wants_direct_claude(args):
         return False, "caller_forced_sync"
-    if family_from_caller() != "codex":
-        return False, "caller_not_codex"
-    if str(effort or "").strip().lower() != "max":
-        return False, "not_claude_max_effort"
-    if normalize_lookup(model_name) not in {
-        "fable",
-        "opus",
-        normalize_lookup(CLAUDE_FLAGSHIP_MODEL),
-    }:
-        return False, f"model_not_frontier:{model_name or 'default'}"
     if task_kind in {"quick_check", "sanity_check"}:
         return False, "quick_task"
-    if task_kind in HEAVY_CLAUDE_ASYNC_TASKS:
-        return True, f"task_kind={task_kind}"
-    if int(token_budget or 0) >= CLAUDE_ASYNC_MIN_TOKEN_BUDGET:
-        return True, f"token_budget={token_budget}"
-    try:
-        max_response_chars = int(args.get("max_response_chars") or DEFAULT_CONSULT_RESPONSE_CHARS)
-    except (TypeError, ValueError):
-        max_response_chars = DEFAULT_CONSULT_RESPONSE_CHARS
-    if max_response_chars >= CLAUDE_ASYNC_MIN_RESPONSE_CHARS:
-        return True, f"max_response_chars={max_response_chars}"
-    try:
-        prompt_tokens = estimate_tokens(prompt)
-    except Exception:  # noqa: BLE001
-        prompt_tokens = 0
-    if prompt_tokens >= CLAUDE_ASYNC_MIN_PROMPT_TOKENS:
-        return True, f"prompt_tokens={prompt_tokens}"
-    return False, "within_sync_budget"
+    return True, f"task_kind={task_kind}"
 
 
 def claude_async_model_labels(model_name: str | None, effort: str | None) -> tuple[str, str]:
@@ -5541,6 +5637,27 @@ def _with_child_marker(prompt: str) -> str:
     return f"{CHILD_PROMPT_MARKER}\n\n{text}"
 
 
+def normalize_codex_mode(mode: Any, task_kind: str | None = None) -> str:
+    """Resolve new request modes without broadening explicit read-only intent."""
+    value = str(mode or "").strip()
+    if not value:
+        return "workspace-write" if normalize_task_kind(task_kind) == "implementation" else "read-only"
+    if value == "danger-full-access":
+        return value
+    aliases = {
+        "read-only": "read-only", "plan": "read-only",
+        "workspace-write": "workspace-write", "accept-edits": "workspace-write",
+        "acceptedits": "workspace-write",
+    }
+    if value.lower() in aliases:
+        return aliases[value.lower()]
+    raise ValueError(
+        f"Unsupported Codex mode {value!r}. Use read-only/plan for inspection, "
+        "workspace-write/accept-edits/acceptEdits for local execution needing files, "
+        "or explicitly danger-full-access."
+    )
+
+
 def consult_codex(
     project: str | None,
     prompt: str,
@@ -5550,6 +5667,7 @@ def consult_codex(
     timeout: int = SYNC_CONSULT_TIMEOUT_SECONDS,
     outbound_reviewed: bool = False,
 ) -> CodexConsultResult:
+    sandbox = normalize_codex_mode(mode)
     config = load_config()
     codex = discover_codex(config, required_model=model_name)
     if not codex:
@@ -5565,7 +5683,6 @@ def consult_codex(
             model_attested=False,
         )
     project_info = resolve_project(project)
-    sandbox = "read-only" if mode not in {"workspace-write", "danger-full-access"} else mode
     command = [
         codex,
         "exec",
@@ -7456,15 +7573,15 @@ def lookup_consultation_receipt(request_id: str) -> dict[str, Any] | None:
     }
 
 
-def _await_codex_row(request_id: str, timeout_seconds: int) -> dict[str, Any] | None:
+def _await_codex_row(request_id: str, timeout_seconds: int | None = None) -> dict[str, Any] | None:
     """Poll the codex_requests row for `request_id` until it reaches a terminal state or the
     (monotonic) deadline passes. Read-only: the detached worker is the sole finalizer, so this
     never mutates the row beyond the stale-expiry refresh. Returns the latest row (or None)."""
     rid = str(request_id or "").strip()
     if not rid:
         return None
-    margin = 8
-    deadline = time.monotonic() + max(15, int(timeout_seconds or SYNC_CONSULT_TIMEOUT_SECONDS) - margin)
+    wait = get_inline_wait_seconds(timeout_seconds)
+    deadline = time.monotonic() + wait
     row: dict[str, Any] | None = None
     while True:
         found = _find_request(rid)
@@ -7477,6 +7594,107 @@ def _await_codex_row(request_id: str, timeout_seconds: int) -> dict[str, Any] | 
         if remaining <= 0:
             return row
         time.sleep(min(1.0, remaining))
+
+
+def _format_terminal_inline_payload(table: str, row: dict[str, Any], rid: str) -> dict[str, Any]:
+    if table == "flash_requests":
+        res = _flash_request_result(row)
+        res["id"] = rid
+        res["request_id"] = rid
+        return res
+
+    response = row.get("response")
+    state = canonical_request_state(row.get("status"))
+    status = "ok" if state == "completed" and not str(response or "").startswith(CONSULT_FAILURE_PREFIXES) else "error"
+    error = row.get("error") or (response if status == "error" else None)
+
+    actual_model = None
+    actual_effort = None
+    responder_model = row.get("responder_model")
+    if table == "codex_requests":
+        actual_model, actual_effort = _parse_codex_responder_model(responder_model)
+    elif table == "claude_requests":
+        if responder_model and responder_model.startswith("claude:") and "unverified" not in responder_model:
+            cleaned = responder_model[len("claude:"):].strip()
+            actual_model = cleaned.split()[0] if cleaned else None
+            if "[" in cleaned and "]" in cleaned:
+                actual_effort = cleaned.split("[", 1)[1].split("]", 1)[0].strip()
+
+    model_attested = bool(
+        actual_model
+        and responder_model
+        and "unverified" not in responder_model
+        and "<synthetic>" not in responder_model
+    )
+
+    result = {
+        "project": row.get("project"),
+        "root_path": row.get("root_path"),
+        "model": responder_model or row.get("target_model") or table.replace("_requests", ""),
+        "effort": row.get("effort"),
+        "mode": row.get("mode"),
+        "status": status,
+        "response": response,
+        "request_id": rid,
+        "id": rid,
+        "responder": row.get("responder"),
+        "responder_model": responder_model,
+        "requested_model": row.get("target_model"),
+        "actual_model": actual_model,
+        "requested_effort": row.get("effort"),
+        "actual_effort": actual_effort,
+        "model_attested": model_attested,
+        "state": state,
+        "answered": bool(response),
+        "completed_at": row.get("completed_at"),
+    }
+    if error:
+        result["error"] = error
+    return result
+
+
+def await_inline_request(request_id: str, timeout_seconds: int | None = None) -> dict[str, Any]:
+    """Poll a request row (claude_requests / codex_requests / flash_requests) until terminal
+    or the inline wait deadline passes. If terminal, returns the finished payload; otherwise
+    returns a pending payload instructing the caller to poll request_result."""
+    rid = str(request_id or "").strip()
+    if not rid:
+        return {
+            "status": "error",
+            "error": "request_id is required",
+            "request_id": rid,
+            "id": rid,
+        }
+    wait = get_inline_wait_seconds(timeout_seconds)
+    deadline = time.monotonic() + wait
+    interval = 0.1
+    while True:
+        found = _find_request(rid)
+        if found:
+            table, row = found
+            row = _refresh_stale_codex_request(table, row)
+            if row.get("response") or is_terminal_state(row.get("status")):
+                return _format_terminal_inline_payload(table, row, rid)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(interval, max(0.01, remaining)))
+
+    return {
+        "status": "pending",
+        "async": True,
+        "request_id": rid,
+        "id": rid,
+        "poll": {
+            "tool": "request_result",
+            "request_id": rid,
+            "wait_seconds": 180,
+        },
+        "note": "Still running in the background; it is never killed by the call window. Poll request_result until terminal.",
+    }
+
+
+await_request_inline = await_inline_request
 
 
 def codex_effort_fits_sync_window(effort: Any) -> bool:
@@ -7513,6 +7731,7 @@ def _run_codex_consult(
     task_kind: str,
     token_budget: int | None,
     outbound_reviewed: bool = False,
+    async_requested: bool = False,
 ) -> dict[str, Any]:
     """Run a Codex consult through the unified ledger+worker path instead of a blocking
     subprocess. Queues the request (which spawns the detached worker), then routes by effort:
@@ -7539,7 +7758,8 @@ def _run_codex_consult(
     # Effort-based routing (per Codex's design): don't lower the effort to fit the window —
     # route by whether it fits. Efforts that fit poll to the deadline; max/xhigh get a single
     # instant check (to catch a deduped/already-complete row) then return pending immediately.
-    sync_eligible = codex_effort_fits_sync_window(effort)
+    effort_sync_eligible = codex_effort_fits_sync_window(effort)
+    sync_eligible = effort_sync_eligible and not async_requested
     if sync_eligible:
         row = _await_codex_row(rid, timeout_seconds) if rid else None
     else:
@@ -7562,11 +7782,16 @@ def _run_codex_consult(
         }
     state = canonical_request_state((row or {}).get("status")) if row else "queued"
     model_label = (f"codex:{resolved_model}" if resolved_model else "codex") + (f" [{effort}]" if effort else "")
-    if sync_eligible:
+    if async_requested:
+        note = (
+            f"Codex request {rid} is queued for asynchronous execution. "
+            f'Collect it with request_result(request_id="{rid}", wait_seconds=180).'
+        )
+    elif sync_eligible:
         note = (
             f"Codex is still working (state={state}); the answer is recorded when it finishes even though this "
-            f"call returned first — the work is NOT lost. Collect it with "
-            f'request_result(request_id="{rid}", wait_seconds=120) and repeat until answered.'
+            f"call returned first — the work is NOT lost. Still running in the background; it is never killed by the call window. "
+            f'Collect it with request_result(request_id="{rid}", wait_seconds=180) and repeat until answered.'
         )
     else:
         note = (
@@ -7583,12 +7808,13 @@ def _run_codex_consult(
         "effort": effort,
         "mode": mode,
         "status": "pending",
-        "routing": "async_by_effort" if not sync_eligible else "exceeded_sync_window",
+        "routing": "explicit_async" if async_requested else ("async_by_effort" if not sync_eligible else "exceeded_sync_window"),
         "request_id": rid,
+        "id": rid,
         "state": state,
-        "retry_after_seconds": 120 if not sync_eligible else 20,
-        "typical_wait": "5-15 minutes at max/xhigh effort" if not sync_eligible else None,
-        "poll": {"tool": "request_result", "request_id": rid, "wait_seconds": 180 if not sync_eligible else 120},
+        "retry_after_seconds": 120 if not effort_sync_eligible else 20,
+        "typical_wait": "5-15 minutes at max/xhigh effort" if not effort_sync_eligible else None,
+        "poll": {"tool": "request_result", "request_id": rid, "wait_seconds": 180},
         "async_worker": worker or None,
         "note": note,
         "requested_model": resolved_model,
@@ -7597,6 +7823,8 @@ def _run_codex_consult(
         "actual_effort": None,
         "model_attested": None,
     }
+    if async_requested:
+        payload["async"] = True
     return {"pending": True, "payload": payload, "request_id": rid}
 
 
@@ -7610,7 +7838,10 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     topic_arg = str(args.get("topic") or "").strip() or None
     task_kind = normalize_task_kind(args.get("task_kind"))
     token_budget = int(args.get("token_budget") or TASK_BUDGETS.get(task_kind, TASK_BUDGETS["consult"]))
-    mode = str(args.get("mode") or ("plan" if model in {"claude", "antigravity"} else "read-only"))
+    mode = (
+        normalize_codex_mode(args.get("mode"), task_kind) if model == "codex"
+        else str(args.get("mode") or ("plan" if model in {"claude", "antigravity"} else "read-only"))
+    )
     requested_model = args.get("target_model") or args.get("model_name") or args.get("model")
     requested_effort = args.get("effort") or args.get("reasoning_effort")
     model_policy = None
@@ -7711,32 +7942,20 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
                 cli_model=resolved_model,
                 mode=mode,
             )
-            consulted_name = f"claude:{resolved_model}" if resolved_model else "claude"
-            if effort:
-                consulted_name += f" [{effort}]"
-            worker_started = bool((queued.get("async_worker") or {}).get("started"))
-            queued.update(
-                {
-                    "async": True,
-                    "route": "claude_cli_worker" if worker_started else "claude_inbox",
-                    "surface": "cli" if worker_started else "extension",
-                    "model": consulted_name,
-                    "effort": effort,
-                    "mode": mode,
-                    "async_reason": async_reason,
-                    "typical_wait": "5-15 minutes at max effort",
-                    "note": (
-                        "A detached Claude CLI worker is running this consult now (max-effort runs typically "
-                        "take 5-15 minutes) and records the answer; collect it with "
-                        "request_result(request_id, wait_seconds=180) and repeat until answered."
-                        if worker_started
-                        else "Queued through the Claude inbox; no CLI worker could run this target, so it "
-                        "requires an interactive Claude session/bridge pickup. Poll request_status/"
-                        "request_result with the returned id."
-                    ),
-                }
-            )
-            return queued
+            return await_inline_request(queued["id"], timeout_seconds)
+    elif model == "gemini":
+        raw_kind = str(args.get("task_kind") or "").strip().lower()
+        if task_kind not in {"quick_check", "search"} and raw_kind not in {"quick_check", "search"} and not truthy(args.get("force_sync")) and not explicit_async_false(args):
+            queued = queue_gemini_consult(args)
+            return await_inline_request(queued["id"], timeout_seconds)
+    elif model == "antigravity":
+        raw_kind = str(args.get("task_kind") or "").strip().lower()
+        if not flash_async_worker and task_kind not in {"quick_check", "search"} and raw_kind not in {"quick_check", "search"} and not truthy(args.get("force_sync")) and not explicit_async_false(args):
+            flash_args = dict(args)
+            if not flash_args.get("timeout_seconds"):
+                flash_args["timeout_seconds"] = 1800
+            queued = queue_flash_request(flash_args)
+            return await_inline_request(queued["id"], timeout_seconds)
     started_at = utc_now()
     flash_run_token = (
         str(args.get("_flash_receipt_id") or "").strip() if flash_async_worker else ""
@@ -7769,6 +7988,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
                 project_info, prompt, mode, resolved_model, effort,
                 timeout_seconds, topic_arg, task_kind, token_budget,
                 outbound_reviewed=truthy(args.get("outbound_reviewed")),
+                async_requested=truthy(args.get("async")),
             )
             if codex_outcome.get("pending"):
                 return codex_outcome["payload"]
@@ -8567,6 +8787,9 @@ def _account_identity_hash(family: str) -> str | None:
 def _parse_quota_latch_expiry(text: str) -> float:
     """Best-effort quota reset time as epoch seconds, from free-text provider
     errors; falls back to AGENT_BROKER_QUOTA_LATCH_MINUTES (default 30)."""
+    parsed = availability_reset.parse_reset_epoch(text)
+    if parsed is not None:
+        return float(parsed)
     now = time.time()
     match = re.search(r"try again in\s+(\d+)\s*(hour|hr|minute|min)s?", text, re.I)
     if match:
@@ -8616,6 +8839,14 @@ def _set_flagship_latch(key: tuple[str, str, str], kind: str, status: str, reaso
     }
     if kind == "quota":
         entry["expires_at"] = _parse_quota_latch_expiry(reason or "")
+    elif kind == "plan":
+        try:
+            recheck_minutes = float(os.environ.get("AGENT_BROKER_UNAVAILABLE_RECHECK_MINUTES") or 60)
+            if recheck_minutes <= 0:
+                recheck_minutes = 60.0
+        except (TypeError, ValueError):
+            recheck_minutes = 60.0
+        entry["expires_at"] = time.time() + recheck_minutes * 60.0
     _FLAGSHIP_AVAILABILITY_LATCHES[key] = entry
 
 
@@ -8637,6 +8868,11 @@ def _latch_active(key: tuple[str, str, str]) -> tuple[bool, str | None]:
         if expires_at is not None and time.time() >= float(expires_at):
             del _FLAGSHIP_AVAILABILITY_LATCHES[key]
             return False, f"retrying {family}:{model}: quota window passed"
+    elif latch.get("kind") == "plan":
+        expires_at = latch.get("expires_at")
+        if expires_at is not None and time.time() >= float(expires_at):
+            del _FLAGSHIP_AVAILABILITY_LATCHES[key]
+            return False, f"retrying {family}:{model}: recheck window passed"
     return True, None
 
 
@@ -8892,6 +9128,717 @@ def _decision_failure_kind(result: dict[str, Any]) -> tuple[str | None, bool, st
 def _decision_failure(result: dict[str, Any]) -> tuple[str | None, bool]:
     status, should_latch, _kind = _decision_failure_kind(result)
     return status, should_latch
+
+
+def _decision_evaluator_model() -> str | None:
+    """The evaluator model id, or None when the evaluator is disabled
+    ('' or 'off' in AGENT_BROKER_DECISION_EVALUATOR_MODEL)."""
+    raw = os.environ.get("AGENT_BROKER_DECISION_EVALUATOR_MODEL")
+    if raw is None:
+        return DECISION_EVALUATOR_DEFAULT_MODEL
+    value = raw.strip()
+    if not value or normalize_lookup(value) == "off":
+        return None
+    return value
+
+
+def _decision_fable_mode() -> str:
+    mode = normalize_lookup(os.environ.get("AGENT_BROKER_FABLE_MODE") or "on_request").replace(" ", "_")
+    return "default" if mode == "default" else "on_request"
+
+
+_DECISION_EVALUATOR_PROMPT = (
+    "You are the decision evaluator. Check the proposed choice against the evidence and "
+    "constraints. Be short and precise, no preamble, no tools. Return only the JSON object."
+)
+_DECISION_EVALUATOR_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["agree", "modify", "reject"]},
+        "issues": {"type": "array", "maxItems": 3, "items": {"type": "string", "maxLength": 200}},
+        "missing_evidence": {"type": "array", "maxItems": 2, "items": {"type": "string", "maxLength": 200}},
+        "suggested_change": {"type": "string", "maxLength": 300},
+    },
+    "required": ["verdict", "issues", "missing_evidence", "suggested_change"],
+    "additionalProperties": False,
+}
+# Reviews keyed by (decision session key, work_package_id) so the evaluator
+# runs at most once per decision, even across the native-consultation round trip.
+_DECISION_EVALUATOR_REVIEWS: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def _render_decision_brief_compact(brief: Mapping[str, Any]) -> str:
+    lines = [f"Decision: {brief.get('decision')}"]
+    if brief.get("proposed_choice"):
+        lines.append(f"Proposed choice: {brief['proposed_choice']}")
+    for label, field in (("Constraints", "constraints"), ("Questions", "questions"), ("Uncertainties", "uncertainties")):
+        values = brief.get(field) or []
+        if values:
+            lines.append(f"{label}: " + " | ".join(str(item) for item in values))
+    options = brief.get("options") or []
+    if options:
+        lines.append("Options: " + " | ".join(f"{item['id']}: {item['summary']}" for item in options))
+    for item in brief.get("evidence") or []:
+        text = f"Evidence {item['ref']}: {item['claim']}"
+        if item.get("excerpt"):
+            text += f" [{item['excerpt']}]"
+        lines.append(text)
+    return "\n".join(lines)
+
+
+def _validated_evaluator_review(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(value, dict):
+        return None
+    verdict = normalize_lookup(value.get("verdict"))
+    if verdict not in {"agree", "modify", "reject"}:
+        return None
+    suggested = value.get("suggested_change")
+    if not isinstance(suggested, str):
+        return None
+    lists: dict[str, list[str]] = {}
+    for field, maximum in (("issues", 3), ("missing_evidence", 2)):
+        raw_list = value.get(field)
+        if not isinstance(raw_list, list) or not all(isinstance(item, str) for item in raw_list):
+            return None
+        lists[field] = [item.strip()[:200] for item in raw_list[:maximum]]
+    return {
+        "verdict": verdict,
+        "issues": lists["issues"],
+        "missing_evidence": lists["missing_evidence"],
+        "suggested_change": suggested.strip()[:300],
+    }
+
+
+def _compact_evaluator_review(review: Mapping[str, Any]) -> str:
+    text = json.dumps(dict(review), ensure_ascii=False, separators=(",", ":"))
+    if len(text) > DECISION_EVALUATOR_REVIEW_MAX_CHARS:
+        text = text[: DECISION_EVALUATOR_REVIEW_MAX_CHARS - 3].rstrip() + "..."
+    return text
+
+
+def _decision_evaluator_timeout() -> int:
+    """Background cap for the evaluator worker: env override, clamped to [240, 10800]."""
+    try:
+        requested = int(str(os.environ.get("AGENT_BROKER_DECISION_EVALUATOR_TIMEOUT") or "").strip() or 0)
+    except (TypeError, ValueError):
+        requested = 0
+    if requested <= 0:
+        requested = DECISION_EVALUATOR_DEFAULT_TIMEOUT_SECONDS
+    return max(DECISION_EVALUATOR_MIN_TIMEOUT_SECONDS, min(requested, DECISION_EVALUATOR_MAX_TIMEOUT_SECONDS))
+
+
+def _run_decision_evaluator(
+    model: str, brief: Mapping[str, Any], *, package_id: str, complexity: str, timeout: int | None = None
+) -> dict[str, Any]:
+    """One Antigravity CLI advice-mode pass over the normalized brief. No file staging:
+    the CLI runs in a fresh empty temp directory removed afterwards. Only the detached
+    evaluator worker calls this (never inline inside consult_decision).
+
+    Returns {"status": "completed", "review": {...}} or an error-shaped dict
+    ({"status": "error", "response": text}) that _decision_failure_kind can
+    classify for the availability latches."""
+    config = load_config()
+    cli = discover_antigravity_cli(config)
+    if not cli:
+        return {
+            "status": "error",
+            "response": "Antigravity CLI was not found; the decision evaluator was not run.",
+        }
+    if timeout is None:
+        timeout = _decision_evaluator_timeout()
+    timeout = max(30, int(timeout))
+    prompt = (
+        _DECISION_EVALUATOR_PROMPT
+        + f"\nLineage: {package_id}; complexity: {complexity}.\n\n"
+        + _render_decision_brief_compact(brief)
+    )
+    command = [
+        cli, "--model", str(model),
+        "--dangerously-skip-permissions",
+        "--output-format", "json",
+        "--json-schema", json.dumps(_DECISION_EVALUATOR_SCHEMA, separators=(",", ":"), ensure_ascii=True),
+        "--print-timeout", f"{timeout}s",
+        "--print", prompt,
+    ]
+    workdir = tempfile.mkdtemp(prefix="decision-evaluator-")
+    try:
+        code, stdout, stderr = run_process(command, workdir, None, timeout=timeout + 30)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "response": f"{type(exc).__name__}: {exc}"[:600]}
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    if code == 124:
+        return {"status": "error", "response": f"Decision evaluator timed out after {timeout}s."}
+    if code != 0:
+        detail = (stderr or stdout or "").strip()
+        return {"status": "error", "response": f"CLI exited with code {code}: {detail}"[:600]}
+    raw = (stdout or stderr or "").strip()
+    try:
+        outer = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return {"status": "error", "response": f"Decision evaluator returned invalid JSON ({exc})."}
+    if isinstance(outer, dict) and outer.get("status") and str(outer.get("status")).upper() != "SUCCESS":
+        # Keep the CLI's own error text (quota, plan, model not found) so _decision_failure_kind
+        # can classify it for the availability latches instead of a generic schema failure.
+        detail = str(outer.get("error") or outer.get("response") or outer.get("status"))
+        return {"status": "error", "response": f"Decision evaluator CLI status {outer.get('status')}: {detail}"[:600]}
+    candidate = outer.get("structured_output") if isinstance(outer, dict) else None
+    review = _validated_evaluator_review(candidate if candidate is not None else outer)
+    if review is None:
+        return {"status": "error", "response": "Decision evaluator output failed schema validation."}
+    result: dict[str, Any] = {"status": "completed", "review": review}
+    attested = (outer.get("model") or outer.get("model_id")) if isinstance(outer, dict) else None
+    if attested:
+        result["actual_model"] = attested
+        result["model_attested"] = normalize_lookup(str(attested)) == normalize_lookup(model)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Persisted evaluator reviews + detached background worker. A paid evaluator run is
+# never thrown away: a finished review is written to disk (survives an MCP restart),
+# and the run itself happens in a detached worker (the flash_requests row machinery,
+# task_kind=decision_evaluator) polled through request_result -- never inline.
+# ---------------------------------------------------------------------------
+_DECISION_EVALUATOR_LOCK = threading.Lock()
+
+
+def _decision_evaluator_reuse_seconds() -> float:
+    try:
+        hours = float(str(os.environ.get("AGENT_BROKER_DECISION_EVALUATOR_REUSE_HOURS") or "").strip() or 0)
+    except (TypeError, ValueError):
+        hours = 0.0
+    if hours <= 0:
+        hours = DECISION_EVALUATOR_DEFAULT_REUSE_HOURS
+    return hours * 3600.0
+
+
+def _decision_evaluator_dir(session_key: str) -> Path:
+    home = os.environ.get("AGENT_BROKER_HOME")
+    base = Path(home) if home else Path.home() / ".agent-broker"
+    digest = hashlib.sha256(str(session_key).encode("utf-8")).hexdigest()[:16]
+    return base / "decision-evaluator" / digest
+
+
+def _decision_evaluator_review_path(session_key: str, package_id: str) -> Path:
+    return _decision_evaluator_dir(session_key) / f"{safe_slug(package_id)}.json"
+
+
+def _decision_evaluator_failure_path(session_key: str, package_id: str) -> Path:
+    return _decision_evaluator_dir(session_key) / "failed" / f"{safe_slug(package_id)}.json"
+
+
+def _decision_evaluator_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        tmp.write_text(json.dumps(dict(payload), ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _decision_evaluator_read_fresh(path: Path) -> dict[str, Any] | None:
+    """A stored JSON record younger than the reuse window, else None."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    created = _iso_epoch(data.get("created_at"))
+    if created is None:
+        try:
+            created = int(path.stat().st_mtime)
+        except OSError:
+            return None
+    if time.time() - created > _decision_evaluator_reuse_seconds():
+        return None
+    return data
+
+
+def _decision_evaluator_store_review(
+    session_key: str, package_id: str, model: str, review: Mapping[str, Any]
+) -> dict[str, Any]:
+    text = _compact_evaluator_review(review)
+    payload = {
+        "work_package_id": package_id,
+        "model": model,
+        "created_at": utc_now(),
+        "review": dict(review),
+        "text": text,
+    }
+    _decision_evaluator_write_json(_decision_evaluator_review_path(session_key, package_id), payload)
+    _decision_evaluator_clear_failure(session_key, package_id)
+    return payload
+
+
+def _decision_evaluator_load_review(session_key: str, package_id: str) -> dict[str, Any] | None:
+    """In-memory dict first, then the persisted file. Returns {"entry", "text"} or None."""
+    cached = _DECISION_EVALUATOR_REVIEWS.get((session_key, package_id))
+    if cached:
+        return cached
+    data = _decision_evaluator_read_fresh(_decision_evaluator_review_path(session_key, package_id))
+    if not data:
+        return None
+    review = _validated_evaluator_review(data.get("review"))
+    if review is None:
+        return None
+    text = _compact_evaluator_review(review)
+    entry = {
+        "target": "antigravity",
+        "lane": "switchboard_evaluator",
+        "resolved_model": str(data.get("model") or DECISION_EVALUATOR_DEFAULT_MODEL),
+        "status": "completed",
+        "response": text,
+    }
+    stored = {"entry": entry, "text": text}
+    _DECISION_EVALUATOR_REVIEWS[(session_key, package_id)] = stored
+    return stored
+
+
+def _decision_evaluator_store_failure(
+    session_key: str, package_id: str, model: str, response: str, request_id: str | None = None
+) -> None:
+    # A review always wins over a failure marker.
+    if _decision_evaluator_read_fresh(_decision_evaluator_review_path(session_key, package_id)):
+        return
+    _decision_evaluator_write_json(
+        _decision_evaluator_failure_path(session_key, package_id),
+        {
+            "work_package_id": package_id,
+            "model": model,
+            "created_at": utc_now(),
+            "status": "error",
+            "response": str(response)[:600],
+            "request_id": request_id,
+        },
+    )
+
+
+def _decision_evaluator_load_failure(session_key: str, package_id: str) -> dict[str, Any] | None:
+    return _decision_evaluator_read_fresh(_decision_evaluator_failure_path(session_key, package_id))
+
+
+def _decision_evaluator_clear_failure(session_key: str, package_id: str) -> None:
+    try:
+        _decision_evaluator_failure_path(session_key, package_id).unlink()
+    except OSError:
+        pass
+
+
+def _decision_evaluator_poll(request_id: str) -> dict[str, Any]:
+    return {"tool": "request_result", "request_id": request_id, "wait_seconds": 180}
+
+
+def _decision_evaluator_active_row(session_key: str, package_id: str) -> dict[str, Any] | None:
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM flash_requests WHERE task_kind = ? AND work_package_id = ? "
+                "AND status IN ('queued', 'running') ORDER BY created_at",
+                (DECISION_EVALUATOR_TASK_KIND, package_id),
+            ).fetchall()
+        ]
+    for row in rows:
+        if _flash_row_args(row).get("session_key") == session_key:
+            return row
+    return None
+
+
+def _decision_evaluator_finalize(
+    row: Mapping[str, Any], status: str, payload: Mapping[str, Any]
+) -> bool:
+    rid = str(row.get("id") or "")
+    envelope = dict(payload)
+    envelope.update(
+        {
+            "request_id": rid,
+            "work_package_id": row.get("work_package_id"),
+            "task_kind": DECISION_EVALUATOR_TASK_KIND,
+            "receipt": row.get("receipt"),
+        }
+    )
+    error = None if status == "completed" else str(payload.get("response") or "")[:600]
+    return _flash_finalize_row(
+        rid, status, json.dumps(envelope, ensure_ascii=False, default=str), error, None,
+        str(row.get("target_model") or "") or None,
+    )
+
+
+def _decision_evaluator_fail_row(row: Mapping[str, Any], reason: str) -> None:
+    """Terminal failure: persist the marker (so nothing restarts the run automatically),
+    then close the request row."""
+    args = _flash_row_args(row)
+    try:
+        _decision_evaluator_store_failure(
+            str(args.get("session_key") or ""), str(row.get("work_package_id") or ""),
+            str(row.get("target_model") or ""), reason, str(row.get("id") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"decision evaluator failure marker write failed: {exc}")
+    _decision_evaluator_finalize(row, "error", {"status": "error", "response": reason, "outcome": "evaluator_failed"})
+
+
+def _refresh_decision_evaluator_request(row: dict[str, Any]) -> dict[str, Any]:
+    """Polled-time stale detection for an evaluator row (dead/overdue worker, never started)."""
+    if row.get("response") or is_terminal_state(row.get("status")):
+        return row
+    status = str(row.get("status") or "").strip().lower()
+    now_epoch = _iso_epoch(utc_now()) or int(time.time())
+    timeout = int(row.get("timeout_seconds") or DECISION_EVALUATOR_DEFAULT_TIMEOUT_SECONDS)
+    reason = ""
+    if status == "running":
+        started = _iso_epoch(row.get("worker_started_at")) or _iso_epoch(row.get("created_at")) or now_epoch
+        elapsed = now_epoch - started
+        if elapsed > timeout + FLASH_ASYNC_STALE_GRACE_SECONDS:
+            reason = f"Decision evaluator timed out after {timeout} seconds (background cap)."
+            _kill_pid_tree(row.get("worker_pid"))
+        elif row.get("worker_pid") and elapsed >= 5 and not _pid_alive(row.get("worker_pid")):
+            reason = f"Decision evaluator worker (pid {row.get('worker_pid')}) died before recording a result."
+    elif status in {"queued", "notified"}:
+        created = _iso_epoch(row.get("created_at")) or now_epoch
+        if now_epoch - created > FLASH_ASYNC_QUEUED_STALE_SECONDS:
+            reason = "Decision evaluator worker never started for this queued request."
+    if not reason:
+        return row
+    session_key = str(_flash_row_args(row).get("session_key") or "")
+    package_id = str(row.get("work_package_id") or "")
+    if _decision_evaluator_read_fresh(_decision_evaluator_review_path(session_key, package_id)):
+        # The worker persisted its review before dying: nothing was lost.
+        _decision_evaluator_finalize(
+            row, "completed", {"status": "ok", "response": "review persisted", "outcome": "evaluator_completed"}
+        )
+    else:
+        _decision_evaluator_fail_row(row, reason)
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        updated = conn.execute("SELECT * FROM flash_requests WHERE id = ?", (row.get("id"),)).fetchone()
+    return dict(updated) if updated else row
+
+
+def queue_decision_evaluator(
+    model: str, brief: Mapping[str, Any], *, session_key: str, package_id: str, complexity: str
+) -> dict[str, Any]:
+    """Find the queued/running evaluator worker for (session_key, package_id) or start one.
+
+    Returns {"request_id", "reused", "started"} or {"failed": True, "reason"} when the
+    worker could not be started or already ended (a failure marker is persisted)."""
+    init_db()
+    with _DECISION_EVALUATOR_LOCK:
+        existing = _decision_evaluator_active_row(session_key, package_id)
+        if existing:
+            existing = _refresh_flash_request(existing)
+            if not is_terminal_state(existing.get("status")):
+                return {"request_id": existing["id"], "reused": True, "started": False}
+            return {
+                "failed": True,
+                "reason": str(existing.get("error") or "Decision evaluator worker ended without a review."),
+            }
+        timeout = _decision_evaluator_timeout()
+        request_id = str(uuid.uuid4())
+        receipt = f"broker:{request_id}"
+        stored_args = {
+            "session_key": session_key,
+            "model": model,
+            "brief": dict(brief),
+            "complexity": complexity,
+            "timeout_seconds": timeout,
+            "caller": os.environ.get("AGENT_BROKER_CALLER") or _MCP_CLIENT_NAME or "",
+        }
+        project_info = resolve_project(None)
+        with db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO flash_requests (
+                    id, project, root_path, topic, prompt, status, created_by, created_at,
+                    target_model, strict_model, task_kind, mode, work_package_id, receipt,
+                    timeout_seconds, write_paths, args_json
+                ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, 1, ?, 'plan', ?, ?, ?, '[]', ?)
+                """,
+                (
+                    request_id, project_info.name, project_info.root_path, "decision-evaluator",
+                    f"decision evaluator for {package_id}",
+                    os.environ.get("AGENT_BROKER_CALLER") or "mcp-client", utc_now(), model,
+                    DECISION_EVALUATOR_TASK_KIND, package_id, receipt, timeout,
+                    json.dumps(stored_args, ensure_ascii=False, default=str),
+                ),
+            )
+        worker = start_flash_request_worker(request_id)
+    if worker.get("started"):
+        return {"request_id": request_id, "reused": False, "started": True, "timeout_seconds": timeout}
+    reason = f"Decision evaluator worker did not start: {worker.get('reason') or 'unknown'}"
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM flash_requests WHERE id = ?", (request_id,)).fetchone()
+    if row and not is_terminal_state(row["status"]):
+        _decision_evaluator_fail_row(dict(row), reason)
+    else:
+        _decision_evaluator_store_failure(session_key, package_id, model, reason, request_id)
+    return {"failed": True, "reason": reason}
+
+
+def run_decision_evaluator_worker(request_id: str) -> dict[str, Any]:
+    """Detached-worker body: run the advice-mode agy call (empty temp cwd, strict schema)
+    with the row's background cap and persist the review BEFORE reporting success."""
+    init_db()
+    rid = str(request_id or "").strip()
+    if not rid:
+        raise ValueError("request_id is required")
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        found = conn.execute("SELECT * FROM flash_requests WHERE id = ?", (rid,)).fetchone()
+        if not found:
+            raise ValueError(f"unknown decision evaluator request: {rid}")
+        row = dict(found)
+        if row.get("response") or is_terminal_state(row.get("status")):
+            return {"id": rid, "status": row.get("status"), "skipped": True, "reason": "already terminal"}
+        conn.execute(
+            "UPDATE flash_requests SET status = 'running', "
+            "worker_started_at = COALESCE(worker_started_at, ?), worker_pid = ? WHERE id = ?",
+            (utc_now(), os.getpid(), rid),
+        )
+    args = _flash_row_args(row)
+    session_key = str(args.get("session_key") or "")
+    package_id = str(row.get("work_package_id") or "")
+    model = str(args.get("model") or row.get("target_model") or DECISION_EVALUATOR_DEFAULT_MODEL)
+    try:
+        timeout = max(
+            DECISION_EVALUATOR_MIN_TIMEOUT_SECONDS,
+            min(
+                int(row.get("timeout_seconds") or DECISION_EVALUATOR_DEFAULT_TIMEOUT_SECONDS),
+                DECISION_EVALUATOR_MAX_TIMEOUT_SECONDS,
+            ),
+        )
+        raw = _run_decision_evaluator(
+            model, args.get("brief") or {}, package_id=package_id,
+            complexity=str(args.get("complexity") or "bounded"), timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raw = {"status": "error", "response": f"{type(exc).__name__}: {exc}"[:600]}
+    review = _validated_evaluator_review(raw.get("review")) if raw.get("status") == "completed" else None
+    if review is None:
+        reason = str(raw.get("response") or raw.get("error") or "Decision evaluator produced no review.")
+        _decision_evaluator_fail_row(row, reason)
+        return {"id": rid, "status": "error", "error": reason[:600]}
+    try:
+        _decision_evaluator_store_review(session_key, package_id, model, review)
+    except Exception as exc:  # noqa: BLE001
+        reason = f"Decision evaluator review could not be persisted: {type(exc).__name__}: {exc}"
+        _decision_evaluator_fail_row(row, reason)
+        return {"id": rid, "status": "error", "error": reason[:600]}
+    _decision_evaluator_finalize(
+        row, "completed",
+        {
+            "status": "ok", "response": _compact_evaluator_review(review), "outcome": "evaluator_completed",
+            "actual_model": raw.get("actual_model"), "model_attested": raw.get("model_attested"),
+        },
+    )
+    return {"id": rid, "status": "completed"}
+
+
+def _refresh_gemini_consult_request(row: dict[str, Any]) -> dict[str, Any]:
+    """Polled-time stale detection for a gemini_consult row (dead/overdue worker, never started)."""
+    if row.get("response") or is_terminal_state(row.get("status")):
+        return row
+    status = str(row.get("status") or "").strip().lower()
+    now_epoch = _iso_epoch(utc_now()) or int(time.time())
+    timeout = int(row.get("timeout_seconds") or GEMINI_CONSULT_DEFAULT_TIMEOUT_SECONDS)
+    reason = ""
+    if status == "running":
+        started = _iso_epoch(row.get("worker_started_at")) or _iso_epoch(row.get("created_at")) or now_epoch
+        elapsed = now_epoch - started
+        if elapsed > timeout + FLASH_ASYNC_STALE_GRACE_SECONDS:
+            reason = f"Gemini consult timed out after {timeout} seconds (background cap)."
+            _kill_pid_tree(row.get("worker_pid"))
+        elif row.get("worker_pid") and elapsed >= 5 and not _pid_alive(row.get("worker_pid")):
+            reason = f"Gemini consult worker (pid {row.get('worker_pid')}) died before recording a result."
+    elif status in {"queued", "notified"}:
+        created = _iso_epoch(row.get("created_at")) or now_epoch
+        if now_epoch - created > FLASH_ASYNC_QUEUED_STALE_SECONDS:
+            reason = "Gemini consult worker never started for this queued request."
+    if not reason:
+        return row
+    now = utc_now()
+    with db_connect() as conn:
+        conn.execute(
+            """
+            UPDATE flash_requests
+            SET status = 'error', error = ?, response = ?, completed_at = ?,
+                worker_completed_at = COALESCE(worker_completed_at, ?)
+            WHERE id = ? AND response IS NULL
+              AND status NOT IN ('completed','error','cancelled','canceled','expired','failed')
+            """,
+            (reason, reason, now, now, row.get("id")),
+        )
+        conn.row_factory = sqlite3.Row
+        updated = conn.execute("SELECT * FROM flash_requests WHERE id = ?", (row.get("id"),)).fetchone()
+    return dict(updated) if updated else row
+
+
+def queue_gemini_consult(args: dict[str, Any]) -> dict[str, Any]:
+    init_db()
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        raise ValueError("prompt is required")
+    project_arg = args.get("project")
+    project_info = resolve_project(str(project_arg) if project_arg is not None else None)
+    topic_arg = str(args.get("topic") or "").strip() or None
+    mode = str(args.get("mode") or "read-only")
+    task_kind = normalize_task_kind(args.get("task_kind"))
+    token_budget = int(args.get("token_budget") or TASK_BUDGETS.get(task_kind, TASK_BUDGETS["consult"]))
+    requested_model = args.get("target_model") or args.get("model_name") or args.get("model")
+    requested_effort = args.get("effort") or args.get("reasoning_effort")
+    resolved_model, effort = resolve_cli_model_and_effort(
+        "gemini", requested_model, requested_effort
+    )
+    if task_kind != "consult" or args.get("include_task_contract", True) is not False:
+        prompt = wrap_task_prompt(prompt, task_kind, token_budget)
+    if topic_arg and args.get("include_context_pack", True) is not False:
+        pack = get_context_pack(project_info.name, topic_arg, DEFAULT_CONTEXT_BUDGET)["content"]
+        prompt = f"Shared context pack for this topic:\n\n{pack}\n\nCurrent request:\n\n{prompt}"
+
+    timeout_seconds = bounded_gemini_consult_timeout(args.get("timeout_seconds"))
+    request_id = str(uuid.uuid4())
+    receipt = f"broker:{request_id}"
+    now = utc_now()
+    created_by = os.environ.get("AGENT_BROKER_CALLER") or _MCP_CLIENT_NAME or "mcp-client"
+    stored_args = {
+        "project": project_info.name,
+        "root_path": project_info.root_path,
+        "topic": topic_arg,
+        "prompt": prompt,
+        "mode": mode,
+        "model": resolved_model,
+        "effort": effort,
+        "task_kind": task_kind,
+        "token_budget": token_budget,
+        "timeout_seconds": timeout_seconds,
+        "caller": created_by,
+        "max_response_chars": args.get("max_response_chars"),
+    }
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO flash_requests (
+                id, project, root_path, topic, prompt, status, created_by, created_at,
+                target_model, strict_model, task_kind, mode, work_package_id, receipt,
+                timeout_seconds, write_paths, args_json
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, 1, ?, ?, ?, ?, ?, '[]', ?)
+            """,
+            (
+                request_id,
+                project_info.name,
+                project_info.root_path,
+                topic_arg,
+                prompt,
+                created_by,
+                now,
+                resolved_model,
+                GEMINI_CONSULT_TASK_KIND,
+                mode,
+                f"gemini-{request_id[:8]}",
+                receipt,
+                timeout_seconds,
+                json.dumps(stored_args, ensure_ascii=False, default=str),
+            ),
+        )
+    worker = start_flash_request_worker(request_id)
+    return {
+        "id": request_id,
+        "request_id": request_id,
+        "status": "running" if worker.get("started") else "queued",
+        "async_worker": worker,
+        "receipt": receipt,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def run_gemini_consult_worker(request_id: str) -> dict[str, Any]:
+    """Detached-worker body: run consult_gemini with the background cap and persist
+    the response on the flash_requests row before reporting success."""
+    init_db()
+    rid = str(request_id or "").strip()
+    if not rid:
+        raise ValueError("request_id is required")
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        found = conn.execute("SELECT * FROM flash_requests WHERE id = ?", (rid,)).fetchone()
+        if not found:
+            raise ValueError(f"unknown gemini consult request: {rid}")
+        data = dict(found)
+        if data.get("response") or is_terminal_state(data.get("status")):
+            return {"id": rid, "status": data.get("status"), "skipped": True, "reason": "already terminal"}
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE flash_requests
+            SET status = 'running', worker_started_at = COALESCE(worker_started_at, ?), worker_pid = ?
+            WHERE id = ?
+            """,
+            (now, os.getpid(), rid),
+        )
+    args = _flash_row_args(data)
+    cap = bounded_gemini_consult_timeout(data.get("timeout_seconds"))
+    project_root = data.get("root_path") or data.get("project")
+    prompt = data.get("prompt") or ""
+    mode = data.get("mode") or "read-only"
+    model = args.get("model") or data.get("target_model")
+    started_at = utc_now()
+    try:
+        response = consult_gemini(project_root, prompt, mode=mode, model_name=model, timeout=cap)
+    except Exception as exc:  # noqa: BLE001
+        response = f"Gemini consult worker failed: {type(exc).__name__}: {exc}"
+    status = "error" if response.startswith(CONSULT_FAILURE_PREFIXES) else "ok"
+    error = response if status == "error" else None
+    responder_model = f"gemini:{model}" if model else "gemini"
+    terminal_status = "completed" if status == "ok" else "error"
+    envelope = {
+        "status": status,
+        "response": response,
+        "model": responder_model,
+        "project": data.get("project"),
+        "root_path": project_root,
+        "mode": mode,
+        "request_id": rid,
+        "task_kind": GEMINI_CONSULT_TASK_KIND,
+    }
+    full = json.dumps(envelope, ensure_ascii=False, default=str)
+    response_ref = None
+    try:
+        response_ref = store_shared_context(
+            data.get("project"), data.get("topic"), full, f"gemini_consult:{rid}",
+            "gemini_consult_result", None, redact=False,
+        ).get("ref")
+    except Exception as exc:  # noqa: BLE001
+        log(f"gemini consult result stash failed for {rid}: {exc}")
+    _flash_finalize_row(rid, terminal_status, full, error, response_ref, responder_model)
+    try:
+        store_consultation(
+            ProjectInfo(data.get("project") or "", project_root or str(Path.cwd())),
+            responder_model,
+            mode,
+            prompt,
+            response,
+            status,
+            error,
+            started_at,
+            request_id=rid,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"gemini consult store_consultation failed for {rid}: {exc}")
+    return {"id": rid, "status": terminal_status}
 
 
 def _decision_session_key(args: dict[str, Any], host_family: str) -> str:
@@ -9216,8 +10163,89 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
     native_value = args.get("native_consultation")
     consultations: list[dict[str, Any]] = []
     notices: list[str] = []
+    fable_enabled = args.get("include_fable") is True or _decision_fable_mode() == "default"
+    evaluator_model = _decision_evaluator_model()
+    review_key = (session_key, package_id)
+    review_text: str | None = None
+    evaluator_pending: dict[str, Any] | None = None
+    stored_review = _decision_evaluator_load_review(session_key, package_id)
+    if stored_review:
+        consultations.append(dict(stored_review["entry"]))
+        review_text = stored_review["text"]
+        if evaluator_model is not None:
+            _FLAGSHIP_AVAILABILITY_LATCHES.pop((session_key, "antigravity", normalize_lookup(evaluator_model)), None)
+
+    def run_evaluator() -> None:
+        """Evaluator leg: reuse the stored review, else follow/start the background worker.
+        Never runs agy inline; at most one paid run per (session, work package)."""
+        nonlocal review_text, evaluator_pending
+        if review_text is not None or evaluator_model is None:
+            return
+        if host_family == "gemini" and (
+            normalize_lookup(host_model) == normalize_lookup(evaluator_model)
+            or _decision_same_model("gemini", host_model, "gemini", evaluator_model)
+        ):
+            return
+        key = (session_key, "antigravity", normalize_lookup(evaluator_model))
+        active, void_notice = _latch_active(key)
+        if void_notice:
+            notices.append(void_notice)
+        entry: dict[str, Any] = {
+            "target": "antigravity",
+            "lane": "switchboard_evaluator",
+            "resolved_model": evaluator_model,
+        }
+        if active and not retry_unavailable:
+            latch = _FLAGSHIP_AVAILABILITY_LATCHES.get(key) or {}
+            reason = latch.get("reason") or "provider unavailable for this session"
+            entry["status"] = latch.get("status") or "skipped_unavailable"
+            entry["response"] = str(reason)[:300]
+            consultations.append(entry)
+            notices.append(f"Skipped antigravity:{evaluator_model}: {reason}.")
+            return
+        marker = _decision_evaluator_load_failure(session_key, package_id)
+        if marker is not None and retry_unavailable:
+            _decision_evaluator_clear_failure(session_key, package_id)
+            marker = None
+        raw: dict[str, Any] | None = None
+        if marker is not None:
+            raw = {"status": "error", "response": str(marker.get("response") or "evaluator failed")}
+        else:
+            try:
+                queued = queue_decision_evaluator(
+                    evaluator_model, brief, session_key=session_key, package_id=package_id, complexity=complexity
+                )
+            except Exception as exc:  # noqa: BLE001
+                queued = {"failed": True, "reason": f"{type(exc).__name__}: {exc}"[:600]}
+            if queued.get("failed"):
+                raw = {"status": "error", "response": str(queued.get("reason") or "evaluator failed")}
+            else:
+                request_id = str(queued["request_id"])
+                entry["status"] = "pending"
+                entry["request_id"] = request_id
+                entry["poll"] = _decision_evaluator_poll(request_id)
+                consultations.append(entry)
+                evaluator_pending = entry
+                return
+        failure, should_latch, kind = _decision_failure_kind(raw)
+        status = failure or "failed"
+        error = str(raw.get("response") or raw.get("error") or status)
+        entry["status"] = status
+        entry["response"] = error[:300]
+        consultations.append(entry)
+        notices.append(
+            f"Decision evaluator antigravity:{evaluator_model} ({status}) did not produce a review; "
+            "continuing to the final verdict."
+        )
+        if should_latch:
+            _set_flagship_latch(key, kind or "plan", status, error)
 
     def needs_native_result(candidate: dict[str, str], fallback_from: str | None = None) -> dict[str, Any]:
+        adviser_instructions = _DECISION_ADVISER_INSTRUCTIONS
+        if review_text and candidate["family"] == "codex":
+            adviser_instructions += (
+                f" Evaluator review (Gemini 4): {review_text} You give the final verdict."
+            )
         native_request: dict[str, Any] = {
             "lane": "native_same_vendor",
             "mechanism": "host_native_subagent",
@@ -9226,7 +10254,7 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
             "effort": effort,
             "work_package_id": package_id,
             "max_summary_chars": DECISION_ADVICE_MAX_CHARS,
-            "adviser_instructions": _DECISION_ADVISER_INSTRUCTIONS,
+            "adviser_instructions": adviser_instructions,
             "max_prompt_bytes": decision_limits["provider_prompt_bytes"],
             "return_contract": {
                 "family": candidate["family"],
@@ -9268,9 +10296,45 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
         _cap_decision_result(result, max_bytes=decision_limits["combined_bytes"])
         return result
 
+    def pending_evaluator_result() -> dict[str, Any]:
+        assert evaluator_pending is not None
+        request_id = evaluator_pending["request_id"]
+        result = {
+            "status": "pending",
+            "policy_version": DECISION_POLICY_VERSION,
+            "work_package_id": package_id,
+            "host": {"vendor": host_family, "model": host_model},
+            "decision_session_key": session_key,
+            "session_id": session_key,
+            "complexity": complexity,
+            "complexity_escalated": complexity_escalated,
+            "consultations": list(consultations),
+            "handoff_notices": list(dict.fromkeys(notices)),
+            "completion_notice": (
+                "The Gemini evaluator is running in the background (it can take many minutes). "
+                f'Poll request_result(request_id="{request_id}", wait_seconds=180) until it is terminal, '
+                "then call consult_decision again with the same work_package_id and brief"
+                + (" and your native_consultation" if native_value is not None else "")
+                + " to continue. Do not re-run the evaluator or start another consultation meanwhile."
+            ),
+            "authoritative": False,
+            "decision_owner": "host",
+            "prompt_budget": prompt_budget,
+        }
+        if budget_reason:
+            result["budget_reason"] = budget_reason
+        _record_decision_result(args, result, [item["status"] for item in consultations])
+        _cap_decision_result(result, max_bytes=decision_limits["combined_bytes"])
+        return result
+
     native_completed = False
-    if native_capable:
+    run_native = native_capable and (host_family == "codex" or fable_enabled or native_value is not None)
+    if run_native:
         if native_value is None:
+            if host_family == "codex":
+                run_evaluator()
+                if evaluator_pending is not None:
+                    return pending_evaluator_result()
             candidate = _next_chain_candidate(host_family, host_model, session_key, retry_unavailable)
             if candidate:
                 return needs_native_result(candidate)
@@ -9336,9 +10400,15 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
     elif native_value is not None:
         raise ValueError("native_consultation is not expected for this host model")
 
+    if host_family != "codex":
+        run_evaluator()
+        if evaluator_pending is not None:
+            return pending_evaluator_result()
     targets = decision_consult_targets(host_family, host_model, complexity)
-    if native_capable and complexity == "bounded" and native_completed:
+    if host_family == "codex" and complexity == "bounded" and native_completed:
         targets = []
+    if not fable_enabled:
+        targets = [item for item in targets if item["family"] != "claude"]
 
     for target in targets:
         family = target["family"]
@@ -9371,10 +10441,19 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
                 attempt_model = _chain_model_after(chain, attempt_model)
                 continue
 
+            leg_prompt = prompt
+            if family == "codex" and review_text:
+                reviewed_prompt = (
+                    prompt + f"\nEvaluator review (Gemini 4): {review_text}\nGive the final verdict."
+                )
+                if len(reviewed_prompt.encode("utf-8")) <= decision_limits["provider_prompt_bytes"]:
+                    leg_prompt = reviewed_prompt
+                else:
+                    notices.append("Evaluator review omitted from the final prompt: provider prompt budget exceeded.")
             call_args: dict[str, Any] = {
                 "project": args.get("project"),
                 "topic": args.get("topic"),
-                "prompt": prompt,
+                "prompt": leg_prompt,
                 "target_model": attempt_model,
                 "effort": effort,
                 "task_kind": "consult",
@@ -9384,7 +10463,7 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
                 "max_response_chars": response_chars,
                 "_decision_internal_token": _DECISION_INTERNAL_TOKEN,
             }
-            if family == "claude" and effort in {"xhigh", "max"}:
+            if family == "claude":
                 call_args["async"] = True
                 call_args["new_chat"] = True
             if family == "codex" and truthy(args.get("outbound_reviewed")):
@@ -9445,6 +10524,21 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
                 attempt_model = _chain_model_after(chain, attempt_model)
                 continue
 
+    host_is_final = host_family == "codex" and not _chain_candidates_for_host(
+        native_chain, host_family, host_model
+    )
+    if review_text and not host_is_final:
+        verdict_given = any(
+            item.get("target") in {"codex", "claude"} and item.get("status") in {"completed", "pending"}
+            for item in consultations
+        )
+        if not verdict_given:
+            notices.append(DECISION_FINAL_UNAVAILABLE_NOTICE)
+
+    if host_family == "claude":
+        # A review picked up from the store sits first; keep the native Fable leg ahead of it,
+        # as when the evaluator used to run inline after the native leg.
+        consultations.sort(key=lambda item: 0 if item.get("lane") == "native_same_vendor" else 1)
     statuses = [item["status"] for item in consultations]
     overall = _decision_overall_status(statuses)
     result: dict[str, Any] = {
@@ -9565,22 +10659,34 @@ def topic_work_memory_section(
     topic: str | None,
     limit: int = DEFAULT_WORK_MEMORY_LIMIT,
     budget_chars: int = DEFAULT_WORK_MEMORY_BUDGET_CHARS,
+    name_set: Iterable[str] | None = None,
 ) -> str:
     limit = max(1, min(int(limit or DEFAULT_WORK_MEMORY_LIMIT), 50))
-    params: list[Any] = [project_info.name, project_info.root_path]
-    topic_filter = ""
-    if topic:
-        topic_filter = "AND topic = ?"
-        params.append(topic)
-    params.append(limit)
+    if name_set:
+        name_list = list(name_set)
+        placeholders = ",".join("?" for _ in name_list)
+        where_clause = f"project IN ({placeholders})"
+        params: list[Any] = list(name_list)
+        if topic:
+            where_clause += " AND topic = ?"
+            params.append(topic)
+        params.append(limit)
+    else:
+        params = [project_info.name, project_info.root_path]
+        topic_filter = ""
+        if topic:
+            topic_filter = "AND topic = ?"
+            params.append(topic)
+        params.append(limit)
+        where_clause = f"(lower(project) = lower(?) OR root_path = ?) {topic_filter}"
+
     with db_connect() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             f"""
             SELECT id, agent, event_type, summary, details, created_at
             FROM agent_events
-            WHERE (lower(project) = lower(?) OR root_path = ?)
-            {topic_filter}
+            WHERE {where_clause}
             AND event_type NOT IN (
                 'claimed_antigravity_request',
                 'queued_antigravity_request',
@@ -9665,6 +10771,59 @@ def get_context_pack(project: str | None, topic: str | None = None, budget: int 
     init_db()
     context_budget = max(1200, min(int(budget or DEFAULT_CONTEXT_BUDGET), 40000))
     project_info = resolve_project(project)
+
+    try:
+        import project_resolver
+        import project_notes
+        registry = project_resolver.load_registry()
+    except Exception:
+        registry = {}
+
+    cid = project_info.name
+    is_registered = bool(registry and cid in registry)
+
+    name_set: set[str] = {cid}
+    if is_registered:
+        entry = registry[cid]
+        other_registered_names: set[str] = set()
+        for other_id, other_entry in registry.items():
+            if other_id != cid:
+                norm_other_id = project_resolver.normalize_name(other_id)
+                if norm_other_id:
+                    other_registered_names.add(norm_other_id)
+                for a in other_entry.aliases:
+                    na = project_resolver.normalize_name(a)
+                    if na:
+                        other_registered_names.add(na)
+                for leg in other_entry.legacy_names:
+                    nl = project_resolver.normalize_name(leg)
+                    if nl:
+                        other_registered_names.add(nl)
+
+        my_cand_names: set[str] = set()
+        for a in entry.aliases:
+            na = project_resolver.normalize_name(a)
+            if na and na not in other_registered_names:
+                my_cand_names.add(na)
+        for leg in entry.legacy_names:
+            nl = project_resolver.normalize_name(leg)
+            if nl and nl not in other_registered_names:
+                my_cand_names.add(nl)
+
+        try:
+            with db_connect() as conn:
+                stored_projects = [
+                    row[0] for row in conn.execute(
+                        "SELECT DISTINCT project FROM agent_events WHERE project IS NOT NULL"
+                    ).fetchall() if row[0]
+                ]
+            for sp in stored_projects:
+                norm_sp = project_resolver.normalize_name(sp)
+                if norm_sp in my_cand_names or norm_sp == project_resolver.normalize_name(cid):
+                    name_set.add(sp)
+        except Exception:
+            pass
+
     topic_filter = ""
     params: list[Any] = [project_info.name, project_info.root_path]
     if topic:
@@ -9673,17 +10832,35 @@ def get_context_pack(project: str | None, topic: str | None = None, budget: int 
 
     with db_connect() as conn:
         conn.row_factory = sqlite3.Row
-        events = conn.execute(
-            f"""
-            SELECT id, agent, event_type, summary, details, created_at
-            FROM agent_events
-            WHERE (lower(project) = lower(?) OR root_path = ?)
-            {topic_filter}
-            ORDER BY id DESC
-            LIMIT 60
-            """,
-            params,
-        ).fetchall()
+        if is_registered:
+            name_placeholders = ",".join("?" for _ in name_set)
+            event_where = f"project IN ({name_placeholders})"
+            event_params: list[Any] = list(name_set)
+            if topic:
+                event_where += " AND topic = ?"
+                event_params.append(topic)
+            events = conn.execute(
+                f"""
+                SELECT id, agent, event_type, summary, details, created_at
+                FROM agent_events
+                WHERE {event_where}
+                ORDER BY id DESC
+                LIMIT 60
+                """,
+                event_params,
+            ).fetchall()
+        else:
+            events = conn.execute(
+                f"""
+                SELECT id, agent, event_type, summary, details, created_at
+                FROM agent_events
+                WHERE (lower(project) = lower(?) OR root_path = ?)
+                {topic_filter}
+                ORDER BY id DESC
+                LIMIT 60
+                """,
+                params,
+            ).fetchall()
         consultations = conn.execute(
             """
             SELECT consulted_model, mode, prompt, response, status, error, finished_at
@@ -9723,7 +10900,11 @@ def get_context_pack(project: str | None, topic: str | None = None, budget: int 
         "# Agent Switchboard Context Pack",
         "",
         f"Project: {project_info.name}",
-        f"Project path: {project_info.root_path}",
+        (
+            f"Project path: registered project {cid} (use code_graph project={cid})"
+            if is_registered
+            else f"Project path: {project_info.root_path}"
+        ),
         f"Topic: {topic or 'all recent topics'}",
         f"Git: {branch} @ {commit_sha}",
         f"Generated: {utc_now()}",
@@ -9733,7 +10914,41 @@ def get_context_pack(project: str | None, topic: str | None = None, budget: int 
         "",
     ]
 
-    work_memory = topic_work_memory_section(project_info, topic, 10, max(1600, min(5000, context_budget // 3)))
+    if is_registered:
+        brief_full = project_notes.read_cached_full(cid)
+        if brief_full is None:
+            entry = registry[cid]
+            entry_dict = {
+                "aliases": entry.aliases,
+                "group": entry.group,
+                "related": entry.related,
+                "start_here": entry.start_here,
+                "label": entry.label,
+            }
+            cache_res = project_notes.write_cache(cid, entry=entry_dict)
+            brief_full = cache_res.get("full") or ""
+        brief_full = project_notes.sanitize_text(brief_full)
+        max_brief = int(context_budget * 0.4)
+        if len(brief_full) > max_brief:
+            cut = brief_full[:max_brief]
+            last_nl = cut.rfind("\n")
+            if last_nl != -1:
+                brief_full = cut[:last_nl]
+            else:
+                brief_full = cut
+        append_budgeted(lines, "## Project brief", context_budget)
+        for bline in brief_full.strip().splitlines():
+            if not append_budgeted(lines, bline, context_budget):
+                break
+        append_budgeted(lines, "", context_budget)
+
+    work_memory = topic_work_memory_section(
+        project_info,
+        topic,
+        10,
+        max(1600, min(5000, context_budget // 3)),
+        name_set=name_set if is_registered else None,
+    )
     for line in work_memory.strip().splitlines():
         if not append_budgeted(lines, line, context_budget):
             break
@@ -9769,6 +10984,61 @@ def get_context_pack(project: str | None, topic: str | None = None, budget: int 
                     break
     else:
         lines.append("- No recorded topic events yet.")
+
+    if is_registered:
+        target_phrases = {project_resolver.normalize_name(cid)}
+        entry = registry[cid]
+        for a in (entry.aliases + entry.legacy_names):
+            na = project_resolver.normalize_name(a)
+            if na:
+                target_phrases.add(na)
+
+        registered_ids = set(registry.keys())
+        registered_norm_ids = {project_resolver.normalize_name(x) for x in registered_ids}
+
+        try:
+            with db_connect() as conn:
+                conn.row_factory = sqlite3.Row
+                cand_rows = conn.execute(
+                    """
+                    SELECT project, topic, summary
+                    FROM agent_events
+                    WHERE project IS NOT NULL
+                    ORDER BY id DESC
+                    """
+                ).fetchall()
+            seen_pairs: set[tuple[str, str]] = set()
+            related_lines: list[str] = []
+            for r in cand_rows:
+                p = str(r["project"] or "").strip()
+                t = str(r["topic"] or "").strip()
+                s = str(r["summary"] or "").strip()
+                if not p:
+                    continue
+                if p in name_set or p in registered_ids:
+                    continue
+                if project_resolver.normalize_name(p) in registered_norm_ids:
+                    continue
+                pair = (p, t)
+                if pair in seen_pairs:
+                    continue
+                norm_t = project_resolver.normalize_name(t)
+                norm_s = project_resolver.normalize_name(s)
+                if any(phrase in norm_t or phrase in norm_s for phrase in target_phrases if phrase):
+                    seen_pairs.add(pair)
+                    rendered = project_notes.sanitize_text(f"project {p} / topic {t}")
+                    related_lines.append(f"- {rendered}")
+                    if len(related_lines) >= 8:
+                        break
+
+            if related_lines:
+                append_budgeted(lines, "", context_budget)
+                append_budgeted(lines, "## Possibly related workspace topics", context_budget)
+                for rline in related_lines:
+                    if not append_budgeted(lines, rline, context_budget):
+                        break
+        except Exception as exc:  # noqa: BLE001
+            log(f"possibly related workspace topics failed: {exc}")
 
     append_budgeted(lines, "", context_budget)
     append_budgeted(lines, "## Recent Consultations", context_budget)
@@ -9862,6 +11132,10 @@ def record_work_memory(
     risks: Any = None,
     next_step: Any = None,
     status: Any = None,
+    outcome: str | None = None,
+    applies_when: str | None = None,
+    evidence: str | None = None,
+    supersedes: str | None = None,
 ) -> dict[str, Any]:
     details = {
         "changed_files": coerce_string_list(changed_files),
@@ -9885,7 +11159,233 @@ def record_work_memory(
         result["memory_file"] = memory["path"]
     except Exception as exc:  # noqa: BLE001
         result["memory_warning"] = str(exc)
+
+    try:
+        import project_resolver
+        import project_notes
+
+        raw_proj = (project or "").strip()
+        registry = project_resolver.load_registry()
+
+        if not raw_proj:
+            _, reason, candidates = project_resolver.canonical_project(
+                None, cwd=str(Path.cwd()), registry=registry
+            )
+            if reason == "ambiguous" and candidates:
+                cand_str = ", ".join(candidates)
+                result["project_hint"] = (
+                    f"This workspace contains registered projects {cand_str}; "
+                    f"pass project=<id> so other sessions find this note."
+                )
+
+        p_info = resolve_project(project)
+        cid = p_info.name
+        if outcome and outcome in project_notes.NOTE_KINDS and cid in registry:
+            if len(summary) > 400:
+                result["note_error"] = (
+                    "summary over 400 chars; note not recorded - shorten it or use project_brief op=add"
+                )
+            else:
+                entry = registry[cid]
+                entry_dict = {
+                    "aliases": entry.aliases,
+                    "group": entry.group,
+                    "related": entry.related,
+                    "start_here": entry.start_here,
+                    "label": entry.label,
+                }
+                author_val = _tool_author(agent)
+                note = project_notes.add_note(
+                    cid,
+                    outcome,
+                    summary,
+                    applies_when=applies_when,
+                    evidence=evidence,
+                    supersedes=supersedes,
+                    author=author_val,
+                )
+                result["note_id"] = note["id"]
+                first_word = (agent or "agent").strip().split()[0][:20] if (agent or "agent").strip() else "agent"
+                project_notes.record_activity(cid, first_word, "note")
+                project_notes.write_cache(cid, entry=entry_dict)
+    except Exception as exc:  # noqa: BLE001
+        result["note_error"] = str(exc)
+
     return result
+
+
+
+def _tool_author(value: Any, default: str = "agent") -> str:
+    """Author label for notes written through MCP tools; never a bare 'owner' (only the owner's own
+    curated seeds carry that rank), so a model cannot promote its own lesson by claiming owner authorship."""
+    text = (str(value).strip() if value else "")[:60] or default
+    return "owner-attributed by agent" if text.lower() == "owner" else text
+
+def project_brief(
+    op: str,
+    project: str | None = None,
+    kind: str | None = None,
+    text: str | None = None,
+    applies_when: str | None = None,
+    evidence: str | None = None,
+    supersedes: str | None = None,
+    note_id: str | None = None,
+    status: str | None = None,
+    reason: str | None = None,
+    author: str | None = None,
+    max_chars: int | None = None,
+) -> dict[str, Any]:
+    try:
+        import project_resolver
+        import project_notes
+
+        op_str = str(op or "").strip()
+        raw_proj = project
+        raw_proj_str = str(raw_proj).strip() if raw_proj is not None else ""
+        cwd_arg = str(Path.cwd()) if not raw_proj_str else None
+        registry = project_resolver.load_registry()
+
+        cid, res_reason, candidates = project_resolver.canonical_project(
+            raw_proj_str or None,
+            cwd=cwd_arg,
+            registry=registry,
+        )
+        if res_reason == "ambiguous":
+            return {
+                "ok": False,
+                "error": "project_required",
+                "candidates": sorted(candidates),
+            }
+        if cid is None or cid not in registry:
+            return {
+                "ok": False,
+                "error": "unregistered",
+                "registered": sorted(registry.keys()),
+            }
+
+        entry = registry[cid]
+        entry_dict = {
+            "aliases": entry.aliases,
+            "group": entry.group,
+            "related": entry.related,
+            "start_here": entry.start_here,
+            "label": entry.label,
+        }
+
+        if op_str == "get":
+            try:
+                mc = int(max_chars) if max_chars is not None else 4000
+            except (ValueError, TypeError):
+                mc = 4000
+            if mc < 500:
+                mc = 500
+            elif mc > 6000:
+                mc = 6000
+
+            full = project_notes.read_cached_full(cid)
+            if full is None:
+                cache_res = project_notes.write_cache(cid, entry=entry_dict)
+                full = cache_res.get("full") or ""
+            ft = project_notes.read_cached_first_touch(cid)
+            if ft is None:
+                cache_res = project_notes.write_cache(cid, entry=entry_dict)
+                ft = cache_res.get("first_touch") or ""
+
+            trimmed_brief = full
+            if len(trimmed_brief) > mc:
+                cut = trimmed_brief[:mc]
+                last_nl = cut.rfind("\n")
+                if last_nl != -1:
+                    trimmed_brief = cut[:last_nl]
+                else:
+                    trimmed_brief = cut
+
+            return {
+                "ok": True,
+                "op": "get",
+                "project": cid,
+                "first_touch": ft,
+                "brief": trimmed_brief,
+            }
+
+        if op_str == "add":
+            author_str = _tool_author(author)
+            note = project_notes.add_note(
+                cid,
+                kind=str(kind or ""),
+                text=str(text or ""),
+                applies_when=applies_when,
+                evidence=evidence,
+                supersedes=supersedes,
+                author=author_str,
+            )
+            project_notes.write_cache(cid, entry=entry_dict)
+            return {
+                "ok": True,
+                "op": "add",
+                "project": cid,
+                "note": {
+                    "id": note["id"],
+                    "kind": note["kind"],
+                    "status": note["status"],
+                },
+            }
+
+        if op_str == "review":
+            author_str = _tool_author(author)
+            rev = project_notes.review_note(
+                cid,
+                note_id=str(note_id or ""),
+                status=str(status or ""),
+                reviewer=author_str,
+                reason=reason,
+            )
+            project_notes.write_cache(cid, entry=entry_dict)
+            return {
+                "ok": True,
+                "op": "review",
+                "project": cid,
+                "note_id": note_id,
+                "status": rev.get("status", status),
+            }
+
+        if op_str == "pending":
+            all_pending = project_notes.list_notes(cid, statuses=["pending"])
+            pending_list = [
+                {
+                    "id": n["id"],
+                    "kind": n["kind"],
+                    "text": n["text"],
+                    "author": n.get("author"),
+                    "created_at": n.get("created_at"),
+                }
+                for n in all_pending[:10]
+            ]
+            return {
+                "ok": True,
+                "op": "pending",
+                "project": cid,
+                "pending": pending_list,
+                "notes": pending_list,
+            }
+
+        return {
+            "ok": False,
+            "error": "invalid",
+            "detail": f"unknown op '{op_str}'",
+        }
+    except ValueError as e:
+        import project_notes
+        return {
+            "ok": False,
+            "error": "invalid",
+            "detail": project_notes.sanitize_text(str(e))[:200],
+        }
+    except Exception:
+        return {
+            "ok": False,
+            "error": "project_brief_failed",
+        }
 
 
 def queue_antigravity_request(
@@ -10384,6 +11884,7 @@ def queue_codex_request(
     mode: str | None = None,
     outbound_reviewed: Any = None,
 ) -> dict[str, Any]:
+    stored_mode = normalize_codex_mode(mode, task_kind)
     init_db()
     if not prompt or not prompt.strip():
         raise ValueError("prompt is required")
@@ -10399,9 +11900,6 @@ def queue_codex_request(
     stored_token_budget = int(token_budget or 0) or None
     stored_effort = normalize_effort_token(effort) or (str(effort).strip().lower() if effort else None)
     autorun_enabled = CODEX_QUEUE_AUTORUN if autorun is None else truthy(autorun)
-    stored_mode = str(mode).strip().lower() if mode else ""
-    if stored_mode not in {"read-only", "workspace-write", "danger-full-access"}:
-        stored_mode = "read-only"
     # Direct callers that name a model get the self-check guard too; route_agent_task
     # already prepends it, so skip if it's present to avoid double-injection.
     if not autorun_enabled and model_label and "[REQUIRED MODEL:" not in clean_prompt and "[Preferred model:" not in clean_prompt:
@@ -10642,9 +12140,7 @@ def start_codex_request_worker(request_id: str) -> dict[str, Any]:
                 "worker_started_at": data.get("worker_started_at"),
             }
     try:
-        tmp_dir = BROKER_DIR / "tmp"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        out_path = tmp_dir / f"codex-worker-{safe_slug(rid)}.log"
+        out_path = _worker_log_path("codex", rid, data)
         env = os.environ.copy()
         env.pop("AGENT_BROKER_CHILD", None)
         env["AGENT_BROKER_CALLER"] = "agent-broker-codex-worker"
@@ -10697,16 +12193,18 @@ def run_codex_request_worker(request_id: str) -> dict[str, Any]:
         data = dict(row)
         if data.get("response") or is_terminal_state(data.get("status")):
             return {"id": rid, "status": data.get("status"), "skipped": True, "reason": "already terminal"}
+        # Legacy NULL modes remain read-only, even on implementation rows.
+        stored_mode = normalize_codex_mode(data.get("mode"))
         now = utc_now()
         conn.execute(
             """
             UPDATE codex_requests
             SET status = 'running',
                 worker_started_at = COALESCE(worker_started_at, ?),
-                worker_pid = ?
+                worker_pid = ?, mode = ?
             WHERE id = ?
             """,
-            (now, os.getpid(), rid),
+            (now, os.getpid(), stored_mode, rid),
         )
     task_kind = normalize_task_kind(data.get("task_kind"))
     target_model, resolved_effort = resolve_cli_model_and_effort("codex", data.get("target_model"), data.get("effort"))
@@ -10719,9 +12217,6 @@ def run_codex_request_worker(request_id: str) -> dict[str, Any]:
         None,
     )
     started_at = utc_now()
-    stored_mode = str(data.get("mode") or "").strip().lower()
-    if stored_mode not in {"read-only", "workspace-write", "danger-full-access"}:
-        stored_mode = "read-only"
     codex_result = consult_codex(
         data.get("root_path") or data.get("project"),
         data.get("prompt") or "",
@@ -10882,9 +12377,7 @@ def start_claude_request_worker(request_id: str) -> dict[str, Any]:
                 "worker_started_at": data.get("worker_started_at"),
             }
     try:
-        tmp_dir = BROKER_DIR / "tmp"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        out_path = tmp_dir / f"claude-worker-{safe_slug(rid)}.log"
+        out_path = _worker_log_path("claude", rid, data)
         env = os.environ.copy()
         env.pop("AGENT_BROKER_CHILD", None)
         env["AGENT_BROKER_CALLER"] = "agent-broker-claude-worker"
@@ -11389,9 +12882,7 @@ def start_flash_request_worker(request_id: str) -> dict[str, Any]:
                 "worker_started_at": data.get("worker_started_at"),
             }
     try:
-        tmp_dir = BROKER_DIR / "tmp"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        out_path = tmp_dir / f"flash-worker-{safe_slug(rid)}.log"
+        out_path = _worker_log_path("flash", rid, data)
         env = os.environ.copy()
         env.pop("AGENT_BROKER_CHILD", None)
         # Preserve the queuing caller's identity so native_handoff resolves the same family.
@@ -11406,7 +12897,16 @@ def start_flash_request_worker(request_id: str) -> dict[str, Any]:
             )
         with out_path.open("ab") as fh:
             proc = subprocess.Popen(
-                _broker_bridge_command("run-flash-request", rid),
+                _broker_bridge_command(
+                    "run-decision-evaluator"
+                    if str(data.get("task_kind") or "") == DECISION_EVALUATOR_TASK_KIND
+                    else (
+                        "run-gemini-consult"
+                        if str(data.get("task_kind") or "") == GEMINI_CONSULT_TASK_KIND
+                        else "run-flash-request"
+                    ),
+                    rid,
+                ),
                 cwd=str(BROKER_DIR),
                 stdin=subprocess.DEVNULL,
                 stdout=fh,
@@ -11564,6 +13064,10 @@ def _refresh_flash_request(row: dict[str, Any]) -> dict[str, Any]:
     a queued row nothing ever started, becomes a failed request with the SB3 classification."""
     if row.get("response") or is_terminal_state(row.get("status")):
         return row
+    if str(row.get("task_kind") or "") == DECISION_EVALUATOR_TASK_KIND:
+        return _refresh_decision_evaluator_request(row)
+    if str(row.get("task_kind") or "") == GEMINI_CONSULT_TASK_KIND:
+        return _refresh_gemini_consult_request(row)
     status = str(row.get("status") or "").strip().lower()
     now_epoch = _iso_epoch(utc_now()) or int(time.time())
     timeout = int(row.get("timeout_seconds") or FLASH_ASYNC_DEFAULT_TIMEOUT_SECONDS)
@@ -11772,17 +13276,24 @@ def _flash_request_result(row: dict[str, Any]) -> dict[str, Any]:
     response = row.get("response")
     if not response:
         progress = _flash_progress(row)
+        task_kind = str(row.get("task_kind") or "")
+        note = (
+            f"Gemini consult still {state}. Call request_result(request_id=\"{rid}\", wait_seconds=180) again."
+            if task_kind == GEMINI_CONSULT_TASK_KIND
+            else (
+                f"Flash package still {state} ({progress.get('steps', 0)} agy steps"
+                + (f"; last: {progress['last_action']}" if progress.get("last_action") else "")
+                + f'). Call request_result(request_id="{rid}", wait_seconds=180) again.'
+            )
+        )
         base.update(
             {
+                "status": "pending",
                 "answered": False,
                 "elapsed_seconds": progress.get("elapsed_seconds"),
                 "progress": progress,
                 "poll": {"tool": "request_result", "request_id": rid, "wait_seconds": 180},
-                "note": (
-                    f"Flash package still {state} ({progress.get('steps', 0)} agy steps"
-                    + (f"; last: {progress['last_action']}" if progress.get("last_action") else "")
-                    + f'). Call request_result(request_id="{rid}", wait_seconds=180) again.'
-                ),
+                "note": note,
             }
         )
         return base
@@ -12218,10 +13729,12 @@ def request_result(request_id: str, wait_seconds: Any = None) -> dict[str, Any]:
         if table == "codex_requests" and (effort_label in {"top", "max", "xhigh"} or "max" in str(row.get("target_model") or "")):
             pending_note += "Max/xhigh-effort Codex frontier consults can take several minutes — this is normal, not a hang. "
         pending_note += f'Call request_result(request_id="{rid}", wait_seconds=180) to wait for it.'
+    status = "ok" if state == "completed" and not str(response or "").startswith(CONSULT_FAILURE_PREFIXES) else ("pending" if not response else "error")
     result = {
         "id": rid,
         "found": True,
         "kind": _REQUEST_KIND.get(table, table),
+        "status": status,
         "state": state,
         "answered": bool(response),
         "elapsed_seconds": elapsed,
@@ -13236,6 +14749,10 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
     # Antigravity host but a real family was named with extension/host intent.
     if family == "antigravity" and intent_family in ("claude", "codex", "gemini"):
         family = intent_family
+    codex_mode = (
+        normalize_codex_mode(args.get("mode"), normalize_task_kind(args.get("task_kind") or args.get("request_type")))
+        if family == "codex" else None
+    )
     if family in {"codex", "claude"}:
         # route_agent_task calls the queue/CLI implementations directly, so it
         # must enforce the same native-first boundary as consult_* and queue_*.
@@ -13434,6 +14951,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
             task_kind,
             token_budget,
             model_resolution.get("effort"),
+            mode=codex_mode,
             outbound_reviewed=args.get("outbound_reviewed"),
         )
         queued["route"] = "codex_inbox"
@@ -13458,6 +14976,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
             token_budget,
             model_resolution.get("effort"),
             autorun=False,
+            mode=codex_mode,
             outbound_reviewed=args.get("outbound_reviewed"),
         )
         project_info = resolve_project(project)
@@ -13538,7 +15057,8 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "project": project,
                 "topic": topic,
                 "prompt": prompt,
-                "mode": args.get("mode") or "read-only",
+                "mode": codex_mode,
+                "async": args.get("async"),
                 "task_kind": task_kind,
                 "token_budget": token_budget,
                 "target_model": target_model,
@@ -13660,7 +15180,7 @@ TOOLS = [
     },
     {
         "name": "consult_decision",
-        "description": "Coordinate one bounded flagship decision brief. Codex and Claude hosts first run their same-vendor flagship as a native subagent, then return its bounded native_consultation descriptor; Agent Switchboard dispatches only the opposite-vendor consultation needed for architecture/critical work. Gemini hosts use both cross-vendor flagships. Effort scales high/xhigh/max. Flash is never used as a decision substitute.",
+        "description": "Coordinate one bounded flagship decision brief. Pipeline: the brain drafts brief.proposed_choice, a short Gemini 4 Argon evaluator reviews it, then Astra gives the final verdict (a Codex host below Astra runs Astra as its native subagent and returns native_consultation). Fable is opt-in via include_fable. Effort scales high/xhigh/max. Flash is never used as a decision substitute.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -13765,6 +15285,10 @@ TOOLS = [
                         "failure refreshes it. Latches for models not attempted this call are left alone."
                     ),
                 },
+                "include_fable": {
+                    "type": "boolean",
+                    "description": "Add Fable to this decision; only when the user asks or the plan includes it.",
+                },
             },
             "required": ["work_package_id", "host", "complexity", "brief"],
         },
@@ -13778,7 +15302,12 @@ TOOLS = [
                 "project": {"type": "string"},
                 "topic": {"type": "string"},
                 "prompt": {"type": "string"},
-                "mode": {"type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"]},
+                "mode": {
+                    "type": "string",
+                    "enum": ["read-only", "plan", "workspace-write", "accept-edits", "acceptEdits", "danger-full-access"],
+                    "description": "Codex sandbox mode. Omitted implementation requests use workspace-write; other tasks use read-only. Explicit plan/read-only is preserved.",
+                },
+                "async": {"type": "boolean", "description": "Return a queued worker request immediately, without waiting for low/high-effort work. Poll request_result for completion."},
                 "include_context_pack": {"type": "boolean"},
                 "task_kind": {"type": "string"},
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
@@ -14014,7 +15543,7 @@ TOOLS = [
                 },
                 "strict_model": {"type": "boolean"},
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
-                "mode": {"type": "string"},
+                "mode": {"type": "string", "description": "Codex: omitted implementation mode uses workspace-write; other tasks use read-only. plan/read-only stays read-only; accept-edits/acceptEdits aliases workspace-write. For tests/scripts needing files, pass workspace-write explicitly."},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
                 "work_package_id": {"type": "string", "description": "For Flash implementation, required stable id for exactly one bounded package."},
                 "allowed_files": {"type": "array", "maxItems": 5, "items": {"type": "string"}, "description": "Legacy alias for allowed_writes; refused if the two disagree."},
@@ -14200,6 +15729,23 @@ TOOLS = [
                 "risks": {},
                 "next_step": {},
                 "status": {},
+                "outcome": {
+                    "type": "string",
+                    "enum": ["worked", "failed", "decision", "pitfall", "progress"],
+                    "description": "Optional lesson outcome (worked, failed, decision, pitfall, progress) to record as a project note.",
+                },
+                "applies_when": {
+                    "type": "string",
+                    "description": "When this lesson applies (condition or context).",
+                },
+                "evidence": {
+                    "type": "string",
+                    "description": "Evidence supporting this lesson.",
+                },
+                "supersedes": {
+                    "type": "string",
+                    "description": "Note ID that this note supersedes.",
+                },
             },
             "required": ["agent", "summary"],
         },
@@ -14323,7 +15869,7 @@ TOOLS = [
                 "token_budget": {"type": "integer"},
                 "effort": {"type": "string"},
                 "autorun": {"type": "boolean"},
-                "mode": {"type": "string"},
+                "mode": {"type": "string", "description": "Codex sandbox mode: implementation defaults workspace-write, other tasks read-only. Explicit read-only/plan is preserved; accept-edits/acceptEdits means workspace-write."},
                 "outbound_reviewed": {"type": "boolean", "description": "Explicit operator opt-in that lets a payload the outbound screen classified needs_owner_review proceed once the async worker actually dispatches it. Never overrides a block verdict."},
                 "native_unavailable_reason": {"type": "string", "minLength": 12},
                 "prompt_budget": {"type": "string", "enum": ["standard", "extended"], "description": "Cheap default 'standard' (14,000 provider-prompt bytes) or opt-in 'extended' (42,000 bytes); extended requires budget_reason."},
@@ -14531,7 +16077,7 @@ TOOLS = [
     },
     {
         "name": "code_graph",
-        "description": "Locate code in a registered project through its code-only knowledge graph (graphify). Returns compact locators: symbol, file:line, relations, confidence, freshness. Results are locators, not answers: read the primary lines before acting. confidence 'low' (or a miss) means fall back to a targeted grep; constants and non-code files are not indexed. Ops: locate, expand, path, stats, health, find_text, context_for; refresh rebuilds the graph. find_text searches indexed string literals; context_for suggests related files.",
+        "description": "Locate code in a registered project through its code-only knowledge graph (graphify). Returns compact locators: symbol, file:line, relations, confidence, freshness. Results are locators, not answers: read the primary lines before acting. confidence 'low' (or a miss) means fall back to a targeted grep; constants and non-code files are not indexed. Ops: locate, expand, path, stats, health, find_text, context_for, resolve; refresh rebuilds the graph. find_text searches indexed string literals; context_for suggests related files; resolve maps free text in query (e.g. the task or a pasted path) to registered project ids with group, related ids and map freshness.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -14546,6 +16092,7 @@ TOOLS = [
                         "health",
                         "find_text",
                         "context_for",
+                        "resolve",
                     ],
                     "description": "Operation to perform.",
                 },
@@ -14595,11 +16142,76 @@ TOOLS = [
             "required": ["op"],
         },
     },
+    {
+        "name": "project_brief",
+        "description": "Cross-host project brief: canonical name, start here, owner decisions, verified do-not-repeat lessons, what worked, recent activity. add records a PENDING lesson (give evidence); review verifies/disputes/supersedes after you checked the evidence; only verified lessons reach new sessions.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["get", "add", "review", "pending"],
+                    "description": "Operation to perform (get, add, review, pending).",
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Project ID, alias, or path (optional; inferred from cwd if omitted).",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["decision", "failed", "worked", "pitfall", "progress"],
+                    "description": "Lesson kind for add.",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Lesson text for add (up to 400 chars).",
+                },
+                "applies_when": {
+                    "type": "string",
+                    "description": "When this lesson applies (up to 200 chars).",
+                },
+                "evidence": {
+                    "type": "string",
+                    "description": "Evidence supporting this lesson (up to 200 chars).",
+                },
+                "supersedes": {
+                    "type": "string",
+                    "description": "Existing note_id superseded by this note.",
+                },
+                "note_id": {
+                    "type": "string",
+                    "description": "Note ID to review.",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["pending", "verified", "disputed", "superseded", "expired"],
+                    "description": "New status for review.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Reason for review status change.",
+                },
+                "author": {
+                    "type": "string",
+                    "description": "Author or reviewer identifier (up to 60 chars).",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 500,
+                    "maximum": 6000,
+                    "default": 4000,
+                    "description": "Maximum characters for get brief output.",
+                },
+            },
+            "required": ["op"],
+        },
+    },
 ]
 
 
 CLAUDE_LITE_TOOL_NAMES = {
     "code_graph",
+    "project_brief",
     "consult_decision",
     "consult_codex",
     "consult_antigravity",
@@ -14690,7 +16302,7 @@ COMPACT_TOOL_DESCRIPTIONS = {
     "record_context_event": "Record a compact evidence/context event.",
     "get_context_pack": "Return a compact project/topic context pack.",
     "retrieve_shared_context": "Retrieve stored large context by ref, optionally filtered by query.",
-    "code_graph": "Query code knowledge graph locators; caller must read primary lines before acting, low confidence falls back to grep. find_text searches indexed string literals; context_for suggests related files.",
+    "code_graph": "Query code knowledge graph locators; caller must read primary lines before acting, low confidence falls back to grep. find_text searches indexed string literals; context_for suggests related files; resolve maps free text in query (e.g. the task or a pasted path) to registered project ids with group, related ids and map freshness.",
     "request_context_snapshot": "Request a compact snapshot of another open agent session.",
     "get_latest_context_snapshot": "Read the latest completed snapshot, capped by max_tokens.",
     "list_live_surfaces": "List recent bridge heartbeats and capabilities.",
@@ -14700,6 +16312,7 @@ COMPACT_TOOL_DESCRIPTIONS = {
     "get_request_ledger": "Return the per-topic request ledger.",
     "store_shared_context": "Store large context locally and return a compact ref.",
     "compact_topic": "Compact topic state and return a retrievable ref.",
+    "project_brief": "Cross-host project brief: canonical name, start here, owner decisions, verified do-not-repeat lessons, what worked, recent activity. add records a PENDING lesson (give evidence); review verifies/disputes/supersedes after you checked the evidence; only verified lessons reach new sessions.",
 }
 
 
@@ -14793,7 +16406,38 @@ def text_content(value: Any) -> dict[str, Any]:
             text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         else:
             text = json.dumps(value, ensure_ascii=False, indent=2)
-    return {"content": [{"type": "text", "text": text}], "_meta": switchboard_meta()}
+    return {"content": [{"type": "text", "text": _mask_redact_terms(text)}], "_meta": switchboard_meta()}
+
+
+_REDACT_TERMS_CACHE: dict[str, Any] = {"key": None, "patterns": []}
+
+
+def _mask_redact_terms(text: str) -> str:
+    """Mask owner-listed private terms (code-graph redact_terms.json) in every tool response.
+
+    Registered project roots can now appear in response fields such as root_path, and some hosts
+    forward tool output to third-party providers, so the configured terms never leave verbatim.
+    Missing/invalid file -> no masking. Never raises."""
+    try:
+        home = Path(os.environ.get("AGENT_BROKER_HOME") or (Path.home() / ".agent-broker"))
+        path = home / "code-graph" / "redact_terms.json"
+        try:
+            st = path.stat()
+            key = (str(path), st.st_mtime_ns, st.st_size)
+        except OSError:
+            return text
+        if _REDACT_TERMS_CACHE["key"] != key:
+            terms = json.loads(path.read_text(encoding="utf-8"))
+            patterns = []
+            if isinstance(terms, list):
+                for term in sorted((t for t in terms if isinstance(t, str) and t.strip()), key=len, reverse=True):
+                    patterns.append(re.compile(re.escape(term.strip()), re.IGNORECASE))
+            _REDACT_TERMS_CACHE.update(key=key, patterns=patterns)
+        for pattern in _REDACT_TERMS_CACHE["patterns"]:
+            text = pattern.sub("<masked>", text)
+        return text
+    except Exception:  # noqa: BLE001 - masking must never break a tool response
+        return text
 
 
 def topic_workspace_dir(project_info: "ProjectInfo", topic: str | None) -> Path:
@@ -16056,7 +17700,15 @@ def _record_code_graph_usage_event(
 ) -> None:
     try:
         args_map = args if isinstance(args, Mapping) else {}
-        resp_map = resp if isinstance(resp, Mapping) else {}
+        if isinstance(resp, str):
+            try:
+                resp_map = json.loads(resp)
+            except Exception:
+                resp_map = {}
+        elif isinstance(resp, Mapping):
+            resp_map = resp
+        else:
+            resp_map = {}
 
         host = _MCP_CLIENT_NAME.strip() if _MCP_CLIENT_NAME and _MCP_CLIENT_NAME.strip() else "unknown"
         session_info = routing_gate.resolve_current_session_identity()
@@ -16076,7 +17728,7 @@ def _record_code_graph_usage_event(
                 hits = 0
         else:
             found_hits = None
-            for key in ("locators", "matches", "suggestions", "neighbors"):
+            for key in ("locators", "matches", "suggestions", "neighbors", "projects"):
                 val = resp_map.get(key)
                 if isinstance(val, (list, tuple)):
                     found_hits = len(val)
@@ -16092,6 +17744,8 @@ def _record_code_graph_usage_event(
                 chars = int(chars)
             except (ValueError, TypeError):
                 chars = 0
+        elif isinstance(resp, str):
+            chars = len(resp)
         else:
             try:
                 chars = len(json.dumps(dict(resp_map), ensure_ascii=False))
@@ -16243,6 +17897,27 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 args.get("risks"),
                 args.get("next_step"),
                 args.get("status"),
+                outcome=args.get("outcome"),
+                applies_when=args.get("applies_when"),
+                evidence=args.get("evidence"),
+                supersedes=args.get("supersedes"),
+            )
+        )
+    if name == "project_brief":
+        return text_content(
+            project_brief(
+                op=str(args.get("op") or ""),
+                project=args.get("project"),
+                kind=args.get("kind"),
+                text=args.get("text"),
+                applies_when=args.get("applies_when"),
+                evidence=args.get("evidence"),
+                supersedes=args.get("supersedes"),
+                note_id=args.get("note_id"),
+                status=args.get("status"),
+                reason=args.get("reason"),
+                author=args.get("author"),
+                max_chars=args.get("max_chars"),
             )
         )
     if name == "get_topic_status":
@@ -16264,7 +17939,53 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         )
     if name == "code_graph":
         t0 = time.perf_counter()
-        res = code_graph_bridge.call(args)
+        if args.get("op") == "resolve":
+            try:
+                import project_resolver
+
+                raw_max = args.get("max_chars")
+                try:
+                    max_chars = int(raw_max) if raw_max is not None else 1500
+                except (ValueError, TypeError):
+                    max_chars = 1500
+                if max_chars <= 0:
+                    max_chars = 1500
+
+                registry = project_resolver.load_registry()
+                resolution = project_resolver.resolve(str(args.get("query") or ""), None, registry)
+                projects = []
+                for pid in resolution.ids:
+                    entry = registry.get(pid)
+                    projects.append({
+                        "id": pid,
+                        "reason": resolution.reasons.get(pid, ""),
+                        "group": entry.group if entry else None,
+                        "related": list(entry.related) if entry else [],
+                        "freshness": project_resolver.freshness(entry),
+                    })
+                res = {
+                    "ok": True,
+                    "op": "resolve",
+                    "projects": projects,
+                    "ambiguous": list(resolution.ambiguous),
+                    "registered": sorted(registry.keys()),
+                    "hint": "Use code_graph project=<id> (locate/find_text) and get_context_pack project=<id> for prior memory; results are locators.",
+                }
+                while len(json.dumps(res, ensure_ascii=False, separators=(",", ":"))) > max_chars and res["registered"]:
+                    res["registered"].pop()
+                while len(json.dumps(res, ensure_ascii=False, separators=(",", ":"))) > max_chars:
+                    trimmed_any = False
+                    for p in reversed(res["projects"]):
+                        if p.get("related"):
+                            p["related"].pop()
+                            trimmed_any = True
+                            break
+                    if not trimmed_any:
+                        break
+            except Exception:
+                res = {"ok": False, "op": "resolve", "error": "resolve_failed"}
+        else:
+            res = code_graph_bridge.call(args)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         try:
             _record_code_graph_usage_event(args, res, elapsed_ms)
@@ -17174,7 +18895,7 @@ def handle_bridge_cli(argv: list[str]) -> int:
             "claude-responses [project] | status <request_id> | result <request_id> | "
             "cancel <request_id> [reason] | reap [max_age_hours] | "
             "debate <project> <topic> <proposition> [rounds] [sideA[:model[:effort]]] [sideB[:model[:effort]]] | "
-            "codex-notified <request_id> | run-codex-request <request_id> | run-claude-request <request_id> | run-flash-request <request_id> | completed-unnotified [limit] | completion-notified <request_id> | "
+            "codex-notified <request_id> | run-codex-request <request_id> | run-claude-request <request_id> | run-flash-request <request_id> | run-decision-evaluator <request_id> | run-gemini-consult <request_id> | completed-unnotified [limit] | completion-notified <request_id> | "
             "context-pack [project] [topic] [budget] | context-retrieve <ref> [query] [limit] | "
             "context-stats [project] [topic] | chat-bootstrap [project] [topic] [target_agent] [budget] | "
             "work-memory [project] [topic] [limit] | "
@@ -17340,6 +19061,14 @@ def handle_bridge_cli(argv: list[str]) -> int:
         if len(argv) < 2:
             raise ValueError("run-flash-request requires <request_id>")
         result = run_flash_request_worker(argv[1])
+    elif command == "run-decision-evaluator":
+        if len(argv) < 2:
+            raise ValueError("run-decision-evaluator requires <request_id>")
+        result = run_decision_evaluator_worker(argv[1])
+    elif command == "run-gemini-consult":
+        if len(argv) < 2:
+            raise ValueError("run-gemini-consult requires <request_id>")
+        result = run_gemini_consult_worker(argv[1])
     elif command == "completed-unnotified":
         limit = int(argv[1]) if len(argv) > 1 else 20
         result = get_unnotified_antigravity_completions(limit)
@@ -17618,6 +19347,37 @@ def _serve_stdio() -> int:
             _emit_response(response)
 
 
+def _start_daily_retention() -> None:
+    """Once-per-day tidy of the broker home (broker_layout rules) in a daemon thread;
+    fail-open and never delays the MCP handshake."""
+    def _run() -> None:
+        try:
+            import broker_layout
+            summary = broker_layout.run_retention()
+            if summary:
+                log(f"daily retention: {summary}")
+        except Exception as exc:  # noqa: BLE001
+            log(f"daily retention skipped: {type(exc).__name__}")
+    try:
+        threading.Thread(target=_run, name="broker-retention", daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _worker_log_path(kind: str, rid: str, row: Any = None) -> Path:
+    """Detached worker log under runs/<date>/<project>/<time>-<request id>/; falls back to tmp/."""
+    try:
+        import broker_layout
+        project = None
+        if isinstance(row, Mapping):
+            project = row.get("project")
+        return broker_layout.run_dir(project, rid) / f"{kind}-worker.log"
+    except Exception:  # noqa: BLE001
+        tmp_dir = BROKER_DIR / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        return tmp_dir / f"{kind}-worker-{safe_slug(rid)}.log"
+
+
 def main() -> int:
     if len(sys.argv) > 1:
         if sys.argv[1] != "bridge":
@@ -17631,9 +19391,16 @@ def main() -> int:
             return 2
     init_db()
     log("agent-broker MCP server started")
+    _start_daily_retention()
     exit_code = _serve_stdio()
     log("agent-broker MCP server stopped")
     return exit_code
+
+
+def __getattr__(name: str) -> Any:
+    if name == "INLINE_WAIT":
+        return get_inline_wait_seconds()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ except Exception:  # noqa: BLE001 - the gate must load even from a partial insta
     BROKER_VERSION = "unknown"
 
 import atomic_io
+import availability_reset
 
 BROKER_HOME = Path(os.environ.get("AGENT_BROKER_HOME", Path.home() / ".agent-broker"))
 STATE_DIR = BROKER_HOME / "routing-gate"
@@ -101,6 +102,24 @@ def policy_is_relaxed() -> bool:
     return gate_mode() == "warn" or DIRECT_LABOUR_LIMIT > DIRECT_LABOUR_LIMIT_DEFAULT
 
 
+OVERRIDE_MAX_BUDGET_DEFAULT = 12
+
+
+def override_max_budget() -> int:
+    configured = _env_int("AGENT_BROKER_OVERRIDE_MAX_BUDGET", OVERRIDE_MAX_BUDGET_DEFAULT)
+    return max(effective_direct_labour_limit(), configured)
+
+
+def _clamp_override_budget(budget: int | None) -> int | None:
+    if budget is None:
+        return None
+    try:
+        val = int(budget)
+    except (TypeError, ValueError):
+        return None
+    return max(effective_direct_labour_limit(), min(val, override_max_budget()))
+
+
 CONTEXT_INGRESS_MAX_CHARS = max(
     2_000, _env_int("AGENT_BROKER_CONTEXT_INGRESS_MAX_CHARS", 8_000)
 )
@@ -140,6 +159,9 @@ SWITCHBOARD_CONTROL_SUFFIXES = {
 SWITCHBOARD_EVIDENCE_EXEMPT_TOOLS = {
     "run_evidence_probe", "retrieve_shared_context", "resolve_model_request",
     "request_status", "request_result", "compact_topic",
+    # Recording project lessons/memory is required by the rules (and prompted by the Stop
+    # reminder), so it must never consume the direct-labour allowance.
+    "project_brief", "record_work_memory",
 }
 CODE_GRAPH_TOOLS = {"code_graph", "code-graph"}
 CODE_GRAPH_EXEMPT_OPS = {
@@ -160,6 +182,7 @@ CODE_GRAPH_EXEMPT_OPS = {
 CHILD_GUARD_SWITCHBOARD_SUFFIXES = {
     "consult_decision", "route_agent_task", "consult_codex", "consult_claude",
     "consult_gemini", "consult_antigravity", "queue_codex_request", "queue_claude_request",
+    "project_brief",
 }
 CLAUDE_UNAVAILABLE_REASONS = {
     "quota",
@@ -192,11 +215,39 @@ CLAUDE_AGENT_NAMES = {
 }
 CLAUDE_MODEL_ALIASES = {"fable", "opus", "sonnet", "haiku"}
 CLAUDE_CIRCUIT_CONTEXT = (
-    "Claude consultation is unavailable for this session. Do not retry Claude in this "
-    "session. If a second opinion is still useful, route one bounded package to the newest "
-    "live Gemini Flash High through Switchboard and treat it as a degraded, non-authoritative "
-    "fallback; the brain retains judgment and independently verifies its evidence."
+    "Claude consultation is temporarily unavailable until the reset window passes. "
+    "Before then, a needed second opinion may go to one bounded Gemini Flash High package as a "
+    "degraded, non-authoritative fallback (the brain keeps judgment). If the user explicitly asks "
+    "for a Claude model, attempt it (retry_unavailable=true where supported) and report the real "
+    "result - never call a model unavailable without a fresh attempt."
 )
+USER_CLAUDE_OVERRIDE_RE = re.compile(
+    r"\b(?:use|try|ask|consult|run|route|send|call|with|via)\b.{0,30}\b(?:claude|opus|sonnet|haiku|fable)\b|"
+    r"\b(?:claude|opus|sonnet|haiku|fable)\b.{0,30}\b(?:use|try|ask|consult|run|route|send|call|with|via)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def format_claude_circuit_context(marker: dict | None) -> str:
+    """Render dynamic circuit breaker guidance for an active Claude failure marker."""
+    if not isinstance(marker, dict):
+        return CLAUDE_CIRCUIT_CONTEXT
+    raw_model = str(marker.get("model") or "").strip()
+    model_str = "(all models)" if not raw_model or raw_model == "*" else raw_model
+    since = marker.get("since")
+    since_str = availability_reset.fmt_utc(since) if since is not None else "earlier"
+    until = marker.get("until")
+    until_str = availability_reset.fmt_utc(until) if until is not None else "later"
+    kind_str = str(marker.get("kind") or "quota")
+    return (
+        f"Claude {model_str} failed at {since_str} ({kind_str}); automatic routing skips it until "
+        f"{until_str}, then the normal hierarchy applies again. Before then, a needed second "
+        "opinion may go to one bounded Gemini Flash High package as a degraded, non-authoritative "
+        "fallback (the brain keeps judgment). If the user explicitly asks for a Claude model, "
+        "attempt it (retry_unavailable=true where supported) and report the real result - "
+        "never call a model unavailable without a fresh attempt."
+    )
+
 ROUTING_OVERRIDE_COMMAND_RE = re.compile(
     r"^\s*(?:&\s*)?(?:"
     r"(?:\"[^\"\r\n]*agent-switchboard(?:\.exe)?\"|\S*agent-switchboard(?:\.exe)?)"
@@ -340,6 +391,11 @@ def normalize_tool_name(name: str) -> str:
         return text
     prefix, server, tool = parts
     return f"{prefix}__{server.replace('-', '_')}__{tool}"
+
+
+def _hook_host(payload: dict) -> str:
+    h = str(payload.get("_switchboard_host") or "").strip().lower()
+    return h if h else "unknown"
 
 
 def _session_path(session_id: str) -> Path:
@@ -575,6 +631,35 @@ def _update_state(session_id: str, update) -> dict | None:
         return None
 
 
+PROJECT_ID_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def _validate_project_counts_dict(d: Any) -> dict[str, int] | None:
+    if not isinstance(d, dict) or len(d) > 16:
+        return None
+    res: dict[str, int] = {}
+    for k, v in d.items():
+        if not isinstance(k, str) or not PROJECT_ID_KEY_RE.fullmatch(k):
+            return None
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            return None
+        res[k] = v
+    return res
+
+
+def _validate_project_reminded_dict(d: Any) -> dict[str, bool] | None:
+    if not isinstance(d, dict) or len(d) > 16:
+        return None
+    res: dict[str, bool] = {}
+    for k, v in d.items():
+        if not isinstance(k, str) or not PROJECT_ID_KEY_RE.fullmatch(k):
+            return None
+        if v is not True:
+            return None
+        res[k] = True
+    return res
+
+
 def reset_turn_state(session_id: str) -> None:
     """Called on UserPromptSubmit: clear any mutation/blocked flags left over
     from a prior turn so they never leak into the new turn's Stop decision."""
@@ -585,9 +670,54 @@ def reset_turn_state(session_id: str) -> None:
         # validated enum marker while clearing all ordinary turn state. A different host
         # session has a different state file and therefore starts with a closed circuit.
         claude_unavailable = state.get("claude_unavailable")
+        raw_pc = state.get("project_context")
+        project_context = None
+        if (
+            isinstance(raw_pc, list)
+            and len(raw_pc) <= 8
+            and all(isinstance(x, str) and len(x) <= 64 for x in raw_pc)
+        ):
+            project_context = list(raw_pc)
+
+        project_edits = _validate_project_counts_dict(state.get("project_edits"))
+        project_noted = _validate_project_counts_dict(state.get("project_noted"))
+        project_reminded = _validate_project_reminded_dict(state.get("project_reminded"))
+
+        raw_rb = state.get("relief_budget")
+        relief_budget = None
+        if (
+            isinstance(raw_rb, int)
+            and not isinstance(raw_rb, bool)
+            and effective_direct_labour_limit() <= raw_rb <= override_max_budget()
+        ):
+            relief_budget = raw_rb
+
+        raw_cp = state.get("cited_paths")
+        cited_paths = None
+        if (
+            isinstance(raw_cp, list)
+            and len(raw_cp) <= 200
+            and all(isinstance(x, str) and len(x) <= 260 for x in raw_cp)
+        ):
+            cited_paths = list(raw_cp)
+
         state.clear()
-        if claude_unavailable in CLAUDE_UNAVAILABLE_REASONS:
+        if isinstance(claude_unavailable, dict) and claude_unavailable.get("kind") in CLAUDE_UNAVAILABLE_REASONS:
+            state["claude_unavailable"] = dict(claude_unavailable)
+        elif claude_unavailable in CLAUDE_UNAVAILABLE_REASONS:
             state["claude_unavailable"] = claude_unavailable
+        if project_context is not None:
+            state["project_context"] = project_context
+        if project_edits is not None:
+            state["project_edits"] = project_edits
+        if project_noted is not None:
+            state["project_noted"] = project_noted
+        if project_reminded is not None:
+            state["project_reminded"] = project_reminded
+        if relief_budget is not None:
+            state["relief_budget"] = relief_budget
+        if cited_paths is not None:
+            state["cited_paths"] = cited_paths
 
     _update_state(session_id, update)
 
@@ -625,7 +755,8 @@ def reserve_direct_labour(
         if tool_use_id and tool_use_id in reservations:
             return
         since_relief = int(state.get("direct_labour_since_relief") or 0)
-        if since_relief >= effective_direct_labour_limit():
+        limit = state.get("relief_budget") or effective_direct_labour_limit()
+        if since_relief >= limit:
             decision["allowed"] = False
             state["labour_gate_denials"] = int(state.get("labour_gate_denials") or 0) + 1
             return
@@ -757,6 +888,7 @@ def subagent_start(payload: dict) -> dict:
             state["labour_relief_sequence"] = int(
                 state.get("labour_relief_sequence") or 0
             ) + 1
+            state.pop("relief_budget", None)
 
     _update_state(session_id, update)
     log_gate_decision(
@@ -944,9 +1076,55 @@ def _is_claude_consult_route(tool_name: object, tool_input: object) -> bool:
     )
 
 
+def active_claude_unavailable_marker(session_id: str) -> dict | None:
+    """Return the active Claude unavailable marker dict or None.
+
+    Active only if it is a dict with a valid kind in CLAUDE_UNAVAILABLE_REASONS
+    and time.time() < until. Legacy bare-string markers and malformed dicts are inactive.
+    """
+    if not session_id:
+        return None
+    marker = _read_state(session_id).get("claude_unavailable")
+    if not isinstance(marker, dict):
+        return None
+    kind = marker.get("kind")
+    if kind not in CLAUDE_UNAVAILABLE_REASONS:
+        return None
+    try:
+        until = float(marker.get("until"))
+    except (TypeError, ValueError):
+        return None
+    if time.time() >= until:
+        return None
+    return marker
+
+
+def _model_matches(marker_model: str, requested_model: str) -> bool:
+    """Check if requested_model matches marker_model.
+
+    Matches if marker model is '*', or equal after normalization, or one
+    contains the other (e.g. 'opus' vs 'claude-opus-5-5').
+    """
+    marker_m = str(marker_model or "").strip().lower() or "*"
+    if marker_m == "*":
+        return True
+    req_m = str(requested_model or "").strip().lower()
+    if not req_m:
+        return False
+    if req_m == "*":
+        return True
+    norm_marker = re.sub(r"[^a-z0-9]+", "", marker_m)
+    norm_req = re.sub(r"[^a-z0-9]+", "", req_m)
+    if norm_marker == norm_req:
+        return True
+    if norm_marker in norm_req or norm_req in norm_marker:
+        return True
+    return False
+
+
 def _claude_unavailable_reason(session_id: str) -> str | None:
-    reason = _read_state(session_id).get("claude_unavailable") if session_id else None
-    return reason if reason in CLAUDE_UNAVAILABLE_REASONS else None
+    marker = active_claude_unavailable_marker(session_id)
+    return str(marker["kind"]) if marker else None
 
 
 def _is_child_guarded_tool(tool_name: object) -> bool:
@@ -1017,6 +1195,82 @@ def _direct_labour_category(tool_name: object, tool_input: object) -> str | None
     return None
 
 
+def _project_context_pointer(
+    session_id: str, prompt_text: str, cwd: Any = None, host_label: str = "unknown"
+) -> str:
+    """Resolve active project context and return a formatted pointer line.
+
+    Fail-open: any exception, disabled env, missing/empty registry, or resolution
+    miss returns an empty string without altering gate behavior.
+    """
+    try:
+        if (
+            os.environ.get("AGENT_BROKER_CHILD") == "1"
+            or os.environ.get("AGENT_BROKER_PROJECT_CONTEXT") == "0"
+            or not session_id
+        ):
+            return ""
+
+        import project_notes
+        import project_resolver
+
+        registry = project_resolver.load_registry()
+        if not registry:
+            return ""
+
+        state = _read_state(session_id)
+        raw_prev = state.get("project_context")
+        prev = list(raw_prev) if isinstance(raw_prev, list) else []
+
+        res = project_resolver.resolve(prompt_text, cwd, registry, active_ids=prev)
+        if not res or not res.ids:
+            return ""
+
+        if set(res.ids) == set(prev):
+            return ""
+
+        sorted_ids = sorted(res.ids)[:8]
+
+        def update_pc(st: dict) -> None:
+            st["project_context"] = sorted_ids
+
+        _update_state(session_id, update_pc)
+
+        log_gate_decision(
+            session_id,
+            "UserPromptSubmit",
+            "-",
+            None,
+            "project-context",
+            extra={"ids": sorted(res.ids), "reasons": res.reasons},
+        )
+
+        primary = res.ids[0]
+        cached_touch = None
+        try:
+            cached_touch = project_notes.read_cached_first_touch(primary)
+        except Exception:
+            cached_touch = None
+
+        text = cached_touch or project_resolver.format_pointer(res, registry, max_chars=300)
+
+        if len(res.ids) > 1:
+            other_ids = ", ".join(res.ids[1:])
+            addition = f" Also matched: {other_ids} (project_brief op=get project=<id>)."
+            if len(text + addition) <= 700:
+                text += addition
+
+        for pid in res.ids:
+            try:
+                project_notes.record_activity(pid, host_label, "touch")
+            except Exception:
+                pass
+
+        return text
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def user_prompt_submit(payload: dict) -> dict:
     sweep_stale()
     session_id = str(payload.get("session_id") or "").strip()
@@ -1057,14 +1311,70 @@ def user_prompt_submit(payload: dict) -> dict:
             session_id, "UserPromptSubmit", "-", None, "decision-required",
             extra={"source": f"task_kind:{explicit_kind}" if explicit_kind else "prompt-classifier"},
         )
+    cwd = payload.get("cwd")
+    pointer = _project_context_pointer(
+        session_id, prompt_text, cwd, host_label=_hook_host(payload)
+    )
+    claude_notice = ""
+    if session_id:
+        state = _read_state(session_id)
+        existing_marker = state.get("claude_unavailable")
+        if existing_marker is not None:
+            active_marker = active_claude_unavailable_marker(session_id)
+            if active_marker is None:
+                until_str = "earlier"
+                if isinstance(existing_marker, dict):
+                    try:
+                        until_str = availability_reset.fmt_utc(float(existing_marker["until"]))
+                    except (TypeError, ValueError):
+                        until_str = "earlier"
+                def clear_marker(st: dict) -> None:
+                    st.pop("claude_unavailable", None)
+                _update_state(session_id, clear_marker)
+                log_gate_decision(
+                    session_id,
+                    "UserPromptSubmit",
+                    "-",
+                    None,
+                    "claude-circuit-expired",
+                )
+                claude_notice = (
+                    f"Claude availability window has passed ({until_str}); the normal "
+                    "hierarchy applies again - route Claude work as usual."
+                )
+            elif USER_CLAUDE_OVERRIDE_RE.search(prompt_text):
+                since_str = "earlier"
+                try:
+                    since_str = availability_reset.fmt_utc(float(active_marker["since"]))
+                except (TypeError, ValueError):
+                    since_str = "earlier"
+                def clear_marker(st: dict) -> None:
+                    st.pop("claude_unavailable", None)
+                _update_state(session_id, clear_marker)
+                log_gate_decision(
+                    session_id,
+                    "UserPromptSubmit",
+                    "-",
+                    None,
+                    "claude-circuit-user-override",
+                )
+                claude_notice = (
+                    "The user explicitly asked for Claude: attempt it now (retry_unavailable=true "
+                    f"where supported) and report the real outcome; the earlier failure at {since_str} "
+                    "is not proof it is unavailable now."
+                )
     context = _standing_policy_context(session_id)
-    if not context:
-        return {}
-    if requires_decision:
+    if context and requires_decision:
         context += (
             " This turn is classified as important diagnosis/architecture work; before the final "
             "response, record a completed native flagship or consult_decision receipt."
         )
+    if claude_notice:
+        context = f"{context} {claude_notice}" if context else claude_notice
+    if pointer:
+        context = f"{context} {pointer}" if context else pointer
+    if not context:
+        return {}
     return {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
@@ -1091,11 +1401,12 @@ def _standing_policy_context(session_id: str) -> str:
         if session_id:
             session_state = _read_state(session_id)
             used = int(session_state.get("direct_labour_since_relief") or 0)
-            claude_circuit_open = (
-                session_state.get("claude_unavailable") in CLAUDE_UNAVAILABLE_REASONS
-            )
+            marker = active_claude_unavailable_marker(session_id)
+            claude_circuit_open = marker is not None
+            claude_circuit_text = format_claude_circuit_context(marker) if marker else ""
         else:
             claude_circuit_open = False
+            claude_circuit_text = ""
         remaining = max(0, limit - used)
         version = str(BROKER_VERSION)
         if not re.fullmatch(r"\d+\.\d+\.\d+", version):
@@ -1126,13 +1437,18 @@ def _standing_policy_context(session_id: str) -> str:
             "For factual investigation, route task_kind='research' with 1-3 exact research_questions; "
             "every request must demand full-scope coverage beyond the first match, primary evidence, "
             "a competing-explanation check, and NOT FOUND with searched boundaries instead of inference."
-            + (f" {CLAUDE_CIRCUIT_CONTEXT}" if claude_circuit_open else "")
+            + (f" {claude_circuit_text}" if claude_circuit_open else "")
         )
     except Exception:  # noqa: BLE001
         return ""
 
 
-def register_brain_override(session_id: str, package_id: str, reason: str) -> bool:
+def register_brain_override(
+    session_id: str,
+    package_id: str,
+    reason: str,
+    budget: int | None = None,
+) -> bool:
     session_id = str(session_id or "").strip()
     package_id = str(package_id or "").strip()
     reason = " ".join(str(reason or "").split())
@@ -1143,13 +1459,21 @@ def register_brain_override(session_id: str, package_id: str, reason: str) -> bo
     ):
         return False
 
+    clamped_budget = _clamp_override_budget(budget)
+
     def update(state: dict) -> None:
         overrides = state.setdefault("brain_overrides", {})
-        overrides[package_id.lower()] = {
+        entry = {
             "package_id": package_id,
             "reason": reason,
             "registered_at": time.time(),
         }
+        if clamped_budget is not None:
+            entry["budget"] = clamped_budget
+            state["relief_budget"] = clamped_budget
+        else:
+            state.pop("relief_budget", None)
+        overrides[package_id.lower()] = entry
         state["direct_labour_since_relief"] = 0
         state["direct_labour_block_counts"] = {}
         state["labour_relief_sequence"] = int(
@@ -1161,9 +1485,16 @@ def register_brain_override(session_id: str, package_id: str, reason: str) -> bo
         # Also append to the durable log. Session STATE is reset each turn, so
         # anything recorded only there vanishes and the rendered audit silently
         # loses packages; the log is append-only and survives.
+        effective_budget = (
+            clamped_budget if clamped_budget is not None else effective_direct_labour_limit()
+        )
         log_gate_decision(
             session_id, "Override", "-", None, "override",
-            extra={"work_package_id": package_id, "reason": reason},
+            extra={
+                "work_package_id": package_id,
+                "reason": reason,
+                "budget": effective_budget,
+            },
         )
     return ok
 
@@ -1173,12 +1504,26 @@ def routing_override_cli(argv: list[str]) -> int:
     parser.add_argument("--session", required=True)
     parser.add_argument("--package", required=True)
     parser.add_argument("--reason", required=True)
+    parser.add_argument("--budget", type=int, default=None)
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code or 2)
-    ok = register_brain_override(args.session, args.package, args.reason)
-    sys.stdout.write(json.dumps({"registered": ok, "package": args.package}))
+    effective_budget = (
+        _clamp_override_budget(args.budget)
+        if args.budget is not None
+        else effective_direct_labour_limit()
+    )
+    ok = register_brain_override(
+        args.session, args.package, args.reason, budget=args.budget
+    )
+    sys.stdout.write(
+        json.dumps({
+            "registered": ok,
+            "package": args.package,
+            "budget": effective_budget,
+        })
+    )
     return 0 if ok else 2
 
 
@@ -1858,28 +2203,32 @@ def pre_tool_use(payload: dict) -> dict:
             extra={"child": True},
         )
         return {}
-    claude_unavailable = _claude_unavailable_reason(session_id)
-    if claude_unavailable and _is_claude_consult_route(
-        payload.get("tool_name"), payload.get("tool_input") or {}
-    ):
-        # Availability failures are session-scoped. This is a hard circuit breaker,
-        # deliberately independent of warn/shadow mode, so an unavailable expensive
-        # provider is not retried every turn. Only the enum is surfaced or logged.
-        log_gate_decision(
-            session_id,
-            "PreToolUse",
-            normalized_tool,
-            None,
-            "deny",
-            extra={"reason": "claude_session_unavailable", "kind": claude_unavailable},
-        )
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": CLAUDE_CIRCUIT_CONTEXT,
+    marker = active_claude_unavailable_marker(session_id)
+    tool_input = payload.get("tool_input") or {}
+    if marker and _is_claude_consult_route(payload.get("tool_name"), tool_input):
+        req_model = str(tool_input.get("target_model") or tool_input.get("model") or "").strip().lower()
+        if _model_matches(marker.get("model", "*"), req_model):
+            deny_reason = format_claude_circuit_context(marker)
+            log_gate_decision(
+                session_id,
+                "PreToolUse",
+                normalized_tool,
+                None,
+                "deny",
+                extra={
+                    "reason": "claude_session_unavailable",
+                    "kind": marker.get("kind"),
+                    "model": marker.get("model"),
+                    "until": marker.get("until"),
+                },
+            )
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": deny_reason,
+                }
             }
-        }
     # Host-independent on purpose. This used to require host in {codex, claude}, which
     # meant a hook invoked without its host argument silently stopped enforcing a
     # security boundary. Nothing legitimate needs the SENDER to run agy itself: the
@@ -1951,6 +2300,36 @@ def pre_tool_use(payload: dict) -> dict:
     if not session_id or not category:
         log_gate_decision(session_id, "PreToolUse", normalized_tool, category, "allow")
         return {}
+    if normalized_tool in READ_TOOL_NAMES or normalized_tool in SEARCH_TOOL_NAMES:
+        tool_input = payload.get("tool_input")
+        raw_target = None
+        if isinstance(tool_input, dict):
+            raw_target = (
+                tool_input.get("file_path")
+                or tool_input.get("path")
+                or tool_input.get("notebook_path")
+                or tool_input.get("filePath")
+            )
+        elif isinstance(tool_input, str):
+            raw_target = tool_input
+        if raw_target:
+            target_norm = _normalize_target_path(str(raw_target))
+            state_snapshot = _read_state(session_id)
+            cited_list = state_snapshot.get("cited_paths")
+            if isinstance(cited_list, list):
+                for tail in cited_list:
+                    if isinstance(tail, str) and (
+                        target_norm == tail or target_norm.endswith("/" + tail)
+                    ):
+                        log_gate_decision(
+                            session_id,
+                            "PreToolUse",
+                            normalized_tool,
+                            category,
+                            "verification-read",
+                            extra={"category": category},
+                        )
+                        return {}
     reserved = reserve_direct_labour(
         session_id,
         category,
@@ -1968,7 +2347,7 @@ def pre_tool_use(payload: dict) -> dict:
     if allowed:
         log_gate_decision(session_id, "PreToolUse", normalized_tool, category, "reserve")
         return {}
-    limit = effective_direct_labour_limit()
+    limit = state.get("relief_budget") or effective_direct_labour_limit()
     block_counts = state.get("direct_labour_block_counts") or {}
     since_relief = int(state.get("direct_labour_since_relief") or 0)
     block_observed = _labour_counts_text(block_counts, limit)
@@ -1995,7 +2374,9 @@ def pre_tool_use(payload: dict) -> dict:
         f"   {_routing_override_command(session_id)}\n"
         "Delegation tools are never blocked. High-risk judgment and final approval stay with "
         "the brain; the deterministic evidence, test, documentation, or mechanical remainder "
-        "does not. Any registered override must appear verbatim in the completion audit."
+        "does not. Any registered override must appear verbatim in the completion audit. "
+        f"For a live investigation, register one override with --budget N (max {override_max_budget()}) "
+        "instead of many; reading lines cited by a delegated result is free."
     )
     if gate_mode() == "warn":
         # Shakedown mode: record exactly what WOULD have been denied, then allow it.
@@ -2129,7 +2510,12 @@ def _claude_failure_reason(payload: dict) -> str | None:
         r"\b(?:quota|usage\s+limit)\b.{0,50}\b(?:exceeded|exhausted|depleted|reached|hit|used\s+up)\b|"
         r"\b(?:exceeded|exhausted|depleted|reached|hit)\b.{0,35}\b(?:quota|usage\s+limit)\b|"
         r"\byou(?:'ve|\s+have)\s+hit\s+your\s+(?:usage\s+)?limit\b|"
-        r"\b(?:daily|weekly|monthly)\s+(?:usage\s+)?limit\s+(?:was\s+|is\s+)?(?:reached|exceeded)\b",
+        r"\b(?:daily|weekly|monthly)\s+(?:usage\s+)?limit\s+(?:was\s+|is\s+)?(?:reached|exceeded)\b|"
+        r"\b(?:five\s+hour|5\s+hour|weekly|seven\s+day|7\s+day)\s+(?:usage\s+)?limit\b|"
+        r"\brate\s+limit\b.{0,50}\b(?:exceeded|reached|rejected|hit)\b|"
+        r"\b(?:exceeded|reached|rejected|hit)\b.{0,50}\brate\s+limit\b|"
+        r"\blimit\b.{0,40}\brejected\b|"
+        r"\brejected\b.{0,40}\blimit\b",
         text,
     ):
         return "quota"
@@ -2183,14 +2569,31 @@ def _claude_failure_reason(payload: dict) -> str | None:
     return None
 
 
-def _record_claude_unavailable(payload: dict) -> str | None:
+def _record_claude_unavailable(payload: dict) -> dict | None:
     session_id = str(payload.get("session_id") or "").strip()
     reason = _claude_failure_reason(payload)
     if not session_id or reason not in CLAUDE_UNAVAILABLE_REASONS:
         return None
 
+    tool_input = payload.get("tool_input") or {}
+    raw_model = str(tool_input.get("target_model") or tool_input.get("model") or "").strip().lower()
+    requested_model = raw_model if raw_model else "*"
+
+    result = _unwrap_switchboard_response(payload.get("tool_response"))
+    text = _failure_text(result) if isinstance(result, dict) else ""
+
+    now_epoch = time.time()
+    until_epoch = availability_reset.latch_until(reason, text, now=now_epoch)
+
+    marker = {
+        "kind": reason,
+        "model": requested_model,
+        "since": now_epoch,
+        "until": until_epoch,
+    }
+
     def update(state: dict) -> None:
-        state["claude_unavailable"] = reason
+        state["claude_unavailable"] = marker
 
     if _update_state(session_id, update) is None:
         return None
@@ -2200,9 +2603,9 @@ def _record_claude_unavailable(payload: dict) -> str | None:
         normalize_tool_name(payload.get("tool_name")),
         None,
         "claude-circuit-open",
-        extra={"kind": reason},
+        extra={"kind": reason, "model": requested_model, "until": until_epoch},
     )
-    return reason
+    return marker
 
 
 def _merge_post_tool_context(result: dict | None, context: str | None) -> dict:
@@ -2377,8 +2780,118 @@ def post_tool_use(payload: dict) -> dict:
     mutated = _is_mutating(payload.get("tool_name"), tool_input)
     if session_id and mutated and not _payload_is_cheap_native_call(payload):
         mark_mutated(session_id)
-    claude_failure = _record_claude_unavailable(payload)
-    claude_context = CLAUDE_CIRCUIT_CONTEXT if claude_failure else None
+
+    # WP-PB-I4: project edit tracking and note marking
+    host_label = _hook_host(payload)
+    if mutated and normalized_tool not in SHELL_TOOL_NAMES and "shell" not in normalized_tool:
+        candidate_paths: list[str] = []
+        if isinstance(tool_input, dict):
+            for k in ("file_path", "path", "notebook_path", "filePath"):
+                v = tool_input.get(k)
+                if isinstance(v, str) and v.strip():
+                    candidate_paths.append(v.strip())
+            if "patch" in normalized_tool:
+                for text_k in ("patch", "input", "patch_text", "content", "diff"):
+                    txt = tool_input.get(text_k)
+                    if isinstance(txt, str) and txt:
+                        for m in re.finditer(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", txt, re.MULTILINE):
+                            candidate_paths.append(m.group(1).strip())
+        elif isinstance(tool_input, str):
+            if "patch" in normalized_tool:
+                for m in re.finditer(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", tool_input, re.MULTILINE):
+                    candidate_paths.append(m.group(1).strip())
+
+        payload_cwd = payload.get("cwd")
+        for raw_path in dict.fromkeys(candidate_paths):
+            p = raw_path
+            if payload_cwd:
+                try:
+                    p_obj = Path(p)
+                    if not p_obj.is_absolute():
+                        p = str(Path(payload_cwd) / p_obj)
+                except Exception:
+                    pass
+            try:
+                import project_resolver
+                res = project_resolver.canonical_project(p)
+                cid = res[0] if res else None
+            except Exception:
+                cid = None
+
+            if cid:
+                if session_id:
+                    def inc_edit(st: dict, _cid=cid) -> None:
+                        edits = st.get("project_edits")
+                        if not isinstance(edits, dict):
+                            edits = {}
+                            st["project_edits"] = edits
+                        curr = edits.get(_cid, 0)
+                        if not isinstance(curr, int) or curr < 0:
+                            curr = 0
+                        edits[_cid] = min(curr + 1, 10000)
+
+                    _update_state(session_id, inc_edit)
+                try:
+                    import project_notes
+                    project_notes.record_activity(cid, host_label, "edit")
+                except Exception:
+                    pass
+
+    # When the tool is the Switchboard record_work_memory or project_brief
+    if normalized_tool in {
+        "record_work_memory",
+        "mcp__agent_switchboard__record_work_memory",
+        "project_brief",
+        "mcp__agent_switchboard__project_brief",
+    }:
+        op = str(tool_input.get("op") or "").strip().lower() if isinstance(tool_input, dict) else ""
+        is_brief_add = (
+            normalized_tool in {"project_brief", "mcp__agent_switchboard__project_brief"}
+            and op == "add"
+        )
+        is_work_memory = normalized_tool in {
+            "record_work_memory",
+            "mcp__agent_switchboard__record_work_memory",
+        }
+        if is_brief_add or is_work_memory:
+            proj_arg = tool_input.get("project") if isinstance(tool_input, dict) else None
+            cid = None
+            try:
+                import project_resolver
+                if proj_arg:
+                    c_res = project_resolver.canonical_project(proj_arg)
+                    cid = c_res[0] if c_res else None
+                elif payload.get("cwd"):
+                    c_res = project_resolver.canonical_project(cwd=payload.get("cwd"))
+                    cid = c_res[0] if c_res else None
+            except Exception:
+                cid = None
+
+            if cid and session_id:
+                def mark_noted(st: dict, _cid=cid) -> None:
+                    edits = st.get("project_edits")
+                    count = edits.get(_cid, 0) if isinstance(edits, dict) else 0
+                    if not isinstance(count, int) or count < 0:
+                        count = 0
+                    noted = st.get("project_noted")
+                    if not isinstance(noted, dict):
+                        noted = {}
+                        st["project_noted"] = noted
+                    noted[_cid] = count
+
+                _update_state(session_id, mark_noted)
+    claude_marker = _record_claude_unavailable(payload)
+    claude_context = format_claude_circuit_context(claude_marker) if claude_marker else None
+
+    if session_id and _is_switchboard_result_or_route_tool(normalized_tool):
+        try:
+            dispatch_result = _extract_dispatch_result(payload)
+            if isinstance(dispatch_result, dict):
+                cited = _collect_cited_paths(dispatch_result)
+                if cited:
+                    _record_cited_paths(session_id, cited)
+        except Exception:
+            pass
 
     # WP-SB8A item 1: credit/decision-receipt must be computed from the ORIGINAL
     # payload BEFORE any ingress replacement is considered. The old order returned
@@ -2425,9 +2938,10 @@ def post_tool_use(payload: dict) -> dict:
             checkpoint_sequence = (
                 -1 if checkpoint_sequence is None else int(checkpoint_sequence)
             )
+            limit = state.get("relief_budget") or effective_direct_labour_limit()
             if (
                 int(state.get("direct_labour_since_relief") or 0)
-                == effective_direct_labour_limit()
+                == limit
                 and checkpoint_sequence != sequence
             ):
                 state["labour_checkpoint_sequence"] = sequence
@@ -2435,20 +2949,23 @@ def post_tool_use(payload: dict) -> dict:
 
         state = _update_state(session_id, update)
         if state and notify["value"]:
+            limit = state.get("relief_budget") or effective_direct_labour_limit()
             block_observed = _labour_counts_text(
-                state.get("direct_labour_block_counts") or {}, effective_direct_labour_limit()
+                state.get("direct_labour_block_counts") or {}, limit
             )
             checkpoint = {
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",
                     "additionalContext": (
-                        f"Routing checkpoint: {effective_direct_labour_limit()} direct labour "
+                        f"Routing checkpoint: {limit} direct labour "
                         f"calls in this block ({block_observed}). The next eligible labour call "
                         "will be denied. Cheapest next move: dispatch the bounded package with "
                         "route_agent_task (target_agent='antigravity', surface='cli', "
                         "target_model='gemini flash', effort='high', mode='plan'); use "
                         "task_kind='research' with 1-3 research_questions for reads/searches/"
-                        "evidence, or task_kind='implementation'/'quick_check' for tests/other."
+                        "evidence, or task_kind='implementation'/'quick_check' for tests/other. "
+                        f"For a live investigation, register one override with --budget N (max {override_max_budget()}) "
+                        "instead of many; reading lines cited by a delegated result is free."
                     ),
                 }
             }
@@ -2514,6 +3031,146 @@ def _extract_dispatch_result(payload: dict) -> dict | None:
     if direct is not None:
         return direct
     return None
+
+
+def _is_switchboard_result_or_route_tool(tool_name: object) -> bool:
+    norm = normalize_tool_name(str(tool_name or ""))
+    return norm in {
+        "request_result",
+        "request-result",
+        "route_agent_task",
+        "route-agent-task",
+        "mcp__agent_switchboard__request_result",
+        "mcp__agent_switchboard__request-result",
+        "mcp__agent_switchboard__route_agent_task",
+        "mcp__agent_switchboard__route-agent-task",
+    }
+
+
+def _normalize_cited_tail(raw_path: str) -> str | None:
+    p = str(raw_path or "").strip().replace("\\", "/")
+    if not p:
+        return None
+    if os.name == "nt":
+        p = p.lower()
+    while p.startswith("./"):
+        p = p[2:]
+    if not p:
+        return None
+    is_abs = False
+    if len(p) >= 2 and p[1] == ":" and p[0].isalpha():
+        is_abs = True
+        p = p[2:]
+    elif p.startswith("/"):
+        is_abs = True
+    parts = [part for part in p.split("/") if part and part != "."]
+    if is_abs and len(parts) > 3:
+        parts = parts[-3:]
+    # Only files can be verified line-by-line: a cited directory must never make a broad
+    # Grep/Glob over that directory free, so the last component needs a file extension.
+    if not parts or not re.fullmatch(r"[^/]*[^./][^/]*\.[A-Za-z0-9]{1,8}", parts[-1]):
+        return None
+    p = "/".join(parts)
+    if not p or len(p) > 260:
+        return None
+    return p
+
+
+def _normalize_target_path(path_str: str) -> str:
+    p = str(path_str or "").strip().replace("\\", "/")
+    if os.name == "nt":
+        p = p.lower()
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+def _collect_cited_paths(result: dict) -> list[str]:
+    raw_paths: list[str] = []
+    structured = result.get("structured_output")
+    if isinstance(structured, str):
+        structured = _coerce_json_dict(structured)
+
+    candidates = []
+    if isinstance(structured, dict):
+        candidates.append(structured)
+    if candidates and candidates[0] is not result:
+        candidates.append(result)
+    elif not candidates:
+        candidates.append(result)
+
+    for src in candidates:
+        rc = src.get("research_coverage")
+        if isinstance(rc, list):
+            for item in rc:
+                if isinstance(item, dict):
+                    ev_list = item.get("evidence")
+                    if isinstance(ev_list, list):
+                        for ev in ev_list:
+                            if isinstance(ev, dict):
+                                loc = ev.get("location")
+                                if isinstance(loc, str) and loc.strip():
+                                    raw_paths.append(loc.strip())
+
+        ev_items = src.get("evidence")
+        if isinstance(ev_items, list):
+            for ev in ev_items:
+                if isinstance(ev, dict):
+                    p = ev.get("path")
+                    if isinstance(p, str) and p.strip():
+                        raw_paths.append(p.strip())
+
+        claims = src.get("claims")
+        if isinstance(claims, list):
+            for cl in claims:
+                if isinstance(cl, dict):
+                    ev_list = cl.get("evidence")
+                    if isinstance(ev_list, list):
+                        for ev in ev_list:
+                            if isinstance(ev, str) and ev.strip():
+                                s = ev.strip()
+                                m = re.search(r":(?:[0-9]+|L[0-9A-Za-z_.:-]*)$", s)
+                                if m:
+                                    file_part = s[:m.start()].strip()
+                                    if file_part:
+                                        raw_paths.append(file_part)
+
+        af = src.get("applied_files")
+        if isinstance(af, list):
+            for item in af:
+                if isinstance(item, str) and item.strip():
+                    raw_paths.append(item.strip())
+                elif isinstance(item, dict) and "path" in item:
+                    p = str(item["path"]).strip()
+                    if p:
+                        raw_paths.append(p)
+
+    normalized: list[str] = []
+    for raw in raw_paths:
+        norm = _normalize_cited_tail(raw)
+        if norm and norm not in normalized:
+            normalized.append(norm)
+    return normalized
+
+
+def _record_cited_paths(session_id: str, paths: list[str]) -> None:
+    if not session_id or not paths:
+        return
+
+    def update(state: dict) -> None:
+        raw_list = state.get("cited_paths")
+        cited: list[str] = list(raw_list) if isinstance(raw_list, list) else []
+        for p in paths:
+            if not isinstance(p, str) or not p or len(p) > 260:
+                continue
+            if p not in cited:
+                cited.append(p)
+        if len(cited) > 200:
+            cited = cited[-200:]
+        state["cited_paths"] = cited
+
+    _update_state(session_id, update)
+
 
 
 def _decision_event_resolves(session_id: str, ledger_ref: str) -> bool:
@@ -2688,6 +3345,7 @@ def _credit_async_flash_start(
         state["direct_labour_since_relief"] = 0
         state["direct_labour_block_counts"] = {}
         state["labour_relief_sequence"] = int(state.get("labour_relief_sequence") or 0) + 1
+        state.pop("relief_budget", None)
         dispatches = state.setdefault("switchboard_dispatches", [])
         dispatches.append({"receipt": receipt, "work_package_id": work_package, "outcome": "async_started",
                            "request_id": request_id})
@@ -2772,6 +3430,7 @@ def _credit_switchboard_dispatch(session_id: str, normalized_tool: str, payload:
         state["direct_labour_since_relief"] = 0
         state["direct_labour_block_counts"] = {}
         state["labour_relief_sequence"] = int(state.get("labour_relief_sequence") or 0) + 1
+        state.pop("relief_budget", None)
         dispatches = state.setdefault("switchboard_dispatches", [])
         dispatches.append({"receipt": receipt, "work_package_id": work_package, "outcome": outcome})
         granted["value"] = True
@@ -3008,6 +3667,52 @@ def stop(payload: dict) -> dict:
                 "required for this check."
             ),
         }
+    if os.environ.get("AGENT_BROKER_PROJECT_NOTE_REMINDER") != "0":
+        edits = state.get("project_edits")
+        if isinstance(edits, dict):
+            noted = state.get("project_noted")
+            if not isinstance(noted, dict):
+                noted = {}
+            reminded = state.get("project_reminded")
+            if not isinstance(reminded, dict):
+                reminded = {}
+            due = sorted(
+                pid
+                for pid, count in edits.items()
+                if isinstance(count, int)
+                and count > int(noted.get(pid, 0) or 0)
+                and not reminded.get(pid)
+            )
+            if due:
+                def mark_reminded(st: dict) -> None:
+                    r = st.get("project_reminded")
+                    if not isinstance(r, dict):
+                        r = {}
+                        st["project_reminded"] = r
+                    for pid in due:
+                        r[pid] = True
+
+                _update_state(session_id, mark_reminded)
+                log_gate_decision(
+                    session_id,
+                    "Stop",
+                    "-",
+                    None,
+                    "project-note-reminder",
+                    extra={"ids": due},
+                )
+                return {
+                    "decision": "block",
+                    "reason": (
+                        f"Before finishing: you changed files in {', '.join(due)} this session. "
+                        "So other sessions (Codex, Claude, Gemini) do not repeat or undo this work, "
+                        "record what worked, what failed, or what was decided: "
+                        "project_brief op=add project=<id> kind=worked|failed|decision|pitfall "
+                        "text=<one sentence> evidence=<file:line, test or command>. "
+                        "Record only facts you verified; notes stay pending until reviewed. "
+                        "If nothing is worth recording, say so and finish."
+                    ),
+                }
     if not has_mutation(session_id):
         return {}
     if audit_mode() == "on-demand":

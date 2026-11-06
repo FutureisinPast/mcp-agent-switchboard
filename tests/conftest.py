@@ -46,3 +46,22 @@ def _isolated_broker_event_db(tmp_path, monkeypatch):
     that need a specific DB monkeypatch DB_PATH again after this fixture runs."""
     monkeypatch.setattr(broker, "DB_PATH", tmp_path / "isolated-state.sqlite")
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_live_decision_evaluator(monkeypatch):
+    """Tests must never launch the real Antigravity CLI for the decision evaluator.
+    Tests that exercise the evaluator mock it and opt in by setting the variable."""
+    monkeypatch.setenv("AGENT_BROKER_DECISION_EVALUATOR_MODEL", "off")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_broker_home_and_fast_wait(tmp_path, monkeypatch):
+    """Inline-wait for detached workers is capped low, and every path derived from the
+    broker home (worker logs, runs/ layout, retention) lands under a per-test tmp dir."""
+    home = tmp_path / "broker-home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("AGENT_BROKER_INLINE_WAIT_SECONDS", "15")
+    monkeypatch.setenv("AGENT_BROKER_HOME", str(home))
+    monkeypatch.setattr(broker, "BROKER_DIR", home)
+    yield

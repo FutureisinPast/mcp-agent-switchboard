@@ -2,7 +2,7 @@
 
 **Use Claude Code, Codex, Gemini, Antigravity, and VS Code together — without copy-pasting context between them.**
 
-Agent Switchboard is a **local MCP bridge** that lets your AI coding agents hand tasks to each other, review each other's work, run multi-round debates, and share compact project context — a local nervous system where the tools stay separate but coordinate through one local broker.
+Agent Switchboard is a **local MCP server** that connects your coding assistants through their existing CLIs and IDE routes. Delegate bounded work, run independent test packages in parallel, request cross-model reviews, and share compact project context. Optional **Graphify-backed code maps** help agents locate relevant symbols, files, and dependencies before reading source.
 
 **No API keys. No cloud broker. No extra billing.** It uses the local CLIs, IDE bridge routes, and subscriptions you already have where possible.
 
@@ -18,7 +18,9 @@ Modern AI coding workflows are fragmented. You might use **Codex** or **Claude C
 - **Consult flagships without dumping context** - Codex/Claude hosts use their native same-vendor flagship child agent, then `consult_decision` adds only the bounded cross-vendor leg needed for the task; Gemini uses the broker for both.
 - **See across chats** - pull a *compact snapshot* of what another agent's session knows; **Codex and Claude Code are read on demand from disk**, no copy-paste.
 - **Run cross-model debate** - Codex vs Claude for N rounds, then synthesize a verdict.
-- **Keep the selected model as the brain, route labour cheaply** - global model rules, reader/workhorse roles, and a completion audit are installed and refreshed by the same exe.
+- **Find code with optional Graphify maps** - query symbols, relationships, literal messages, and suggested context files in registered projects; verify the returned source locations before acting.
+- **Keep project knowledge across hosts** - resolve project aliases and load reviewed project briefs, decisions, pitfalls, and lessons instead of repeating discovery in each session.
+- **Keep the selected model as the brain, route labour cheaply** - global model rules and reader/workhorse roles are installed and refreshed by the same exe. Routing activity is recorded automatically in the session ledger.
 - **Use Gemini Flash as an external workhorse** - Codex and Claude brains route eligible bounded labour through the Switchboard MCP `route_agent_task` tool by default, without treating Flash as a native child or authoritative brain. Gemini, Antigravity, and unknown hosts receive no automatic downward routing, though explicit routes remain available.
 - **Token compaction is built in** - compressed handoffs, compact context packs, work memory, and retrievable originals instead of dumping entire transcripts.
 - **Keep it local** - SQLite state under `~/.agent-broker`; no private chat scraping, no cloud broker.
@@ -105,6 +107,8 @@ The broker is a dependency-free Python MCP server. Each assistant talks to it ov
 
 Use the Switchboard MCP tool `route_agent_task` with `target_agent: "antigravity"`, `surface: "cli"`, `target_model: "gemini flash"`, and `effort: "high"`. The sender brain must not run `agy` directly; `surface: "cli"` tells Switchboard to invoke its internal CLI backend. Set `mode: "plan"` for read-only work. For implementation, set `mode: "accept-edits"` and include `work_package_id`, 1-5 exact `allowed_files`, and `acceptance_criteria`; Switchboard rejects an incomplete or whole-plan handoff.
 
+For Codex tests or scripts that need temporary files or reports, use `target_agent: "codex"`, `surface: "cli"`, and `mode: "workspace-write"`. `accept-edits` and `acceptEdits` are aliases for the same sandbox. New `task_kind: "implementation"` requests default to workspace-write when mode is omitted; research and other tasks default to read-only. Explicit `plan` or `read-only` always remains read-only. Unknown modes are rejected instead of silently reducing access. For parallel test packages, set `async: true`, give each package independent output paths, and collect each returned ID with `request_result`.
+
 ---
 
 ## See what another chat knows (active context snapshots)
@@ -187,6 +191,14 @@ On Windows, Switchboard-owned bounded subprocesses use hidden-window flags and a
 ---
 
 ## Changelog
+
+### v1.0.65 (combined release since v1.0.57)
+- **Optional Graphify integration:** project aliases and exclusions, secret-aware literal indexing and response masking, and background refresh of stale or missing snapshots with visible refresh status. Explicit refresh stays synchronous; code maps remain source locators, not authoritative answers. See [adapter details](code_graph_runtime/ADAPTER_README.md).
+- **Shared project context:** project resolution and reviewed per-project notes/briefs carry decisions, pitfalls, and working approaches across hosts. Only verified lessons are exposed automatically.
+- **Codex execution and parallel work:** canonical sandbox modes survive CLI, inbox, queue, and worker dispatch. New implementation requests default to `workspace-write`; other work defaults to `read-only`, and explicit read-only intent is preserved. `async: true` returns a request ID without waiting inline; poll each ID with `request_result`.
+- **Worker and routing reliability:** detached-work handling, configurable inline waits, provider availability/reset handling, routing evidence and override budgets, and organized runtime artifacts with protected-state retention rules.
+- **Installation and portability:** remove the obsolete bridge publisher before installing the current bridge, include the new runtime modules in the executable, and remove machine-specific workspace defaults from the Antigravity launcher.
+- **Regression isolation:** code-graph usage tests clear inherited thread identity before setting a synthetic session, preserving the production guard against conflicting identities.
 
 ### v1.0.57 (`code_graph`: literal search, context suggestions, usage events, hot-reloading adapter)
 - Routing telemetry: async Flash dispatches now record their target and model, and request_result records the terminal outcome, so routing reports show real Flash use and failure rates (previously async packages were invisible to the gate log).
