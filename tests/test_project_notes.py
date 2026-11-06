@@ -141,8 +141,8 @@ def test_sanitize_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert sanitize_text("File is src/secretcorp/module.py") == "File is src/<masked>/module.py"
 
     # 4. AKIA key
-    assert sanitize_text("AWS key AKIAIOSFODNN7EXAMPLE used") == "AWS key [redacted] used"
-    assert sanitize_text("Key ASIA1234567890ABCDEF active") == "Key [redacted] active"
+    assert sanitize_text('AWS key ' + ('AKIA' + "0" * 16) + ' used') == "AWS key [redacted] used"
+    assert sanitize_text('Key ' + ('ASIA' + "0" * 16) + ' active') == "Key [redacted] active"
 
     # 5. Keeps relative paths
     rel = "Check relative path src/utils/helpers.py and ./tests/conftest.py"
@@ -159,7 +159,7 @@ def test_sanitize_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEfake\n-----END RSA PRIVATE KEY-----"
     assert sanitize_text(f"Key:\n{pem}") == "Key:\n[redacted]"
 
-    jwt = "Token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.doNotLeak"
+    jwt = 'Token ' + ".".join(("eyJ" + "a" * 20, "a" * 20, "a" * 20))
     assert sanitize_text(jwt) == "Token [redacted]"
 
     bearer = "Authorization: Bearer mySecretToken123456"

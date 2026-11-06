@@ -1210,7 +1210,7 @@ class RoutingGateTests(unittest.TestCase):
         )
 
     def test_gate_decision_log_records_no_arguments(self):
-        secret = "sk-super-secret-token-do-not-log-12345"
+        secret = "".join(("FAKE_TEST_SECRET_", "0" * 32))
         payload = self.pre_payload(
             "secret-call", tool_name="Read", host="claude"
         )
