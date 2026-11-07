@@ -258,6 +258,50 @@ class ClaudeChildDisallowedToolsTests(unittest.TestCase):
 # shell commands for the child -- verified regression, see agent_broker_mcp.py).
 # ---------------------------------------------------------------------------
 class CodexChildFlagsTests(unittest.TestCase):
+    def _network_command(self, mode, config):
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             mock.patch.object(broker, "load_config", return_value=config), \
+             mock.patch.object(broker, "discover_codex", return_value="codex"), \
+             mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", tmpdir)), \
+             mock.patch.object(broker, "BROKER_DIR", Path(tmpdir) / "broker-home"), \
+             mock.patch.object(broker, "run_process", return_value=(0, codex_stream("ok"), "")) as run:
+            broker.consult_codex(tmpdir, "check", mode, None, None, 30)
+        return run.call_args.args[0]
+
+    def test_workspace_network_and_live_web_defaults(self):
+        command = self._network_command("workspace-write", {})
+        values = [command[i + 1] for i, arg in enumerate(command) if arg == "-c"]
+        self.assertEqual(command[command.index("--sandbox") + 1], "workspace-write")
+        self.assertIn('web_search="live"', values)
+        self.assertIn("sandbox_workspace_write.network_access=true", values)
+
+    def test_read_only_web_does_not_promote_filesystem_or_shell_network(self):
+        command = self._network_command("read-only", {})
+        values = [command[i + 1] for i, arg in enumerate(command) if arg == "-c"]
+        self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+        self.assertIn('web_search="live"', values)
+        self.assertFalse(any(value.startswith("sandbox_workspace_write.network_access=") for value in values))
+
+    def test_network_opt_out_is_explicit_for_the_child(self):
+        command = self._network_command("workspace-write", {"codex_web_search": "disabled", "codex_network_access": False})
+        values = [command[i + 1] for i, arg in enumerate(command) if arg == "-c"]
+        self.assertIn('web_search="disabled"', values)
+        self.assertIn("sandbox_workspace_write.network_access=false", values)
+
+    def test_invalid_network_settings_fail_before_provider_discovery(self):
+        for config in ({"codex_web_search": "invalid"}, {"codex_network_access": "yes"}):
+            with mock.patch.object(broker, "load_config", return_value=config), \
+                 mock.patch.object(broker, "discover_codex") as discover:
+                with self.assertRaises(ValueError):
+                    broker.consult_codex("p", "check")
+                discover.assert_not_called()
+
+    def test_builtin_web_permission_preserves_the_mcp_recursion_ban(self):
+        for sanitize in (broker.sanitize_prompt, broker.sanitize_flash_workhorse_prompt):
+            prompt = sanitize("check public information")
+            self.assertIn("Built-in web search and URL fetching", prompt)
+            self.assertIn("Do not call MCP tools or ask another", prompt)
+
     def test_switchboard_mcp_disabled_and_multi_agent_disabled_present(self):
         with tempfile.TemporaryDirectory() as tmpdir, \
              mock.patch.object(broker, "load_config", return_value={}), \

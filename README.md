@@ -109,6 +109,10 @@ Use the Switchboard MCP tool `route_agent_task` with `target_agent: "antigravity
 
 For Codex tests or scripts that need temporary files or reports, use `target_agent: "codex"`, `surface: "cli"`, and `mode: "workspace-write"`. `accept-edits` and `acceptEdits` are aliases for the same sandbox. New `task_kind: "implementation"` requests default to workspace-write when mode is omitted; research and other tasks default to read-only. Explicit `plan` or `read-only` always remains read-only. Unknown modes are rejected instead of silently reducing access. For parallel test packages, set `async: true`, give each package independent output paths, and collect each returned ID with `request_result`.
 
+Codex children receive live built-in web search by default. Workspace-write children also receive an explicit network grant for shell commands; read-only children keep their filesystem and shell-network restrictions and use built-in web tools for public research. Broker `config.json` supports `codex_web_search` (`live`, `cached`, or `disabled`) and boolean `codex_network_access` (default `true`) to override these child defaults. Disabling shell networking does not disable hosted web search; set both options when both should be unavailable.
+
+On Windows, a restricted-token `curl.exe` can fail with Schannel `SEC_E_NO_CREDENTIALS` even when verified Python HTTPS succeeds. Use a working TLS-verifying client or built-in web tools; do not disable certificate verification to work around that client error.
+
 ---
 
 ## See what another chat knows (active context snapshots)
@@ -191,6 +195,10 @@ On Windows, Switchboard-owned bounded subprocesses use hidden-window flags and a
 ---
 
 ## Changelog
+
+### Unreleased v1.0.66 (delegated worker internet)
+- Codex children explicitly request live web search and workspace-write networking without promoting read-only filesystem access. Broker configuration can opt out of either capability.
+- Child prompts explicitly allow built-in web research while retaining the MCP, recursion, and secret-access restrictions. Gemini network controls and API grounding remain unchanged.
 
 ### v1.0.65 (combined release since v1.0.57)
 - **Optional Graphify integration:** project aliases and exclusions, secret-aware literal indexing and response masking, and background refresh of stale or missing snapshots with visible refresh status. Explicit refresh stays synchronous; code maps remain source locators, not authoritative answers. See [adapter details](code_graph_runtime/ADAPTER_README.md).

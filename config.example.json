@@ -1,6 +1,9 @@
 {
   "_comment": "Copy to config.json. Leave paths empty to auto-detect via PATH. No personal paths are required.",
   "codex_path": "",
+  "codex_web_search": "live",
+  "codex_network_access": true,
+  "_comment_codex_network": "Codex child defaults: web search can be live, cached or disabled. Network access controls workspace-write shell networking; read-only shell networking stays restricted.",
   "antigravity_path": "",
   "antigravity_cli_path": "",
   "vscode_path": "",

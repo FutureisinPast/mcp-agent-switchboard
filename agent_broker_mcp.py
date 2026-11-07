@@ -1919,7 +1919,8 @@ def sanitize_prompt(prompt: str) -> str:
     blocked = ", ".join(sorted(SECRET_NAMES))
     return (
         "You are being consulted by a local agent broker. "
-        "Answer with concise technical advice. Do not call MCP tools or ask another agent. "
+        "Answer with concise technical advice. Built-in web search and URL fetching may be used "
+        "for the assigned task. Do not call MCP tools or ask another agent. "
         "Do not inspect or reveal secrets, API keys, credentials, private keys, or files named "
         f"{blocked}. If you need missing private information, say exactly what is missing.\n\n"
         f"{prompt}"
@@ -1930,7 +1931,8 @@ def sanitize_flash_workhorse_prompt(prompt: str) -> str:
     blocked = ", ".join(sorted(SECRET_NAMES))
     return (
         "You are executing one bounded work package for a local agent broker. Follow the package "
-        "contract exactly and return the schema-enforced report. Do not call MCP tools or ask another "
+        "contract exactly and return the schema-enforced report. Built-in web search and URL fetching "
+        "may be used for the assigned task. Do not call MCP tools or ask another "
         "agent. Do not inspect or reveal secrets, API keys, credentials, private keys, or files named "
         f"{blocked}. If required private information is missing, return status=blocked and name only what "
         "is missing.\n\n"
@@ -5669,6 +5671,12 @@ def consult_codex(
 ) -> CodexConsultResult:
     sandbox = normalize_codex_mode(mode)
     config = load_config()
+    web_search = str(config.get("codex_web_search", "live")).strip().lower()
+    if web_search not in {"live", "cached", "disabled"}:
+        raise ValueError("codex_web_search must be live, cached, or disabled")
+    network_access = config.get("codex_network_access", True)
+    if not isinstance(network_access, bool):
+        raise ValueError("codex_network_access must be a boolean")
     codex = discover_codex(config, required_model=model_name)
     if not codex:
         return CodexConsultResult(
@@ -5690,6 +5698,8 @@ def consult_codex(
         project_info.root_path,
         "--sandbox",
         sandbox,
+        "-c",
+        f'web_search="{web_search}"',
         "--skip-git-repo-check",
         # WP-SB8C: WP-SB6's --ignore-user-config was a regression -- it also skips
         # ~/.codex/config.toml's [projects.'<path>'] trust_level, so every consult/
@@ -5719,6 +5729,8 @@ def consult_codex(
         "--json",
         "-",
     ]
+    if sandbox == "workspace-write":
+        command[2:2] = ["-c", f"sandbox_workspace_write.network_access={str(network_access).lower()}"]
     # Reasoning effort is a config key, NOT part of the model name — keeping it separate
     # is what fixes the "--model 'gpt-5.5 xhigh'" class of failures.
     if effort:
