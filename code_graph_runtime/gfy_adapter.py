@@ -546,6 +546,7 @@ class Project:
         if os.path.exists(os.path.join(self.root, ".git")):
             try:
                 p = subprocess.run(["git", "ls-files", "-z", "-c", "-o", "--exclude-standard"], cwd=self.root,
+                                   stdin=subprocess.DEVNULL,
                                    capture_output=True, timeout=15)
                 if p.returncode == 0:
                     for rel in p.stdout.decode("utf-8", "replace").split("\0"):
@@ -591,8 +592,8 @@ class Project:
         head = None
         if os.path.exists(os.path.join(self.root, ".git")):
             try:
-                head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.root, capture_output=True,
-                                      text=True, timeout=10).stdout.strip() or None
+                head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.root, stdin=subprocess.DEVNULL,
+                                      capture_output=True, text=True, timeout=10).stdout.strip() or None
             except Exception:
                 head = None
         return entries, head
@@ -1696,6 +1697,21 @@ def _extract_changed_files(msg: str | None, pre: dict | None, proj: Project) -> 
     return changed
 
 
+BUILD_TIMEOUT_S = 900
+BUILD_MAX_WORKERS = "8"
+
+
+def _kill_tree(pid: int) -> None:
+    """Stop a build and its pool workers. On Windows Popen.kill() reaches only the venv launcher, so workers would outlive it and keep stdout open."""
+    if sys.platform != "win32":
+        return
+    try:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def run_build(proj: Project, env: dict) -> str | None:
     delay_s = float(os.environ.get("GFY_BUILD_DELAY_S", "0"))
     if delay_s > 0:
@@ -1704,11 +1720,23 @@ def run_build(proj: Project, env: dict) -> str | None:
     cmd = [sys.executable, "-m", "graphify", "extract", proj.root, "--code-only"]
     for pat in proj.exclude:
         cmd.extend(["--exclude", pat])
-    p = subprocess.run(cmd,
-                       env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                       timeout=900, cwd=str(proj.out_dir))
+    build_env = dict(env)
+    build_env.setdefault("GRAPHIFY_MAX_WORKERS", BUILD_MAX_WORKERS)
+    # stdin=DEVNULL: main() is blocked reading stdin, and a child sharing that pipe freezes at startup on Windows.
+    p = subprocess.Popen(cmd, env=build_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, encoding="utf-8", errors="replace", cwd=str(proj.out_dir))
+    try:
+        stdout, stderr = p.communicate(timeout=BUILD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        _kill_tree(p.pid)
+        p.kill()
+        try:
+            p.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
     if p.returncode != 0:
-        return f"graphify extract rc={p.returncode}: {(p.stderr or p.stdout)[-200:]}"
+        return f"graphify extract rc={p.returncode}: {(stderr or stdout)[-200:]}"
     return None
 
 

@@ -402,7 +402,7 @@ class AntigravityCatalogCacheTests(unittest.TestCase):
                 {"project": "p", "target_agent": "antigravity", "target_model": "gemini flash"}
             )
         self.assertEqual(result["status"], "needs_model_selection")
-        self.assertIn("No eligible stable Gemini Flash High", result["reason"])
+        self.assertIn("No eligible stable Gemini Hydrogen High or Flash High", result["reason"])
         self.assertTrue(result["catalog_status"]["live_refresh_attempted"])
 
 

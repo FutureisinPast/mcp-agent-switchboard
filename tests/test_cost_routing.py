@@ -393,7 +393,7 @@ class RoutingContractStringsTests(unittest.TestCase):
     def test_global_rules_never_promote_flash_to_peer_brain(self):
         text = " ".join(broker.COST_AWARE_ROUTING_RULES).lower()
         self.assertIn("capability tier outranks model version", text)
-        self.assertIn("newer gemini flash remains a non-authoritative labour workhorse", text)
+        self.assertIn("the gemini workhorse (hydrogen or flash, any version or benchmark score) remains a non-authoritative labour workhorse", text)
         self.assertIn("never becomes an astra/fable decision consultant", text)
         self.assertIn("consult_decision", text)
         self.assertIn("a codex host below astra spawns its native astra subagent", text)  # owner flow 2026-10-16
@@ -404,7 +404,7 @@ class RoutingContractStringsTests(unittest.TestCase):
     def test_global_rules_define_proactive_external_flash_workhorse_lane(self):
         text = " ".join(broker.COST_AWARE_ROUTING_RULES).lower()
         self.assertIn(
-            "default workhorse = the newest live antigravity gemini flash high", text
+            "default workhorse = the newest live antigravity gemini hydrogen high", text
         )
         self.assertIn("never a native child agent", text)
         self.assertIn("standing request to delegate eligible labour", text)
@@ -511,35 +511,60 @@ class NativeLabourPolicyTests(unittest.TestCase):
             )
 
     def test_noncreditable_flash_outcomes_return_broker_backed_native_handoffs(self):
-        cases = {
-            "unavailable_pre_mutation": "flash-unavailable:broker:receipt-1",
-            "rejected": "flash-failed:broker:receipt-1",
-            "blocked": "flash-failed:broker:receipt-1",
-            "failed_pre_mutation": "flash-failed:broker:receipt-1",
-        }
+        cases = [
+            ("unavailable_pre_mutation", None, None, "native", "flash-unavailable:broker:receipt-1"),
+            (
+                "failed_pre_mutation",
+                "timeout_during_execution",
+                "Antigravity CLI timed out after 60 seconds",
+                "native",
+                "flash-failed:broker:receipt-1",
+            ),
+            ("rejected", None, None, "redispatch", None),
+            ("blocked", None, None, "redispatch", None),
+            ("failed_pre_mutation", None, None, "redispatch", None),
+            ("applied_then_rejected", None, None, "applied", None),
+            ("apply_outcome_uncertain", None, None, "applied", None),
+        ]
         for family, client, role, model in (
             ("codex", "codex-vscode", "explorer", "live-reader"),
             ("claude", "claude-code", "Explore", "live-haiku"),
         ):
-            for outcome, reason in cases.items():
-                with self.subTest(family=family, outcome=outcome), \
+            for outcome, failure_kind, response_text, expected_shape, reason in cases:
+                with self.subTest(family=family, outcome=outcome, failure_kind=failure_kind), \
                      mock.patch.object(broker, "_MCP_CLIENT_NAME", client), \
                      mock.patch.object(broker, "current_codex_role_model", return_value="live-reader"), \
                      mock.patch.object(broker.model_roles, "select_claude_roles", return_value={"reader": "live-haiku", "workhorse": "live-sonnet"}):
                     handoff = broker.native_handoff_for_flash_outcome(
-                        {"work_package_id": "WP-READ", "task_kind": "research"}, outcome, "broker:receipt-1"
+                        {"work_package_id": "WP-READ", "task_kind": "research"},
+                        outcome,
+                        "broker:receipt-1",
+                        response_text=response_text,
+                        failure_kind=failure_kind,
                     )
                 self.assertEqual(handoff["work_package_id"], "WP-READ")
                 self.assertEqual(handoff["semantic_lane"], "reader")
-                self.assertEqual(handoff["native"]["family"], family)
-                self.assertEqual(handoff["native"]["role"], role)
-                self.assertEqual(handoff["native"]["model"], model)
-                self.assertEqual(handoff["flash_skip_reason"], reason)
+                self.assertEqual(handoff["flash_outcome"], outcome)
                 self.assertFalse(handoff["auto_launch"])
-                self.assertIn(reason, handoff["record_requirement"])
-                if outcome == "unavailable_pre_mutation":
+                if expected_shape == "native":
+                    self.assertEqual(handoff["native"]["family"], family)
+                    self.assertEqual(handoff["native"]["role"], role)
+                    self.assertEqual(handoff["native"]["model"], model)
+                    self.assertEqual(handoff["flash_skip_reason"], reason)
+                    self.assertIn(reason, handoff["record_requirement"])
                     self.assertNotIn("brain_review", handoff)
+                    self.assertNotEqual(handoff["action"], "fix_and_redispatch")
+                elif expected_shape == "redispatch":
+                    self.assertEqual(handoff["action"], "fix_and_redispatch")
+                    self.assertNotIn("native", handoff)
+                    self.assertNotIn("flash_skip_reason", handoff)
+                    self.assertTrue(handoff["brain_review"]["required"])
                 else:
+                    self.assertEqual(handoff["action"], "review_applied_files_first")
+                    self.assertIs(handoff["do_not_replay"], True)
+                    self.assertTrue(handoff["do_not_replay_note"])
+                    self.assertNotIn("native", handoff)
+                    self.assertNotIn("flash_skip_reason", handoff)
                     self.assertTrue(handoff["brain_review"]["required"])
 
     def test_gemini_antigravity_and_unknown_callers_get_no_native_handoff(self):

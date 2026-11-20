@@ -522,17 +522,16 @@ def test_source_change_during_build_is_rejected_keeps_last_good(tmp_path, monkey
     r1 = json.loads(ga.op_refresh(proj, {}))
     assert r1["ok"], r1
     good = (out / "published" / "current.json").read_text()
-    real_run = ga.subprocess.run
+    real_build = ga.run_build
 
     mutation = [0]
-    def run_and_mutate(cmd, *a, **kw):
-        res = real_run(cmd, *a, **kw)
-        if isinstance(cmd, list) and "graphify" in cmd:
-            mutation[0] += 1
-            (root / "svc.py").write_text(LIT_FILES["svc.py"] + f"\n\ndef sneaky_{mutation[0]}():\n    return 'edited during the build'\n",
-                                         encoding="utf-8")
+    def build_and_mutate(p, env):
+        res = real_build(p, env)
+        mutation[0] += 1
+        (root / "svc.py").write_text(LIT_FILES["svc.py"] + f"\n\ndef sneaky_{mutation[0]}():\n    return 'edited during the build'\n",
+                                     encoding="utf-8")
         return res
-    monkeypatch.setattr(ga.subprocess, "run", run_and_mutate)
+    monkeypatch.setattr(ga, "run_build", build_and_mutate)
     r2 = json.loads(ga.op_refresh(proj, {}))
     assert r2["ok"] is False and r2["error"] == "refresh_failed" and "source_changed_during_build" in r2["detail"], r2
     assert r2["serving"] == "last-good"

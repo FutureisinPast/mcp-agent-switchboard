@@ -23,7 +23,8 @@ if str(REPO_ROOT) not in sys.path:
 import agent_broker_mcp as broker  # noqa: E402
 
 _REAL_START = broker.start_flash_request_worker  # captured before tests/conftest.py stubs it
-EVALUATOR = "gemini-4-argon-high"
+EVALUATOR = "gemini-4-neon-high"
+EVALUATOR_HEAVY = "gemini-4-neon-xhigh"
 REVIEW = {
     "verdict": "modify",
     "issues": ["Rollback path is unstated."],
@@ -92,13 +93,17 @@ class EvaluatorTestCase(unittest.TestCase):
         home_patch = mock.patch.object(Path, "home", return_value=home)
         home_patch.start()
         self.addCleanup(home_patch.stop)
-        env = {"HOME": str(home), "USERPROFILE": str(home), "AGENT_BROKER_CHILD": ""}
+        env = {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "AGENT_BROKER_CHILD": "",
+            "AGENT_BROKER_FABLE_MODE": "on_request",
+        }
         env_patch = mock.patch.dict(os.environ, env)
         env_patch.start()
         self.addCleanup(env_patch.stop)
         for name in (
             "AGENT_BROKER_DECISION_EVALUATOR_MODEL",
-            "AGENT_BROKER_FABLE_MODE",
         ):
             os.environ.pop(name, None)
 
@@ -150,27 +155,41 @@ class ClaudeHostPipelineTests(EvaluatorTestCase):
         self.assertEqual(result["consultations"][0]["target"], "antigravity")
 
     def test_architecture_and_risk_flag_efforts(self):
-        _, consult, _ = self._run(_args("claude", "opus", "architecture"))
+        _, consult, evaluator = self._run(_args("claude", "opus", "architecture"))
+        self.assertEqual(evaluator.call_args.args[0], EVALUATOR_HEAVY)
         self.assertEqual(consult.call_args_list[0].args[1]["effort"], "xhigh")
         broker._DECISION_EVALUATOR_REVIEWS.clear()
         result, consult, _ = self._run(_args("claude", "opus", "bounded", risk_flags=["security"]))
+        self.assertEqual(result["consultations"][0]["resolved_model"], EVALUATOR_HEAVY)
         self.assertEqual(consult.call_args_list[0].args[1]["effort"], "max")
         self.assertTrue(result["complexity_escalated"])
 
     def test_include_fable_requests_native_fable_first(self):
         result, consult, evaluator = self._run(_args("claude", "opus", include_fable=True))
+        evaluator.assert_called_once()
         self.assertEqual(result["status"], "needs_native_consultation")
-        self.assertEqual(result["native_request"]["family"], "claude")
+        req = result["native_request"]
+        self.assertEqual(req["family"], "claude")
+        self.assertEqual(req["model"], "fable")
+        self.assertEqual(req["effort"], "high")
+        self.assertIn("Evaluator review (Gemini 4):", req["adviser_instructions"])
+        self.assertIn('"verdict":"modify"', req["adviser_instructions"])
+        self.assertIn(broker.FABLE_ANSWER_LIMIT, req["adviser_instructions"])
         consult.assert_not_called()
-        evaluator.assert_not_called()
 
     def test_fable_mode_default_requests_native_fable_first(self):
         with mock.patch.dict(os.environ, {"AGENT_BROKER_FABLE_MODE": "default"}):
             result, consult, evaluator = self._run(_args("claude", "opus"))
+        evaluator.assert_called_once()
         self.assertEqual(result["status"], "needs_native_consultation")
-        self.assertEqual(result["native_request"]["family"], "claude")
+        req = result["native_request"]
+        self.assertEqual(req["family"], "claude")
+        self.assertEqual(req["model"], "fable")
+        self.assertEqual(req["effort"], "high")
+        self.assertIn("Evaluator review (Gemini 4):", req["adviser_instructions"])
+        self.assertIn('"verdict":"modify"', req["adviser_instructions"])
+        self.assertIn(broker.FABLE_ANSWER_LIMIT, req["adviser_instructions"])
         consult.assert_not_called()
-        evaluator.assert_not_called()
 
     def test_fable_native_done_then_evaluator_then_astra(self):
         result, consult, evaluator = self._run(
@@ -664,3 +683,12 @@ class BackgroundEvaluatorTests(EvaluatorTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _pin_live_neon_catalog(monkeypatch):
+    """Keep these tests independent of the live agy catalog: with no live Neon found,
+    the evaluator falls back to the default constants these tests assert."""
+    monkeypatch.setattr(broker, "_newest_live_neon", lambda level: None)

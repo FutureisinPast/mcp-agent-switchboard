@@ -371,6 +371,17 @@ class TranscriptModelAttestationTests(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {"AGENT_BROKER_AGY_HOME": str(self.home)}, clear=False)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # A rejected dispatch quarantines its output; keep that out of the real
+        # ~/.agent-broker/quarantine tree.
+        tmp_root = Path(self._tmp.name)
+        for name, value in (
+            ("QUARANTINE_ROOT", tmp_root / "quarantine" / "rejected"),
+            ("QUARANTINE_LOCK_PATH", tmp_root / "quarantine" / ".prune.lock"),
+            ("_quarantine_last_prune_at", 0.0),
+        ):
+            quarantine_patch = mock.patch.object(broker, name, value)
+            quarantine_patch.start()
+            self.addCleanup(quarantine_patch.stop)
 
     def _catalog(self) -> list[dict]:
         return [

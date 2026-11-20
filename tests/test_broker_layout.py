@@ -6,7 +6,7 @@ Covers all layout helpers, retention rules, CLI wrapper, and safety constraints.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import sys
@@ -133,15 +133,19 @@ def test_rule_2_runs_retention(tmp_path, monkeypatch):
     runs_dir = tmp_path / "runs"
     runs_dir.mkdir(parents=True)
 
-    old_run = runs_dir / "2026-08-01" / "proj1" / "010000-run"
+    today = datetime.now(timezone.utc).date()
+    old_date = (today - timedelta(days=45)).strftime("%Y-%m-%d")
+    new_date = (today - timedelta(days=5)).strftime("%Y-%m-%d")
+
+    old_run = runs_dir / old_date / "proj1" / "010000-run"
     old_run.mkdir(parents=True)
     (old_run / "artifact.txt").write_text("data1234", encoding="utf-8")
-    _set_age_days(runs_dir / "2026-08-01", 45)
+    _set_age_days(runs_dir / old_date, 45)
 
-    new_run = runs_dir / "2026-10-10" / "proj1" / "010000-run"
+    new_run = runs_dir / new_date / "proj1" / "010000-run"
     new_run.mkdir(parents=True)
     (new_run / "artifact.txt").write_text("data5678", encoding="utf-8")
-    _set_age_days(runs_dir / "2026-10-10", 5)
+    _set_age_days(runs_dir / new_date, 5)
 
     non_date_run = runs_dir / "non-date-folder"
     non_date_run.mkdir(parents=True)
@@ -151,8 +155,8 @@ def test_rule_2_runs_retention(tmp_path, monkeypatch):
     res = layout.run_retention(force=True)
     assert res["runs"]["items"] == 1
     assert res["runs"]["bytes"] == len("data1234")
-    assert not (runs_dir / "2026-08-01").exists()
-    assert (runs_dir / "2026-10-10").exists()
+    assert not (runs_dir / old_date).exists()
+    assert (runs_dir / new_date).exists()
     assert non_date_run.exists()
 
 
@@ -275,12 +279,16 @@ def test_rule_7_archive_retention(tmp_path, monkeypatch):
     arch_dir = tmp_path / "archive"
     arch_dir.mkdir(parents=True)
 
-    old_arch = arch_dir / "2026-08-01"
+    today = datetime.now(timezone.utc).date()
+    old_date = (today - timedelta(days=50)).strftime("%Y-%m-%d")
+    new_date = (today - timedelta(days=5)).strftime("%Y-%m-%d")
+
+    old_arch = arch_dir / old_date
     old_arch.mkdir(parents=True)
     (old_arch / "notes.txt").write_text("archived content", encoding="utf-8")
     _set_age_days(old_arch, 50)
 
-    new_arch = arch_dir / "2026-10-10"
+    new_arch = arch_dir / new_date
     new_arch.mkdir(parents=True)
     (new_arch / "notes.txt").write_text("recent archive", encoding="utf-8")
     _set_age_days(new_arch, 5)

@@ -1370,6 +1370,21 @@ class RoutingGateTests(unittest.TestCase):
             allowed = routing_gate.pre_tool_use(self.pre_payload("credit-4"))
             self.assertEqual(allowed, {})
 
+    def test_credit_granted_for_completed_with_gaps_receipt(self):
+        request_id = str(uuid.uuid4())
+        self._seed_ledger(request_id)
+        receipt = f"broker:{request_id}"
+
+        with mock.patch.object(routing_gate, "DIRECT_LABOUR_LIMIT", 1):
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("gap-1")), {})
+            denied = routing_gate.pre_tool_use(self.pre_payload("gap-2"))
+            self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+            credit_result = routing_gate.post_tool_use(
+                self._dispatch_response_payload("dispatch-gap", receipt, "completed_with_gaps", "WP-X")
+            )
+            self.assertIn(receipt, credit_result["hookSpecificOutput"]["additionalContext"])
+            self.assertEqual(routing_gate.pre_tool_use(self.pre_payload("gap-3")), {})
+
     def test_credit_is_single_use(self):
         request_id = str(uuid.uuid4())
         self._seed_ledger(request_id)

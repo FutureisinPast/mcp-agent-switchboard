@@ -9,6 +9,7 @@ needed by Codex, Claude Code, and Antigravity over stdio JSON-RPC.
 from __future__ import annotations
 
 import calendar
+import contextlib
 import errno
 import json
 import hashlib
@@ -219,6 +220,16 @@ DECISION_COMPLEXITY_EFFORT = {
     "architecture": "xhigh",
     "critical": "max",
 }
+# Fable output is billed at a premium and gains above high are uneven, so Fable
+# runs one step lower than Astra and never at max; reply length is set by the prompt, not by effort.
+FABLE_COMPLEXITY_EFFORT = {
+    "bounded": "high",
+    "architecture": "high",
+    "critical": "xhigh",
+}
+FABLE_ANSWER_LIMIT = (
+    " Keep the whole answer under 250 words; output is billed at a premium, so be dense, not long."
+)
 DECISION_CRITICAL_RISK_FLAGS = {
     "security", "auth", "authentication", "payment", "data_loss", "data-loss",
     "migration", "irreversible", "destructive", "hard_diagnosis", "hard-diagnosis",
@@ -256,8 +267,10 @@ RESPONSE_ENVELOPE_DEFAULT_CHARS = 6_000
 DECISION_QUOTA_LATCH_DEFAULT_MINUTES = 30
 # Decision pipeline: the brain drafts brief.proposed_choice, a short Gemini
 # evaluator pass reviews it, then the flagship (Astra) gives the final verdict.
-# Fable is opt-in (include_fable=true, or AGENT_BROKER_FABLE_MODE=default).
-DECISION_EVALUATOR_DEFAULT_MODEL = "gemini-4-argon-high"
+# Fable joins by default (high, critical xhigh, answer under 250 words, gets
+# the evaluator review) and include_fable=false skips it for one call.
+DECISION_EVALUATOR_DEFAULT_MODEL = "gemini-4-neon-high"
+DECISION_EVALUATOR_HEAVY_DEFAULT_MODEL = "gemini-4-neon-xhigh"
 # Background cap for the detached evaluator worker (never an inline MCP-call run).
 DECISION_EVALUATOR_DEFAULT_TIMEOUT_SECONDS = 1800
 DECISION_EVALUATOR_MIN_TIMEOUT_SECONDS = 240
@@ -372,12 +385,17 @@ GENERIC_MODEL_REQUESTS = {
     "gemini flash",
     "gemini flash high",
     "flash high",
+    "hydrogen",
+    "gemini hydrogen",
+    "gemini hydrogen high",
+    "hydrogen high",
+    "workhorse",
     "antigravity",
 }
 
 # Default CLI model per family. Codex and Claude use their highest-quality
 # defaults. Antigravity's entry is an offline fallback; its live workhorse is
-# selected dynamically from the advertised stable Flash High slugs.
+# selected dynamically from advertised stable Hydrogen High (or Flash High) slugs.
 FAMILY_FLAGSHIP = {
     "codex": CODEX_FLAGSHIP_MODEL,
     "claude": CLAUDE_FLAGSHIP_MODEL,
@@ -387,11 +405,12 @@ FAMILY_FLAGSHIP = {
 
 # Reasoning-effort ladders per family, lowest -> highest. The last entry is the
 # family max, used as the default ("highest effort available") for routed CLI
-# consults unless a lower effort is explicitly requested. Gemini has no effort knob.
+# consults unless a lower effort is explicitly requested (Antigravity defaults
+# omitted effort to "high"). Gemini has no effort knob.
 FAMILY_EFFORTS = {
     "codex": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
     "claude": ["low", "medium", "high", "xhigh", "max"],
-    "antigravity": ["low", "medium", "high"],
+    "antigravity": ["low", "medium", "high", "xhigh"],
 }
 
 PEER_CONSULT_DEFAULTS = {
@@ -750,13 +769,13 @@ GENERIC_GROUND_RULES = [
 
 COST_AWARE_ROUTING_RULES = [
     "The model selected for the main session is the brain; never rewrite that user choice. It owns requirements, architecture, planning, hard diagnosis, risk decisions, and final signoff.",
-    "For important architecture, compatibility, or hard decisions, the brain drafts its own choice first, then consult_decision runs Gemini 4 Argon High as a short evaluator and Astra gives the final verdict: Claude and Gemini hosts get Astra through Switchboard; a Codex host below Astra spawns its native Astra subagent with the evaluator's review. Fable joins only when the user asks (include_fable=true) or AGENT_BROKER_FABLE_MODE=default. The Switchboard process must never replace this with a nested same-vendor CLI call.",
-    "Pass a native Astra (or requested Fable) result to consult_decision as native_consultation. If the evaluator fails, continue to Astra; if Astra is unavailable, the evaluator's review returns with a handoff notice -- never step down to a weaker model. Complexity maps Astra effort to high/xhigh/max.",
+    "For important architecture, compatibility, or hard decisions, the brain drafts its own choice first, then consult_decision runs the newest live Gemini Neon (High for bounded, Xhigh for architecture/critical) as the advisory decision evaluator, never the final verdict, and Astra gives the final verdict: Claude and Gemini hosts get Astra through Switchboard; a Codex host below Astra spawns its native Astra subagent with the evaluator's review. Fable joins Astra by default as a second final-verdict consultant for architecture, hard and critical decisions; it runs at high (critical: xhigh, never max), receives the Neon review, and must answer under 250 words because its output is billed at a premium; AGENT_BROKER_FABLE_MODE=on_request turns it off or include_fable=false skips it for one call; never substitute Opus for an unavailable Fable. The Switchboard process must never replace this with a nested same-vendor CLI call.",
+    "Pass a native Astra or native Fable result to consult_decision as native_consultation. If the evaluator fails, continue to Astra; if Astra is unavailable, the evaluator's review returns with a handoff notice -- never step down to a weaker model. Complexity maps Astra effort to high/xhigh/max.",
     "Decision briefs are hard-capped: one decision, at most three questions, four options, eight evidence refs, 4,000 excerpt bytes, 12,000 total UTF-8 bytes, and about 3,000 tokens. Send summaries, precise excerpts, and immutable refs -- never whole files, articles, logs, or chat histories.",
     "Flagship availability and quota failures are isolated. Continue with available targets, never substitute Flash for flagship judgment, and include every consult_decision handoff_notices item in the final response.",
-    "Capability tier outranks model version: a newer Gemini Flash remains a non-authoritative labour workhorse and never becomes an Astra/Fable decision consultant; Gemini 4 Argon High is the advisory decision evaluator, never the final verdict.",
+    "Capability tier outranks model version: the Gemini workhorse (Hydrogen or Flash, any version or benchmark score) remains a non-authoritative labour workhorse and never becomes an Astra/Fable decision consultant; the newest live Gemini Neon (High for bounded, Xhigh for architecture/critical) is the advisory decision evaluator, never the final verdict.",
     "The owner has issued a STANDING REQUEST to delegate eligible labour: dispatching a bounded package to the Flash workhorse or to a managed native subagent is pre-authorized work, not an optional extra that needs fresh permission each turn.",
-    "For Codex and Claude brains, DEFAULT WORKHORSE = the newest live Antigravity Gemini Flash High through Agent Switchboard. For a bounded package -- reading, search, extraction, summaries, drafting/writing, independent parallel read-only packages, and (once containment is enabled) light implementation and tests from an approved plan when isolated and low-risk -- the default lane is route_agent_task with target_agent=antigravity, surface=cli, target_model=gemini flash, effort=high, a work_package_id, the correct task_kind, and mode=plan or mode=accept-edits with the implementation envelope. It is roughly a tenth the cost of the same-vendor native workhorse and several times faster.",
+    "For Codex and Claude brains, DEFAULT WORKHORSE = the newest live Antigravity Gemini Hydrogen High (gemini-4-hydrogen-high today; newest Flash High only as automatic fallback when no Hydrogen slug is live) through Agent Switchboard. The lane keeps its historical 'Flash' names (flash_skip, flash-failed, Flash package) and now runs Gemini Hydrogen. For a bounded package -- reading, search, extraction, summaries, drafting/writing, independent parallel read-only packages, and (once containment is enabled) light implementation and tests from an approved plan when isolated and low-risk -- the default lane is route_agent_task with target_agent=antigravity, surface=cli, target_model=hydrogen, effort=high (xhigh for heavier packages), a work_package_id, the correct task_kind, and mode=plan or mode=accept-edits with the implementation envelope.",
     "Gemini, Antigravity, and unknown hosts receive no automatic downward cost routing. Their user-selected brain remains in place; explicit routing is still allowed, and Gemini upward flagship consultation through consult_decision is unchanged.",
     "Flash is the default with OBJECTIVE EXCEPTIONS, not an unconditional rule. A Flash-eligible package must end in exactly one of: a Switchboard dispatch, the small direct allowance for non-mutating micro-work, or a native/brain lane carrying a stated flash_skip reason with evidence -- host-tools:<tool-id> (the package needs host-only MCP tools, skills, or an IDE session), unshared-state:<evidence-id> (it depends on session state Flash cannot see), flash-failed:<broker-receipt>, flash-unavailable:<health-id>, or atomic-oversize:<plan-id> (an indivisible package over five files or past the input preflight). 'It felt easier to do myself' is not one of them.",
     "Native cheap roles (Codex explorer/worker; Claude Explore/economy-worker) remain the correct lane for package-specific native preference or Flash failure and for anything needing the host's own tools; they are the fallback, not the first choice. Record the concrete package-specific flash_skip reason. Flash is an external worker, never a native child agent, and never an Astra/Fable decision consultant.",
@@ -764,9 +783,10 @@ COST_AWARE_ROUTING_RULES = [
     "The Antigravity in-app/extension surface is retired for Flash labour: always use surface=cli, never extension or app. If the named model cannot be selected and runtime-attested, return needs_model_selection; never continue on the IDE's current or a neighbouring model.",
     "Every Flash call is exactly one bounded work package. Never hand Flash an entire autonomous plan or let it select/continue to the next package. Implementation calls must name a package id, at most five allowed files, explicit acceptance criteria, and forbidden actions; Switchboard rejects an incomplete envelope.",
     "Every factual investigation sent to Flash MUST use task_kind=research with 1-3 exact research_questions. Repeat the depth contract in every request: cover the full bounded scope beyond the first match, reject surface summaries, check a competing explanation, attach compact primary evidence to every answer, and return NOT FOUND with searched boundaries and gaps instead of inferring. The brain independently verifies factual truth.",
-    "A Switchboard-launched Gemini Flash session is the non-authoritative worker for exactly its assigned envelope, never the brain or router. It must not dispatch agents, reinterpret the whole plan, or continue to another package.",
-    "Switchboard's internal agy backend must use --output-format json with --json-schema. Missing/malformed fields, scope violations, contradictory completion, unsupported design-intent claims, ambiguity, or failed checks are failures to escalate -- never prose to accept. The sender brain independently inspects cited lines, the actual diff, and check output before dispatching another package.",
+    "A Switchboard-launched Gemini workhorse session is the non-authoritative worker for exactly its assigned envelope, never the brain or router. It must not dispatch agents, reinterpret the whole plan, or continue to another package.",
+    "Switchboard's internal agy backend must use --output-format json with --json-schema. Missing/malformed fields, scope violations, contradictory completion, unsupported design-intent claims, ambiguity, or failed checks are failures to escalate -- never prose to accept. A read-only package that answers from its own files and lists only outside files in scope_gaps returns completed_with_gaps, which still needs brain verification. The sender brain independently inspects cited lines, the actual diff, and check output before dispatching another package.",
     "Flash never receives production SSH, live credentials, destructive operations, migrations, or danger-full-access. It may prepare bounded local changes and checks; the brain owns live deployment and approval.",
+    "A workhorse package that must run the repo's tests sets stage_repo=true. For GPU or real-data work, the workhorse writes the code and tests with synthetic data; only the final real-hardware run happens in the brain's own session.",
     "If agy or Flash is missing, quota-limited, times out, mismatches the requested model, is blocked, or returns rejected/failed structured output, return a structured handoff to the Codex/Claude host's native cheap role and record the broker-backed flash-unavailable or flash-failed reason. Never auto-launch the native role.",
     "Classify risk and difficulty at every work-package boundary. Reader/low handles bounded reading, search, extraction, and formatting; workhorse/medium handles routine writing, light implementation, tests, scripts, and reversible deployment from an approved plan.",
     "Portable packages state Lane | mechanism | exact resolved model/effort | deliverable | verification | escalation. Imported foreign-vendor reader/workhorse routes are re-resolved to the executor's current same-vendor native role at execution start.",
@@ -830,7 +850,7 @@ def db_connect() -> sqlite3.Connection:
 
 def init_db() -> None:
     BROKER_DIR.mkdir(parents=True, exist_ok=True)
-    with db_connect() as conn:
+    with contextlib.closing(db_connect()) as conn, conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS projects (
@@ -1231,7 +1251,7 @@ def resolve_project(project: str | None) -> ProjectInfo:
         if possible_path.exists():
             root = possible_path.resolve()
             return ProjectInfo(normalize_project_name(root), str(root))
-        with db_connect() as conn:
+        with contextlib.closing(db_connect()) as conn:
             row = conn.execute(
                 "SELECT name, root_path FROM projects WHERE lower(name) = lower(?)",
                 (raw,),
@@ -1286,6 +1306,7 @@ def run_git(root: str, args: list[str]) -> str | None:
         proc = subprocess.run(
             ["git", *args],
             cwd=root,
+            stdin=subprocess.DEVNULL,
             text=True,
             capture_output=True,
             timeout=10,
@@ -1410,6 +1431,7 @@ if ($match) { $match.AppID }
     try:
         proc = subprocess.run(
             [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            stdin=subprocess.DEVNULL,
             text=True,
             capture_output=True,
             timeout=8,
@@ -1446,6 +1468,7 @@ def app_is_running(agent: str) -> bool:
     try:
         proc = subprocess.run(
             [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            stdin=subprocess.DEVNULL,
             text=True,
             capture_output=True,
             timeout=8,
@@ -1499,6 +1522,7 @@ def focus_app_window(agent: str) -> dict[str, Any]:
     try:
         proc = subprocess.run(
             [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", FOCUS_PS_SCRIPT],
+            stdin=subprocess.DEVNULL,
             text=True,
             capture_output=True,
             timeout=8,
@@ -1619,6 +1643,7 @@ if (-not $p) { 'no-window' } else {
     try:
         proc = subprocess.run(
             [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            stdin=subprocess.DEVNULL,
             text=True,
             capture_output=True,
             timeout=int(delay_ms) / 1000 + 25,
@@ -1762,6 +1787,7 @@ def copy_to_clipboard(text: str) -> dict[str, Any]:
                 "-Command",
                 "$value = Get-Content -Raw -LiteralPath $env:AGENT_BROKER_CLIP_FILE; Set-Clipboard -Value $value",
             ],
+            stdin=subprocess.DEVNULL,
             text=True,
             capture_output=True,
             timeout=8,
@@ -2147,6 +2173,29 @@ def compress_context_content(
     return result
 
 
+_RESPONSE_ENVELOPE_CONTENT_TYPES = frozenset({
+    "response_envelope",
+    "flash_async_result",
+    "consultation_response",
+    "gemini_consult_result",
+})
+
+
+def _pretty_json_if_valid(value: Any) -> str:
+    """Pretty-print JSON objects/arrays before line-based redaction or storage so one
+    secret-looking field only redacts its own line instead of blanking the whole payload."""
+    raw = "" if value is None else str(value)
+    stripped = raw.lstrip()
+    if stripped.startswith(("{", "[")):
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return raw
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(parsed, indent=1, ensure_ascii=False, default=str)
+    return raw
+
+
 def store_shared_context(
     project: str | None,
     topic: str | None,
@@ -2157,7 +2206,13 @@ def store_shared_context(
     redact: bool = True,
 ) -> dict[str, Any]:
     init_db()
-    text = (redact_text(content) if redact else ("" if content is None else str(content))).strip()
+    if isinstance(content, (dict, list)):
+        raw_content = json.dumps(content, indent=1, ensure_ascii=False, default=str)
+    else:
+        raw_content = "" if content is None else str(content)
+    if redact or content_type in _RESPONSE_ENVELOPE_CONTENT_TYPES:
+        raw_content = _pretty_json_if_valid(raw_content)
+    text = (redact_text(raw_content) if redact else raw_content).strip()
     if not text:
         raise ValueError("content is required")
     project_info = resolve_project(project)
@@ -2168,7 +2223,7 @@ def store_shared_context(
     kind = classify_context_content(text, content_type)
     compressed = compress_context_content(text, int(max_chars or SHARED_CONTEXT_INLINE_CHARS), kind, redact=False)
     now = utc_now()
-    with db_connect() as conn:
+    with contextlib.closing(db_connect()) as conn, conn:
         conn.execute(
             """
             INSERT INTO shared_context_blobs (
@@ -2491,7 +2546,7 @@ def model_family_for(target_agent: Any = None, target_model: Any = None) -> str:
     if has_claude:
         return "claude"
     if has_gemini:
-        return "antigravity" if "flash" in raw or "pro" in raw else "gemini"
+        return "antigravity" if any(t in raw for t in ("flash", "pro", "hydrogen", "argon", "neon")) else "gemini"
     return normalize_lookup(target_agent) or "antigravity"
 
 
@@ -2549,6 +2604,7 @@ def run_json_command(command: list[str], cwd: str | None = None, timeout: int = 
         proc = subprocess.run(
             command,
             cwd=cwd or str(Path.cwd()),
+            stdin=subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -2695,13 +2751,13 @@ def discover_claude_models() -> list[dict[str, Any]]:
 def antigravity_model_entry_from_slug(slug: str, source: str = "antigravity-cli") -> dict[str, Any]:
     """Turn a stable `agy models` slug into an agent-friendly catalog entry."""
     model_id = str(slug or "").strip()
-    effort_match = re.search(r"-(low|medium|high)$", model_id, re.I)
+    effort_match = re.search(r"-(low|medium|high|xhigh)$", model_id, re.I)
     effort = effort_match.group(1).lower() if effort_match else None
     base = model_id[: effort_match.start()] if effort_match else model_id
     display = model_id
     aliases = [model_id, model_id.replace("-", " ")]
 
-    gemini_match = re.fullmatch(r"gemini-([0-9]+(?:\.[0-9]+)*)-(flash|pro)", base, re.I)
+    gemini_match = re.fullmatch(r"gemini-([0-9]+(?:\.[0-9]+)*)-(flash|pro|hydrogen|argon|neon)", base, re.I)
     claude_match = re.fullmatch(r"claude-(sonnet|opus)-([0-9]+)-([0-9]+)(-thinking)?", base, re.I)
     if gemini_match:
         version, tier = gemini_match.groups()
@@ -2734,25 +2790,53 @@ def antigravity_model_entry_from_slug(slug: str, source: str = "antigravity-cli"
     return model_entry(model_id, display, list(dict.fromkeys(aliases)), source)
 
 
+_STABLE_GEMINI_HYDROGEN_HIGH_SLUG = re.compile(
+    r"gemini-([0-9]+(?:\.[0-9]+)*)-hydrogen-high", re.I
+)
 _STABLE_GEMINI_FLASH_HIGH_SLUG = re.compile(
     r"gemini-([0-9]+(?:\.[0-9]+)*)-flash-high", re.I
 )
 
 
-def antigravity_roles_from_models(models: list[dict[str, Any]]) -> dict[str, Any]:
-    """Select the newest stable Flash High workhorse advertised by ``agy``.
-
-    Numeric version segments are compared as integers, so 3.10 sorts after 3.9.
-    Nonconforming/preview slugs and static/config entries cannot auto-promote.
-    """
+def _newest_live_antigravity_slug(
+    models: list[dict[str, Any]], pattern: re.Pattern[str]
+) -> dict[str, Any] | None:
     live: list[tuple[tuple[int, ...], dict[str, Any]]] = []
     for item in models:
         if item.get("source") != "antigravity-cli":
             continue
-        match = _STABLE_GEMINI_FLASH_HIGH_SLUG.fullmatch(str(item.get("id") or ""))
+        match = pattern.fullmatch(str(item.get("id") or ""))
         if match:
             live.append((tuple(int(part) for part in match.group(1).split(".")), item))
-    selected = max(live, key=lambda candidate: candidate[0])[1] if live else None
+    return max(live, key=lambda candidate: candidate[0])[1] if live else None
+
+
+def antigravity_roles_from_models(models: list[dict[str, Any]]) -> dict[str, Any]:
+    """Select the newest stable Hydrogen High (fallback Flash High) workhorse advertised by ``agy``.
+
+    Numeric version segments are compared as integers, so 4.10 sorts after 4.9.
+    Nonconforming/preview slugs and static/config entries cannot auto-promote.
+    """
+    override = str(os.environ.get("AGENT_BROKER_ANTIGRAVITY_WORKHORSE") or "").strip()
+    override_key = override.lower()
+    selected: dict[str, Any] | None = None
+    if override_key == "flash":
+        selected = _newest_live_antigravity_slug(models, _STABLE_GEMINI_FLASH_HIGH_SLUG)
+    else:
+        if override_key not in {"", "hydrogen"}:
+            selected = next(
+                (
+                    item
+                    for item in models
+                    if item.get("source") == "antigravity-cli"
+                    and str(item.get("id") or "").strip().lower() == override_key
+                ),
+                None,
+            )
+        if selected is None:
+            selected = _newest_live_antigravity_slug(models, _STABLE_GEMINI_HYDROGEN_HIGH_SLUG)
+        if selected is None:
+            selected = _newest_live_antigravity_slug(models, _STABLE_GEMINI_FLASH_HIGH_SLUG)
     workhorse = selected or next(
         (
             item
@@ -2769,11 +2853,11 @@ def antigravity_roles_from_models(models: list[dict[str, Any]]) -> dict[str, Any
         "capability_tier": "workhorse",
         "source": "antigravity-cli" if selected else "offline-fallback",
         "rule": (
-            "Gemini Flash High is a useful, non-authoritative external workhorse for Codex/Claude "
-            "brains to consider proactively; it is not a native child agent. A higher version does "
-            "not make it an Astra/Fable decision consultant. On agy/model absence, quota, timeout, mismatch, or "
-            "failure, use the host native cheap reader/workhorse and record the fallback. The main "
-            "frontier brain reviews evidence/diffs and retains judgment."
+            "Gemini Hydrogen High workhorse (Flash High as fallback) is a non-authoritative external "
+            "workhorse for Codex/Claude brains to consider proactively; it is not a native child agent. "
+            "A higher version or score never makes it an Astra/Fable decision consultant. On agy/model "
+            "absence, quota, timeout, mismatch, or failure, use the host native cheap reader/workhorse "
+            "and record the fallback. The main frontier brain reviews evidence/diffs and retains judgment."
         ),
     }
 
@@ -3030,6 +3114,7 @@ def discover_antigravity_models(force_live: bool = False) -> list[dict[str, Any]
             proc = subprocess.run(
                 [agy, "models"],
                 cwd=str(Path.cwd()),
+                stdin=subprocess.DEVNULL,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -3132,17 +3217,41 @@ def discover_antigravity_models(force_live: bool = False) -> list[dict[str, Any]
     return result
 
 
+_ANTIGRAVITY_EFFORT_SUFFIX_RE = re.compile(r"-(low|medium|high|xhigh)$", re.I)
+
+
+def _antigravity_model_effort_suffix(model: Any) -> str | None:
+    match = _ANTIGRAVITY_EFFORT_SUFFIX_RE.search(str(model or "").strip())
+    return match.group(1).lower() if match else None
+
+
+def _antigravity_effective_effort(model: Any, effort: str | None) -> str | None:
+    suffix = _antigravity_model_effort_suffix(model)
+    if suffix:
+        return suffix
+    normalized = str(effort or "").strip().lower()
+    return normalized or None
+
+
 def antigravity_model_for_effort(model: str | None, effort: str | None) -> str | None:
-    """Select the requested low/medium/high variant when the live catalog has it."""
+    """Select the requested low/medium/high/xhigh variant when the live catalog has it."""
     model_id = str(model or "").strip()
     level = str(effort or "").strip().lower()
-    if not model_id or level not in {"low", "medium", "high"}:
+    if not model_id or level not in {"low", "medium", "high", "xhigh"}:
         return model_id or None
-    candidate = re.sub(r"-(?:low|medium|high)$", f"-{level}", model_id, flags=re.I)
-    if candidate == model_id and re.match(r"^gemini-", model_id):
+    candidate = _ANTIGRAVITY_EFFORT_SUFFIX_RE.sub(f"-{level}", model_id)
+    if candidate == model_id and re.match(r"^gemini-", model_id, re.I) and not _ANTIGRAVITY_EFFORT_SUFFIX_RE.search(model_id):
         candidate = f"{model_id}-{level}"
     available = {str(item.get("id") or "").lower() for item in discover_antigravity_models()}
-    return candidate if candidate.lower() in available else model_id
+    if candidate.lower() in available:
+        return candidate
+    if level == "xhigh":
+        high_candidate = _ANTIGRAVITY_EFFORT_SUFFIX_RE.sub("-high", model_id)
+        if high_candidate == model_id and re.match(r"^gemini-", model_id, re.I) and not _ANTIGRAVITY_EFFORT_SUFFIX_RE.search(model_id):
+            high_candidate = f"{model_id}-high"
+        if high_candidate.lower() in available:
+            return high_candidate
+    return model_id
 
 
 def antigravity_display_model(model: Any) -> str:
@@ -3236,7 +3345,7 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
             "excluded_rule": "No automatic downward routing; explicit routing and upward consult_decision remain available.",
         },
         "execution_precedence": [
-            "Codex/Claude eligible bounded labour uses the newest live Antigravity Gemini Flash High through Agent Switchboard first.",
+            "Codex/Claude eligible bounded labour uses the newest live Antigravity Gemini Hydrogen High (Flash High only as fallback) through Agent Switchboard first.",
             "For one concrete package, use the matching same-vendor native reader/workhorse instead when a recorded native preference applies or Flash failed/unavailable; never auto-launch it.",
             "Choose reader for quick_check/research/search and read-only extraction; choose workhorse for implementation, drafting/planning, tests, review, bug_hunt, sanity_check, and harder routine analysis.",
             "Flash implementation (accept-edits) and research packages run async by default with a 60-minute cap (timeout_seconds 240-10800; async=false forces the 240 s sync path; quick_check/search stay sync): route_agent_task returns request_id/receipt/poll immediately; poll request_result(request_id, wait_seconds=180) until terminal. The start earns one gate relief; overlapping accept-edits write paths are refused.",
@@ -3338,7 +3447,7 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                     "record_fallback": True,
                     "auto_launch_native": False,
                 },
-                "rule": "Antigravity routes through agy using the newest stable numeric Gemini Flash High advertised live. It is the automatic external labour default only for Codex and Claude brains, not Gemini/Antigravity or unknown hosts. Every call is one bounded package with schema-enforced JSON; implementation requires a package id, 1-5 allowed files, and acceptance criteria. Never hand Flash a whole plan or production access. Flash remains non-authoritative: the brain reviews evidence/diffs and independently verifies cited lines, the actual diff, and checks before accepting or dispatching another package. Every non-creditable Flash outcome returns Codex/Claude callers a structured native reader/workhorse handoff with a broker-backed reason; it never auto-launches native work. Flash and native workers run concurrently only on independent packages; writes are serial unless demonstrably isolated.",
+                "rule": "Antigravity routes through agy using the newest stable numeric Gemini Hydrogen High advertised live (newest Flash High only as fallback). The lane keeps its historical 'Flash' names and now runs Gemini Hydrogen. It is the automatic external labour default only for Codex and Claude brains, not Gemini/Antigravity or unknown hosts. Every call is one bounded package with schema-enforced JSON; implementation requires a package id, 1-5 allowed files, and acceptance criteria. Never hand Flash a whole plan or production access. Flash remains non-authoritative: the brain reviews evidence/diffs and independently verifies cited lines, the actual diff, and checks before accepting or dispatching another package. Every non-creditable Flash outcome returns Codex/Claude callers a structured native reader/workhorse handoff with a broker-backed reason; it never auto-launches native work. Flash and native workers run concurrently only on independent packages; writes are serial unless demonstrably isolated.",
             },
         },
         "caller_examples": {
@@ -3402,7 +3511,7 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                 "args": {
                     "target_agent": "antigravity",
                     "surface": "cli",
-                    "target_model": "gemini flash",
+                    "target_model": "hydrogen",
                     "effort": "high",
                     "mode": "plan",
                     "task_kind": "quick_check",
@@ -3423,7 +3532,7 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
                 "args": {
                     "target_agent": "antigravity",
                     "surface": "cli",
-                    "target_model": "gemini flash",
+                    "target_model": "hydrogen",
                     "effort": "high",
                     "mode": "accept-edits",
                     "task_kind": "implementation",
@@ -3443,9 +3552,9 @@ def get_model_routing_guide(agent: str | None = None, project: str | None = None
         "notes": [
             "Use target_model for the model slug only; put reasoning in effort.",
             "Antigravity CLI models are discovered live with `agy models`; newly released models become routable without changing the static catalog.",
-            "The newest exact stable gemini-<numeric>-flash-high slug is the Antigravity workhorse; numeric version order never promotes previews or renamed/nonconforming SKUs.",
-            "Capability tier outranks version: Gemini Flash is a non-authoritative labour workhorse and never substitutes for Astra/Fable decision advice. If a flagship is unavailable, consult_decision records the skip for the final handoff and continues with any available target.",
-            "Both Codex and Claude brains should proactively consider newest live Flash High for bounded external workhorse labour; this does not make Flash a native child agent.",
+            "The newest exact stable gemini-<numeric>-hydrogen-high slug is the Antigravity workhorse, with newest stable gemini-<numeric>-flash-high as fallback; numeric version order never promotes previews or renamed/nonconforming SKUs.",
+            "Capability tier outranks version: The Gemini workhorse (Hydrogen or Flash) is a non-authoritative labour workhorse and never substitutes for Astra/Fable decision advice. If a flagship is unavailable, consult_decision records the skip for the final handoff and continues with any available target.",
+            "Both Codex and Claude brains should proactively consider the newest live Gemini Hydrogen High (effort high; xhigh for heavier packages) for bounded external workhorse labour; this does not make it a native child agent.",
             "If agy/Flash is missing, quota-limited, times out, mismatches, or fails, use the host native explorer/worker or Explore/economy-worker and record the fallback.",
             "Flash and native workers may run concurrently only for independent stages/packages: parallel reads are allowed, while writes are serial unless demonstrably isolated; the brain reviews evidence/diffs and owns the final decision.",
             "Each Flash call carries exactly one bounded package and schema-enforced output. Implementation without a package id, 1-5 allowed files, and explicit acceptance criteria is rejected before agy starts.",
@@ -3542,7 +3651,7 @@ def set_model_default(
 def find_model_default(project: str | None, topic: str | None, family: str) -> dict[str, Any] | None:
     init_db()
     project_info = resolve_project(project)
-    with db_connect() as conn:
+    with contextlib.closing(db_connect()) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             """
@@ -3594,13 +3703,16 @@ _PROMPT_MODEL_PATTERNS: list[tuple[str, str]] = [
     (r"fable", "fable"),
     (r"haiku\s*4\.5", "haiku 4.5"),
     (r"haiku", "haiku"),
-    (r"gpt[-\s]?5\.6[-\s]?(?:sol|solar)", CODEX_FLAGSHIP_MODEL),
-    (r"gpt[-\s]?5\.6[-\s]?terra", CODEX_BALANCED_MODEL),
-    (r"gpt[-\s]?5\.6[-\s]?(?:luna|lunar)", CODEX_CHEAP_MODEL),
-    (r"gpt[-\s]?5\.6", CODEX_FLAGSHIP_MODEL),
-    (r"sol|solar", CODEX_FLAGSHIP_MODEL),
-    (r"terra", CODEX_BALANCED_MODEL),
-    (r"luna|lunar", CODEX_CHEAP_MODEL),
+    # Exact older versions stay exact; bare family words resolve to the newest live
+    # model of that family in match_model_request (owner 2026-11-18).
+    (r"gpt[-\s]?5\.6[-\s]?(?:sol|solar)", "gpt-5.6-sol"),
+    (r"gpt[-\s]?5\.6[-\s]?terra", "gpt-5.6-terra"),
+    (r"gpt[-\s]?5\.6[-\s]?(?:luna|lunar)", "gpt-5.6-luna"),
+    (r"gpt[-\s]?5\.6", "gpt-5.6-sol"),
+    (r"astra", "astra"),
+    (r"sol|solar", "sol"),
+    (r"terra", "terra"),
+    (r"luna|lunar", "luna"),
     (r"gpt[-\s]?5\.5", "gpt-5.5"),
     (r"gpt[-\s]?5\.4[-\s]?mini", "gpt-5.4-mini"),
     (r"gpt[-\s]?5\.4", "gpt-5.4"),
@@ -3714,6 +3826,40 @@ def parse_claude_versioned_model(text: Any) -> tuple[str, str] | None:
     return model_id, display
 
 
+_CODEX_FAMILY_WORD_RE = re.compile(r"^(?:gpt ?)?(?:(\d+) ?)?(astra|sol|solar|luna|lunar|terra)$")
+_CODEX_MAJOR_ONLY_RE = re.compile(r"^gpt ?(\d+)$")
+_CODEX_ID_FAMILY_RE = re.compile(r"^gpt-(\d+(?:\.\d+)*)-([a-z]+)$", re.IGNORECASE)
+
+
+def _codex_family_request(lookup: str, choices: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Owner 2026-11-18: a bare family word ('sol', 'astra', 'luna', 'terra') or a
+    major-only request ('gpt 6') means the NEWEST model of that family in the live
+    catalog. An exact model id (e.g. gpt-6.1-sol, gpt-6-astra) is never rewritten:
+    asking for a specific older model still gets exactly that model."""
+    if any(normalize_lookup(item.get("id")) == lookup for item in choices):
+        return None
+    match = _CODEX_FAMILY_WORD_RE.fullmatch(lookup)
+    if match:
+        major = int(match.group(1)) if match.group(1) else None
+        family = {"solar": "sol", "lunar": "luna"}.get(match.group(2), match.group(2))
+    else:
+        major_only = _CODEX_MAJOR_ONLY_RE.fullmatch(lookup)
+        if not major_only:
+            return None
+        major, family = int(major_only.group(1)), "astra"
+    best: tuple[tuple[int, ...], dict[str, Any]] | None = None
+    for item in choices:
+        parsed = _CODEX_ID_FAMILY_RE.fullmatch(str(item.get("id") or "").strip())
+        if not parsed or parsed.group(2).lower() != family:
+            continue
+        version = tuple(int(part) for part in parsed.group(1).split("."))
+        if major is not None and version[0] != major:
+            continue
+        if best is None or version > best[0]:
+            best = (version, item)
+    return best[1] if best else None
+
+
 def match_model_request(family: str, requested_model: Any) -> dict[str, Any]:
     requested_text = str(requested_model or "").strip()
     # Preserve an empty/bare Antigravity request as generic. normalize_model_name
@@ -3733,6 +3879,16 @@ def match_model_request(family: str, requested_model: Any) -> dict[str, Any]:
         return {"status": "generic", "requested": raw}
     catalog = list_agent_models(family).get("catalogs", {}).get(family, {})
     choices = catalog.get("models") or []
+    if family == "codex":
+        newest = _codex_family_request(lookup, choices)
+        if newest is not None:
+            return {
+                "status": "matched",
+                "model": newest["id"],
+                "display": newest.get("display") or newest["id"],
+                "matches": [newest],
+                "resolved_newest_in_family": True,
+            }
     matches: list[dict[str, Any]] = []
     req_terms = [term for term in lookup.split() if term]
     for item in choices:
@@ -3852,6 +4008,9 @@ def resolve_cli_model_and_effort(
     elif default_effort is not None:
         fallback = normalize_effort_token(default_effort) or default_effort
         effort = effort_for_family(family, fallback)
+    elif family == "antigravity":
+        # No effort requested anywhere: an explicit slug level (e.g. -xhigh) wins over "high".
+        effort = _antigravity_model_effort_suffix(model) or "high"
     else:
         effort = family_max_effort(family)
     return model, effort_for_resolved_model(family, model, effort)
@@ -3942,13 +4101,364 @@ def native_semantic_lane(args: dict[str, Any], task_kind: Any = None) -> str:
     return "reader" if kind in {"quick_check", "research"} else "workhorse"
 
 
+_FLASH_WORKHORSE_TARGET = {
+    "target_agent": "antigravity",
+    "surface": "cli",
+    "target_model": "hydrogen",
+}
+_FLASH_STAGE_REPO_HINT_RE = re.compile(
+    r"\bModuleNotFoundError\b"
+    r"|\bImportError\b"
+    r"|No module named\b"
+    r"|\btests?\s+(?:(?:that|which)\s+)?could\s+not\s+(?:be\s+)?run\b"
+    r"|\bcould\s+not\s+run\s+(?:the\s+|repo(?:'s)?\s+)?tests?\b"
+    r"|\bunable\s+to\s+run\s+(?:the\s+|repo(?:'s)?\s+)?tests?\b",
+    re.IGNORECASE,
+)
+_FLASH_ADJUDICATION_RE = re.compile(
+    r"\bambiguit(?:y|ies)\b"
+    r"|\bscope[- ]violation(?:s)?\b|\bviolated\s+scope\b|\bscope[- ]refusal(?:s)?\b"
+    r"|\bout[- ]of[- ]scope\b|\bin-scope file\b"
+    r"|\boutside\s+(?:the\s+|declared\s+|its\s+)?(?:allowed|allowlist|writable|scope|manifest)\b"
+    r"|\bundeclared\s+(?:file|write|create|edit|change|modification|path)s?\b"
+    r"|scope_gaps\s+on\s+an\s+implementation\s+package"
+    r"|\battest(?:ation|ed)\b|\b(?:resolved[- ])?model[- ]mismatch\b|\bunattested model\b"
+    r"|\bfailed[- ]checks?\b|\bchecks?(?:\s+#?\d+)?\s+failed\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_dispatched_prompt(raw: Any) -> str:
+    """Strip broker task/context/workhorse wrappers to recover the dispatched prompt."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text.startswith("<flash_workhorse_contract>"):
+        contract_end = text.find("</flash_workhorse_contract>")
+        if contract_end != -1:
+            after = text[contract_end + len("</flash_workhorse_contract>"):]
+            start_tag = "<bounded_request>"
+            end_tag = "</bounded_request>"
+            start_idx = after.find(start_tag)
+            end_idx = after.rfind(end_tag)
+            if start_idx != -1 and end_idx > start_idx:
+                text = after[start_idx + len(start_tag):end_idx].strip()
+    elif "<bounded_request>" in text and text.endswith("</bounded_request>"):
+        start_idx = text.find("<bounded_request>")
+        text = text[start_idx + len("<bounded_request>"):-len("</bounded_request>")].strip()
+    if text.startswith("Shared context pack for this topic:\n\n") and "\n\nCurrent request:\n\n" in text:
+        text = text.split("\n\nCurrent request:\n\n", 1)[1].strip()
+    if text.startswith("[Agent Switchboard]") and "\n\nRequest:\n\n" in text:
+        text = text.split("\n\nRequest:\n\n", 1)[1].strip()
+    return text
+
+
+def _prompt_sha256(raw: Any) -> str:
+    clean = _extract_dispatched_prompt(raw)
+    return hashlib.sha256(clean.encode("utf-8")).hexdigest() if clean else ""
+
+
+def _row_matches_work_package(meta: Mapping[str, Any], prompt_text: str, work_package_id: str) -> bool:
+    row_wp = str(meta.get("work_package_id") or "").strip()
+    if row_wp:
+        return row_wp == work_package_id
+    return f"\nPackage ID: {work_package_id}\n" in str(prompt_text or "")
+
+
+def _has_earlier_flash_failure_different_prompt(
+    work_package_id: str | None,
+    current_prompt: Any,
+    current_request_id: str | None,
+) -> bool:
+    """True when the persisted ledger already holds a rejected/blocked/failed row for
+    the same work_package_id whose dispatched prompt differs from current_prompt."""
+    wp_id = str(work_package_id or "").strip()
+    current_clean = _extract_dispatched_prompt(current_prompt)
+    if not wp_id or not current_clean or not DB_PATH.exists():
+        return False
+    current_hash = hashlib.sha256(current_clean.encode("utf-8")).hexdigest()
+    exclude_rid = str(current_request_id or "").strip()
+    failure_outcomes = {"rejected", "blocked", "failed_pre_mutation", *FLASH_APPLIED_OUTCOMES}
+    try:
+        with contextlib.closing(db_connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT request_id, consulted_model, prompt, response, status, receipt_meta
+                FROM consultations
+                WHERE (request_id IS NULL OR request_id != ?)
+                  AND (consulted_model LIKE 'antigravity%' OR receipt_meta IS NOT NULL)
+                """,
+                (exclude_rid,),
+            ).fetchall()
+            for row in rows:
+                try:
+                    meta = json.loads(row["receipt_meta"]) if row["receipt_meta"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    meta = {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                if not _row_matches_work_package(meta, str(row["prompt"] or ""), wp_id):
+                    continue
+                row_outcome = str(meta.get("outcome") or "").strip()
+                if row_outcome:
+                    if row_outcome not in failure_outcomes:
+                        continue
+                else:
+                    resp = str(row["response"] or "")
+                    if not str(row["consulted_model"] or "").startswith("antigravity"):
+                        continue
+                    if str(row["status"] or "") not in {"error", "blocked", "failed"}:
+                        continue
+                    if resp.startswith(FLASH_INFRASTRUCTURE_PREFIXES) or resp.startswith("Antigravity CLI needs_context:"):
+                        continue
+                row_hash = str(meta.get("prompt_sha256") or "").strip()
+                if row_hash:
+                    if row_hash != current_hash:
+                        return True
+                else:
+                    earlier_clean = _extract_dispatched_prompt(row["prompt"])
+                    if earlier_clean and earlier_clean != current_clean:
+                        return True
+
+            req_rows = conn.execute(
+                """
+                SELECT id, prompt, status, response, args_json
+                FROM flash_requests
+                WHERE work_package_id = ?
+                  AND id != ?
+                  AND response IS NOT NULL
+                """,
+                (wp_id, exclude_rid),
+            ).fetchall()
+            for req in req_rows:
+                raw_resp = str(req["response"] or "")
+                env: dict[str, Any] | None = None
+                if raw_resp.lstrip().startswith("{"):
+                    try:
+                        parsed = json.loads(raw_resp)
+                        if isinstance(parsed, dict):
+                            env = parsed
+                    except json.JSONDecodeError:
+                        env = None
+                row_outcome = (
+                    str(env.get("outcome") or "").strip()
+                    if env and env.get("outcome")
+                    else classify_flash_outcome(raw_resp, str(req["status"] or ""), None)
+                )
+                if row_outcome not in failure_outcomes:
+                    continue
+                earlier_raw = req["prompt"]
+                if not str(earlier_raw or "").strip() and req["args_json"]:
+                    try:
+                        earlier_raw = (json.loads(req["args_json"]) or {}).get("prompt")
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        earlier_raw = ""
+                earlier_clean = _extract_dispatched_prompt(earlier_raw)
+                if earlier_clean and earlier_clean != current_clean:
+                    return True
+    except sqlite3.Error:
+        return False
+    return False
+
+
+def _collect_flash_failure_signals(
+    args: Mapping[str, Any],
+    validation_failures: list[str] | tuple[str, ...] | None,
+    structured_output: Mapping[str, Any] | None,
+    response_text: str | None,
+    missing_context: list[str] | None,
+) -> tuple[list[str], list[str], bool, bool]:
+    """Extract failure messages, suggested_read_context, stage_repo_hint, and brain_adjudication_required."""
+    raw_failures = validation_failures if validation_failures is not None else args.get("validation_failures")
+    failures: list[str] = (
+        [str(item).strip() for item in raw_failures if str(item or "").strip()]
+        if isinstance(raw_failures, (list, tuple))
+        else []
+    )
+    text = str(response_text or "")
+    envelope: dict[str, Any] | None = None
+    if text.lstrip().startswith("{"):
+        try:
+            loaded = json.loads(text)
+            if isinstance(loaded, dict):
+                envelope = loaded
+        except json.JSONDecodeError:
+            envelope = None
+
+    structured = structured_output if isinstance(structured_output, Mapping) else None
+    if structured is None and isinstance(envelope, dict) and isinstance(envelope.get("structured_output"), Mapping):
+        structured = envelope["structured_output"]
+
+    non_json_error = ""
+    if not failures and text:
+        parsed_failures = _rejection_validation_failures(text)
+        if parsed_failures:
+            failures = parsed_failures
+        elif isinstance(envelope, dict):
+            extracted: list[str] = []
+            for container_key in ("containment_apply", "rejection"):
+                container = envelope.get(container_key)
+                if isinstance(container, Mapping) and isinstance(container.get("reasons"), list):
+                    extracted.extend(str(r).strip() for r in container["reasons"] if str(r or "").strip())
+            for scalar_key in ("apply_skipped_reason", "post_commit_error"):
+                val = str(envelope.get(scalar_key) or "").strip()
+                if val:
+                    extracted.append(val)
+            failures = extracted
+        else:
+            trimmed = text.split(" | quarantine_path:")[0].split(" | full log:")[0].strip()
+            non_json_error = trimmed
+            if trimmed.startswith(("Model attestation failed:", "Antigravity CLI Flash safety policy rejected")):
+                failures = [trimmed.split("\n", 1)[0].strip()]
+
+    suggested_paths: list[str] = []
+    seen_paths: set[str] = set()
+    for gap in _scope_gaps_of(structured):
+        path = str(gap.get("path") or "").strip()
+        if path and path not in seen_paths:
+            seen_paths.add(path)
+            suggested_paths.append(path)
+    for item in list(missing_context or []) + list(args.get("missing_context_files") or []):
+        path = str(item or "").strip()
+        if path and path not in seen_paths:
+            seen_paths.add(path)
+            suggested_paths.append(path)
+
+    stage_texts = list(failures)
+    adjudication_texts = list(failures)
+    if non_json_error:
+        stage_texts.append(non_json_error)
+        adjudication_texts.append(non_json_error)
+    elif isinstance(envelope, dict):
+        for scalar_key in ("post_commit_error", "apply_skipped_reason", "message"):
+            val = str(envelope.get(scalar_key) or "").strip()
+            if val:
+                stage_texts.append(val)
+                adjudication_texts.append(val)
+
+    failed_check_present = False
+    has_ambiguities = False
+    if isinstance(structured, Mapping):
+        if structured.get("ambiguities"):
+            has_ambiguities = True
+        for chk in structured.get("checks") or []:
+            if not isinstance(chk, Mapping):
+                continue
+            chk_status = chk.get("status")
+            if chk_status == "failed":
+                failed_check_present = True
+            if chk_status in {"failed", "not_run"}:
+                excerpt = str(chk.get("output_excerpt") or "").strip()
+                if excerpt:
+                    stage_texts.append(excerpt)
+
+    stage_repo_hint = any(_FLASH_STAGE_REPO_HINT_RE.search(t) for t in stage_texts if t)
+    brain_adjudication_required = (
+        has_ambiguities
+        or failed_check_present
+        or any(_FLASH_ADJUDICATION_RE.search(t) for t in adjudication_texts if t)
+    )
+    return failures, suggested_paths, stage_repo_hint, brain_adjudication_required
+
+
+_FLASH_AVAILABILITY_FAILURE_KINDS = frozenset({
+    "timeout_during_execution",
+    "startup_stall",
+    "timeout",
+    "timeout_exceeded",
+    "worker_dead",
+    "worker_never_started",
+    "worker_start_failed",
+    "agy_missing",
+    "cli_missing",
+    "quota",
+    "rate_limit",
+    "skipped_quota",
+    "skipped_unavailable",
+    "unavailable",
+})
+_FLASH_INFRA_TEXT_RE = re.compile(
+    r"cli was not found|"
+    r"\bagy\b.{0,40}\bnot found\b|"
+    r"\b(?:not found|cannot find)\b.{0,20}\bagy\b|"
+    r"no such file or directory.{0,80}\bagy\b|"
+    r"\btimed out\b|"
+    r"timeout exceeded|"
+    r"exceeded its cap without recording a result|"
+    r"died before recording a result|"
+    r"\basync worker\b.{0,60}\bdied\b|"
+    r"worker never started|"
+    r"failed to start flash async worker"
+)
+
+
+def _flash_extract_error_text(response_text: str) -> str:
+    """Extract error-bearing text from a raw or JSON-wrapped Flash failure response."""
+    raw = str(response_text or "").strip()
+    if not raw or not raw.startswith("{"):
+        return raw
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw
+    if not isinstance(payload, dict):
+        return raw
+    parts: list[str] = []
+    for key in ("error", "stderr", "message", "reason", "response"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            parts.append(val.strip())
+    cli = payload.get("cli")
+    if isinstance(cli, dict):
+        for key in ("error", "stderr", "message", "reason"):
+            val = cli.get(key)
+            if isinstance(val, str) and val.strip():
+                parts.append(val.strip())
+    return " ".join(parts)
+
+
+def _flash_is_infrastructure_failure(
+    outcome: str | None,
+    response_text: str | None = None,
+    failure_kind: str | None = None,
+) -> bool:
+    """True when a failed_pre_mutation outcome reflects infrastructure/availability
+    (timeouts, overdue/dead async workers, missing agy, quota) rather than a reworkable failure."""
+    if outcome != "failed_pre_mutation":
+        return False
+    kind = str(failure_kind or "").strip().lower()
+    if kind in FLASH_TIMEOUT_FAILURE_KINDS or kind in _FLASH_AVAILABILITY_FAILURE_KINDS:
+        return True
+    raw = str(response_text or "").strip()
+    if not raw:
+        return False
+    if raw.startswith(FLASH_INFRASTRUCTURE_PREFIXES):
+        return True
+    error_text = _flash_extract_error_text(raw)
+    if error_text.startswith(FLASH_INFRASTRUCTURE_PREFIXES):
+        return True
+    normalized = normalize_lookup(error_text)
+    if not normalized:
+        return False
+    return bool(
+        _DECISION_QUOTA_TEXT_PATTERN.search(normalized)
+        or _FLASH_INFRA_TEXT_RE.search(normalized)
+    )
+
+
 def native_handoff_for_flash_outcome(
     args: dict[str, Any], outcome: str | None, receipt: str | None,
     quarantine_files: list[str] | None = None, quarantine_diff: str | None = None,
     missing_context: list[str] | None = None,
+    validation_failures: list[str] | None = None,
+    structured_output: Mapping[str, Any] | None = None,
+    response_text: str | None = None,
+    current_request_id: str | None = None,
+    failure_kind: str | None = None,
 ) -> dict[str, Any] | None:
-    """Describe, but never launch, the Codex/Claude native fallback for failed Flash work."""
-    if outcome == FLASH_OUTCOME_CREDITABLE or not receipt:
+    """Describe, but never launch, the Codex/Claude handoff or fix-and-redispatch guidance."""
+    if outcome in FLASH_CREDITABLE_OUTCOMES or not receipt:
         return None
     caller_family = family_from_caller()
     if caller_family not in {"codex", "claude"}:
@@ -3963,19 +4473,79 @@ def native_handoff_for_flash_outcome(
         role = "Explore" if lane == "reader" else "economy-worker"
         model = roles[lane]
         effort = None if lane == "reader" else "medium"
+    native_block = {
+        "family": caller_family,
+        "role": role,
+        "model": model,
+        "effort": effort,
+        "mechanism": "managed_native_subagent",
+    }
+    work_package_id = str(args.get("work_package_id") or "").strip() or None
+    redispatch_outcomes = {"rejected", "blocked", "failed_pre_mutation", *FLASH_APPLIED_OUTCOMES}
+
+    if outcome in redispatch_outcomes and not _flash_is_infrastructure_failure(
+        outcome, response_text=response_text, failure_kind=failure_kind
+    ):
+        failures, suggested_paths, stage_repo_hint, brain_adjudication_required = (
+            _collect_flash_failure_signals(
+                args, validation_failures, structured_output, response_text, missing_context
+            )
+        )
+        effective_rid = current_request_id
+        if not effective_rid and str(receipt).startswith("broker:"):
+            effective_rid = str(receipt)[len("broker:"):].strip()
+        allow_native = _has_earlier_flash_failure_different_prompt(
+            work_package_id, args.get("prompt"), effective_rid
+        )
+        handoff: dict[str, Any] = {
+            "work_package_id": work_package_id,
+            "semantic_lane": lane,
+            "flash_outcome": outcome,
+            "auto_launch": False,
+            "action": "fix_and_redispatch",
+            "target": dict(_FLASH_WORKHORSE_TARGET),
+            "suggested_read_context": suggested_paths,
+            "suggested_read_context_note": (
+                "A proposal for the brain only: never applied automatically. Review these paths "
+                "and add them to read_context on re-dispatch if they are genuinely needed."
+            ),
+            "stage_repo_hint": stage_repo_hint,
+            "brain_adjudication_required": brain_adjudication_required,
+        }
+        if failures:
+            handoff["validation_failures"] = failures
+        if allow_native:
+            reason = f"flash-failed:{receipt}"
+            handoff["native"] = native_block
+            handoff["flash_skip_reason"] = reason
+            handoff["record_requirement"] = f"Record this package-specific fallback as {reason}."
+        if quarantine_files or quarantine_diff:
+            handoff["quarantine_files"] = list(quarantine_files or [])
+            handoff["quarantine_diff"] = quarantine_diff
+            handoff["salvage_note"] = (
+                "The worker's edited files are kept in quarantine for review only; they were NOT applied."
+            )
+        if outcome in FLASH_APPLIED_OUTCOMES:
+            # The package already wrote (or may have written) files: a blind resend could
+            # repeat a partial change, so the brain reviews the applied files first.
+            handoff["action"] = "review_applied_files_first"
+            handoff["do_not_replay"] = True
+            handoff["do_not_replay_note"] = (
+                "Do NOT replay this package: it already wrote files (or may have). Review the applied files "
+                "and the git diff first, then re-dispatch only what remains."
+            )
+        handoff["brain_review"] = {
+            "required": True,
+            "action": "Inspect the failure and rescope or resolve ambiguity before re-dispatch; do not silently replay the same package.",
+        }
+        return handoff
+
     unavailable = outcome == "unavailable_pre_mutation"
     reason = f"{'flash-unavailable' if unavailable else 'flash-failed'}:{receipt}"
-    needs_review = outcome in {"rejected", "blocked", "failed_pre_mutation", *FLASH_APPLIED_OUTCOMES}
     handoff = {
-        "work_package_id": str(args.get("work_package_id") or "").strip() or None,
+        "work_package_id": work_package_id,
         "semantic_lane": lane,
-        "native": {
-            "family": caller_family,
-            "role": role,
-            "model": model,
-            "effort": effort,
-            "mechanism": "managed_native_subagent",
-        },
+        "native": native_block,
         "flash_outcome": outcome,
         "flash_skip_reason": reason,
         "record_requirement": f"Record this package-specific fallback as {reason}.",
@@ -3996,16 +4566,6 @@ def native_handoff_for_flash_outcome(
             "Re-dispatch the same package to Flash with these paths added to read_context: "
             + json.dumps(list(missing_context or []))
         )
-    if outcome in FLASH_APPLIED_OUTCOMES:
-        handoff["action"] = (
-            "Do NOT replay this package: it already wrote files (or may have). Review the applied files "
-            "and the git diff first, then decide what remains."
-        )
-    if needs_review:
-        handoff["brain_review"] = {
-            "required": True,
-            "action": "Inspect the Flash failure and rescope or resolve ambiguity before native delegation; do not silently replay the same package.",
-        }
     return handoff
 
 
@@ -4134,7 +4694,12 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
     target_model, parsed_effort = split_model_and_effort(raw_model)
     family = model_family_for(raw_agent, target_model)
     canonical_effort = normalize_effort_token(raw_effort) or parsed_effort
-    resolved_effort = effort_for_family(family, canonical_effort) if canonical_effort else family_max_effort(family)
+    if canonical_effort:
+        resolved_effort = effort_for_family(family, canonical_effort)
+    elif family == "antigravity":
+        resolved_effort = _antigravity_model_effort_suffix(target_model) or "high"
+    else:
+        resolved_effort = family_max_effort(family)
     resolved_effort = effort_for_resolved_model(family, target_model, resolved_effort)
     match = match_model_request(family, target_model)
 
@@ -4147,10 +4712,17 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
                 else default["target_model"]
             )
             resolved_effort = effort_for_resolved_model(family, default_model, resolved_effort)
-            final_effort, effort_policy = enforce_codex_effort_policy(
-                args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")),
-                default_model, resolved_effort, model_policy,
-            ) if family == "codex" else (resolved_effort, None)
+            final_effort, effort_policy = (
+                enforce_codex_effort_policy(
+                    args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")),
+                    default_model, resolved_effort, model_policy,
+                )
+                if family == "codex"
+                else (
+                    (_antigravity_effective_effort(default_model, resolved_effort) if family == "antigravity" else resolved_effort),
+                    None,
+                )
+            )
             result = {
                 "status": "resolved",
                 "project": resolve_project(project).name,
@@ -4175,10 +4747,17 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
                 if family == "antigravity"
                 else flagship
             )
-            final_effort, effort_policy = enforce_codex_effort_policy(
-                args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")),
-                flagship, resolved_effort, model_policy,
-            ) if family == "codex" else (resolved_effort, None)
+            final_effort, effort_policy = (
+                enforce_codex_effort_policy(
+                    args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")),
+                    flagship, resolved_effort, model_policy,
+                )
+                if family == "codex"
+                else (
+                    (_antigravity_effective_effort(flagship, resolved_effort) if family == "antigravity" else resolved_effort),
+                    None,
+                )
+            )
             result = {
                 "status": "resolved",
                 "project": resolve_project(project).name,
@@ -4200,7 +4779,7 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
         return {
             "status": "needs_model_selection",
             "reason": (
-                "No eligible stable Gemini Flash High model was available from live Antigravity CLI "
+                "No eligible stable Gemini Hydrogen High or Flash High model was available from live Antigravity CLI "
                 "discovery or its last valid observed catalog."
                 if family == "antigravity"
                 else f"No default {family} model is set for this topic."
@@ -4221,10 +4800,17 @@ def resolve_model_request(args: dict[str, Any]) -> dict[str, Any]:
             else match["model"]
         )
         resolved_effort = effort_for_resolved_model(family, matched_model, resolved_effort)
-        final_effort, effort_policy = enforce_codex_effort_policy(
-            args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")),
-            matched_model, resolved_effort, model_policy,
-        ) if family == "codex" else (resolved_effort, None)
+        final_effort, effort_policy = (
+            enforce_codex_effort_policy(
+                args, str(args.get("prompt") or ""), normalize_task_kind(args.get("task_kind") or args.get("request_type")),
+                matched_model, resolved_effort, model_policy,
+            )
+            if family == "codex"
+            else (
+                (_antigravity_effective_effort(matched_model, resolved_effort) if family == "antigravity" else resolved_effort),
+                None,
+            )
+        )
         # Only pin as the topic default when the caller EXPLICITLY opts in. Auto-pinning
         # every explicit pick made model selection sticky and surprising on later
         # generic requests; bare "codex"/"claude" should mean "flagship", not "last used".
@@ -4480,6 +5066,7 @@ def prepare_flash_work_package(args: dict[str, Any], task_kind: str, prompt: str
         "acceptance_criteria": acceptance_criteria,
         "forbidden_actions": forbidden_actions,
         "research_questions": research_questions,
+        "stage_repo": truthy(args.get("stage_repo")),
     }
 
 
@@ -4498,8 +5085,28 @@ RESEARCH_DOCUMENT_LOCATOR_RE = re.compile(
 )
 
 
+SCOPE_GAP_AFFECTS_PATTERN = r"^(question|criterion) [1-9][0-9]*$"
+SCOPE_GAP_AFFECTS_RE = re.compile(SCOPE_GAP_AFFECTS_PATTERN)
+SCOPE_GAP_MAX_ITEMS = 3
+FLASH_OUTCOME_WITH_GAPS = "completed_with_gaps"
+
+
 def flash_workhorse_output_schema(package: dict[str, Any]) -> dict[str, Any]:
     criteria_min = 1 if package.get("task_kind") == "implementation" else 0
+    expected_criteria = package.get("acceptance_criteria") or []
+    criteria_item_properties: dict[str, Any] = {
+        "criterion": {"type": "string"},
+        "status": {"type": "string", "enum": ["passed", "failed", "not_checked"]},
+        "evidence": {"type": "array", "items": {"type": "string"}},
+    }
+    criteria_item_required = ["criterion", "status", "evidence"]
+    if expected_criteria:
+        criteria_ids = [f"AC{index}" for index in range(1, len(expected_criteria) + 1)]
+        criteria_item_properties = {
+            "id": {"type": "string", "enum": criteria_ids},
+            **criteria_item_properties,
+        }
+        criteria_item_required = ["id", "criterion", "status", "evidence"]
     research_questions = package.get("research_questions") or []
     research_count = len(research_questions)
     return {
@@ -4508,7 +5115,7 @@ def flash_workhorse_output_schema(package: dict[str, Any]) -> dict[str, Any]:
         "required": [
             "package_id", "status", "summary", "acceptance_criteria", "files_changed",
             "checks", "evidence", "claims", "ambiguities", "risks", "next_action",
-            "brain_verification_required", "research_coverage",
+            "brain_verification_required", "research_coverage", "scope_gaps",
         ],
         "properties": {
             "package_id": {"type": "string", "enum": [package["package_id"]]},
@@ -4520,12 +5127,8 @@ def flash_workhorse_output_schema(package: dict[str, Any]) -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["criterion", "status", "evidence"],
-                    "properties": {
-                        "criterion": {"type": "string"},
-                        "status": {"type": "string", "enum": ["passed", "failed", "not_checked"]},
-                        "evidence": {"type": "array", "items": {"type": "string"}},
-                    },
+                    "required": criteria_item_required,
+                    "properties": criteria_item_properties,
                 },
             },
             "files_changed": {
@@ -4631,11 +5234,48 @@ def flash_workhorse_output_schema(package: dict[str, Any]) -> dict[str, Any]:
                         "competing_explanations_checked": {
                             "type": "array", "maxItems": 2, "items": {"type": "string"},
                         },
-                        "gaps": {"type": "array", "maxItems": 2, "items": {"type": "string"}},
+                        "gaps": {
+                            "type": "array", "maxItems": 2, "items": {"type": "string"},
+                            "description": "What is still unanswered for this question.",
+                        },
                     },
                 },
             },
-            "ambiguities": {"type": "array", "items": {"type": "string"}},
+            "scope_gaps": {
+                "type": "array",
+                "maxItems": 3,
+                "description": (
+                    "Read-only packages only: files outside your read scope that would make the "
+                    "answer more complete. Each entry names the file, the question or criterion "
+                    "it affects, and why it is needed."
+                ),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["path", "affects", "why_needed"],
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1, "maxLength": 300},
+                        # No "pattern" keyword: agy has never been sent one; the validator
+                        # enforces SCOPE_GAP_AFFECTS_RE instead.
+                        "affects": {
+                            "type": "string", "minLength": 10, "maxLength": 20,
+                            "description": "Exactly 'question N' or 'criterion N' (N starts at 1).",
+                        },
+                        "why_needed": {"type": "string", "minLength": 10, "maxLength": 400},
+                        "symbol": {"type": "string", "maxLength": 200},
+                    },
+                },
+            },
+            "ambiguities": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "In-scope doubt only: unclear instructions, conflicting evidence, a decision you "
+                    "cannot make, or an outside dependency that makes an in-scope conclusion uncertain. "
+                    "A file you were not given that would only make the answer more complete belongs "
+                    "in scope_gaps."
+                ),
+            },
             "risks": {"type": "array", "items": {"type": "string"}},
             "next_action": {"type": "string"},
             "brain_verification_required": {"type": "string", "enum": ["required"]},
@@ -4662,7 +5302,18 @@ def package_writable_paths(package: dict[str, Any]) -> list[str]:
 def wrap_flash_workhorse_prompt(prompt: str, package: dict[str, Any]) -> str:
     allowed = "\n".join(f"- {item}" for item in package_writable_paths(package)) or "- Read-only scope stated in the request; make no edits."
     context = "\n".join(f"- {item}" for item in (package.get("read_context") or [])) or "- None declared; everything you need is already in this prompt."
-    criteria = "\n".join(f"- {item}" for item in package["acceptance_criteria"]) or "- Return the requested bounded evidence only."
+    expected_criteria = package.get("acceptance_criteria") or []
+    if expected_criteria:
+        criteria_lines = "\n".join(
+            f"- AC{index}: {item}" for index, item in enumerate(expected_criteria, 1)
+        )
+        criteria = (
+            f"Report each criterion exactly once with its id (AC1..AC{len(expected_criteria)}), "
+            "in order; never merge or split criteria.\n"
+            f"{criteria_lines}"
+        )
+    else:
+        criteria = "- Return the requested bounded evidence only."
     forbidden = "\n".join(f"- {item}" for item in package["forbidden_actions"])
     questions = "\n".join(
         f"{index}. {question}"
@@ -4689,6 +5340,7 @@ Research questions (preserve this exact order in research_coverage):
 {questions}
 
 Stop with status=blocked at the first ambiguity, plan mismatch, required out-of-scope change, or failed fix that needs diagnosis. Never continue to the next plan step/package. A failed check means status=failed unless the approved package explicitly expects that failure.
+In a read-only package (mode plan), finish what the given files can answer; list each file you were not given that would make the answer more complete in scope_gaps (at most 3, each with the question or criterion it affects), finish with status=completed, and use ambiguities only for real doubt about an in-scope conclusion. Put limits of your method (no runtime test, no profiling) in risks. In an implementation package, a needed read or change outside the allowed files still means status=blocked.
 Never stop at the first plausible result or provide only a surface summary. Cover the full declared scope and check a competing explanation when relevant. For research, answer every declared question with compact primary citations; use NOT FOUND only after reporting the searched boundary and gaps. Never invent line numbers for web sources. Block rather than infer when required evidence is unavailable. There is no length limit on your answer; the broker stores the full result. Do not measure, trim or shorten your output.
 Separate observed facts from inference and assumptions. Any claim that behavior is intentional/by design must be basis=observed and cite an explicit spec, test, or code comment as file:line evidence; otherwise label it assumption and keep the investigation open.
 Your schema-enforced report is evidence for the sender brain, never approval. The brain will independently inspect cited lines, the actual diff, and check output before accepting this package or dispatching another.
@@ -4804,11 +5456,343 @@ def _valid_research_locator(source_kind: str, location: str, locator: str) -> bo
     return True
 
 
+def package_is_read_only(package: dict[str, Any]) -> bool:
+    """Eligibility for scope_gaps comes from the dispatched package, never from the worker."""
+    mode = normalize_lookup(package.get("mode") or "")
+    if mode in {
+        "accept edits", "accept-edits", "workspace write", "workspace-write",
+        "implementation", "implement", "edit",
+    }:
+        return False
+    if normalize_task_kind(package.get("task_kind")) == "implementation":
+        return False
+    return not package_writable_paths(package)
+
+
+def _scope_gaps_of(structured: Any) -> list[Any]:
+    gaps = structured.get("scope_gaps") if isinstance(structured, dict) else None
+    return gaps if isinstance(gaps, list) else []
+
+
+def _scope_boundary(package: Mapping[str, Any], roots: list[Path]) -> list[str]:
+    boundary = [
+        _scope_key(path, roots)
+        for path in list(package.get("read_context") or []) + package_writable_paths(package)
+    ]
+    return [key for key in boundary if key]
+
+
+def _validate_single_scope_gap(
+    gap: Any,
+    index: int,
+    roots: list[Path],
+    boundary: list[str],
+    coverage_items: list[Any],
+    criteria_count: int,
+) -> list[str]:
+    """Validate one scope_gaps entry and return any error messages."""
+    label = f"scope_gaps[{index}]"
+    if not isinstance(gap, dict):
+        return [f"{label} must be an object"]
+    path = str(gap.get("path") or "").strip()
+    affects = str(gap.get("affects") or "").strip()
+    why = str(gap.get("why_needed") or "").strip()
+    if not path or not affects or not why:
+        return [
+            f"{label} requires a non-empty path, affects and why_needed "
+            "(a symbol alone cannot show a dependency is outside scope)"
+        ]
+    errors: list[str] = []
+    key = _scope_key(path, roots)
+    if key and any(key == item or key.startswith(item.rstrip("/") + "/") for item in boundary):
+        errors.append(f"scope_gaps entry names an in-scope file: {path}; real doubt belongs in ambiguities")
+    if not SCOPE_GAP_AFFECTS_RE.fullmatch(affects):
+        errors.append(f"{label} affects must look like 'question N' or 'criterion N'")
+        return errors
+    kind, number_text = affects.split(" ")
+    number = int(number_text)
+    if kind == "question" and coverage_items:
+        entry = coverage_items[number - 1] if number <= len(coverage_items) else None
+        entry_gaps = entry.get("gaps") if isinstance(entry, dict) else None
+        if not (isinstance(entry_gaps, list) and any(str(g or "").strip() for g in entry_gaps)):
+            errors.append(
+                f"scope_gaps entry affects question {number} but research_coverage lists no gap for it"
+            )
+    elif kind == "criterion" and number > criteria_count:
+        errors.append(f"{label} affects criterion {number} but the package has {criteria_count} criteria")
+    return errors
+
+
+def _not_found_single_probe_allowed(
+    structured: Mapping[str, Any],
+    package: Mapping[str, Any],
+    roots: list[Path],
+    question_index: int,
+    item_evidence: list[Any],
+    item_gaps: list[Any],
+    coverage_items: list[Any],
+) -> bool:
+    """Allow a single probe for not_found only in read-only packages when a valid
+    linked scope_gaps entry targets the question and every declared read_context
+    file was cited in that question's evidence."""
+    if not package_is_read_only(package):
+        return False
+    raw_gaps = structured.get("scope_gaps")
+    if not isinstance(raw_gaps, list) or not raw_gaps or len(raw_gaps) > SCOPE_GAP_MAX_ITEMS:
+        return False
+    if not any(str(value or "").strip() for value in item_gaps):
+        return False
+    boundary = _scope_boundary(package, roots)
+    criteria = structured.get("acceptance_criteria") or []
+    criteria_count = len(package.get("acceptance_criteria") or []) or (
+        len(criteria) if isinstance(criteria, list) else 0
+    )
+    target_affects = f"question {question_index}"
+    has_linked_gap = any(
+        isinstance(gap, dict)
+        and str(gap.get("affects") or "").strip() == target_affects
+        and not _validate_single_scope_gap(gap, index, roots, boundary, coverage_items, criteria_count)
+        for index, gap in enumerate(raw_gaps, 1)
+    )
+    if not has_linked_gap:
+        return False
+    cited_locations: set[str] = set()
+    for ev in item_evidence:
+        if isinstance(ev, dict):
+            loc = _scope_key(str(ev.get("location") or ""), roots)
+            if loc:
+                cited_locations.add(loc)
+    declared_context = [
+        _scope_key(path, roots)
+        for path in (package.get("read_context") or [])
+        if str(path or "").strip()
+    ]
+    declared_context = [key for key in declared_context if key]
+    return all(ctx in cited_locations for ctx in declared_context)
+
+
+def _validate_scope_gaps(
+    structured: dict[str, Any],
+    package: dict[str, Any],
+    roots: list[Path],
+    coverage_items: list[Any],
+    expected_criteria: list[Any],
+    criteria: list[Any],
+) -> list[str]:
+    """Rules for a completed result that lists files outside its read scope."""
+    raw = structured.get("scope_gaps")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        return ["scope_gaps must be an array"]
+    if not raw:
+        return []
+    if not package_is_read_only(package):
+        return ["scope_gaps on an implementation package requires status=blocked"]
+    errors: list[str] = []
+    if len(raw) > SCOPE_GAP_MAX_ITEMS:
+        errors.append(f"scope_gaps allows at most {SCOPE_GAP_MAX_ITEMS} entries")
+    boundary = _scope_boundary(package, roots)
+    criteria_count = len(expected_criteria) or len(criteria)
+    for index, gap in enumerate(raw, 1):
+        errors.extend(_validate_single_scope_gap(gap, index, roots, boundary, coverage_items, criteria_count))
+    evidence_count = len([item for item in (structured.get("evidence") or []) if item])
+    for item in coverage_items:
+        if isinstance(item, dict) and isinstance(item.get("evidence"), list):
+            evidence_count += len([e for e in item["evidence"] if e])
+    if evidence_count == 0:
+        errors.append("completed_with_gaps requires in-scope evidence")
+    return errors
+
+
+def _research_evidence_keys(item_evidence: list[Any]) -> set[tuple[str, str, str, str]]:
+    keys: set[tuple[str, str, str, str]] = set()
+    for ev in item_evidence:
+        if not isinstance(ev, dict):
+            continue
+        keys.add((
+            str(ev.get("source_kind") or "").strip(),
+            str(ev.get("location") or "").strip(),
+            str(ev.get("locator") or "").strip(),
+            str(ev.get("observation") or "").strip(),
+        ))
+    return keys
+
+
+def _weak_answer_entry(question_index: int, requirement: str) -> dict[str, Any]:
+    return {
+        "question": question_index,
+        "requirement": requirement,
+        "follow_up": "confirm with a second independent probe before relying on it",
+    }
+
+
+def _weak_answers_from_structured(
+    structured: Mapping[str, Any],
+    package: dict[str, Any],
+    staged: Any = None,
+) -> list[dict[str, Any]]:
+    if not package_is_read_only(package):
+        return []
+    coverage = structured.get("research_coverage")
+    if not isinstance(coverage, list):
+        return []
+    roots = _scope_roots(staged, package)
+    weak: list[dict[str, Any]] = []
+    for index, item in enumerate(coverage, 1):
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status")
+        item_evidence = item.get("evidence")
+        gaps = item.get("gaps")
+        if not isinstance(item_evidence, list) or not isinstance(gaps, list):
+            continue
+        evidence_keys = _research_evidence_keys(item_evidence)
+        if len(evidence_keys) != 1:
+            continue
+        if status == "answered":
+            weak.append(_weak_answer_entry(index, "answered status requires at least 2 distinct evidence probes"))
+        elif status == "not_found" and not _not_found_single_probe_allowed(
+            structured, package, roots, index, item_evidence, gaps, coverage
+        ):
+            weak.append(_weak_answer_entry(index, "not_found status requires at least 2 distinct search/evidence probes"))
+    return weak
+
+
+_AGY_MALFORMED_TOOL_CALL_RE = re.compile(
+    r"improperly formatted function call|malformed function call|function call is empty",
+    re.I,
+)
+
+
+def _extract_agy_error_text(outer: Mapping[str, Any]) -> str:
+    """Return error text carried by an agy outer JSON envelope, if any."""
+    for key in ("error", "error_message", "message"):
+        val = outer.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, Mapping):
+            for subkey in ("message", "detail", "error", "reason"):
+                subval = val.get(subkey)
+                if isinstance(subval, str) and subval.strip():
+                    return subval.strip()
+            serialized = json.dumps(val, ensure_ascii=False).strip()
+            if serialized and serialized != "{}":
+                return serialized
+    return ""
+
+
+def _has_nonempty_evidence(value: Any) -> bool:
+    return isinstance(value, list) and any(str(item or "").strip() for item in value)
+
+
+def _criterion_token_overlap(dispatched: Any, reported: Any) -> float:
+    want_tokens = set(re.findall(r"\w+", _normalize_criterion(dispatched)))
+    got_tokens = set(re.findall(r"\w+", _normalize_criterion(reported)))
+    if not want_tokens or not got_tokens:
+        return 0.0
+    return len(want_tokens & got_tokens) / min(len(want_tokens), len(got_tokens))
+
+
+def _validate_criteria_by_id(
+    criteria: list[Any],
+    expected_criteria: list[Any],
+    worker_status: Any,
+    caveats: list[dict[str, str]],
+) -> list[str]:
+    """Validate reported acceptance_criteria entries when ids (AC1..ACn) are present."""
+    errors: list[str] = []
+    pending_caveats: list[dict[str, str]] = []
+    expected_ids = [f"AC{index}" for index in range(1, len(expected_criteria) + 1)]
+    expected_by_id = dict(zip(expected_ids, expected_criteria))
+    valid_statuses = {"passed", "failed", "not_checked"}
+    seen_ids: dict[str, dict[str, Any]] = {}
+    duplicate_ids: list[str] = []
+    extra_entries: list[dict[str, Any]] = []
+
+    for index, item in enumerate(criteria, 1):
+        if not isinstance(item, dict):
+            errors.append(f"reported acceptance criterion {index} must be an object")
+            continue
+        raw_id = item.get("id")
+        entry_id = str(raw_id).strip() if raw_id is not None else ""
+        if not entry_id:
+            extra_entries.append(item)
+            continue
+        if entry_id not in expected_by_id:
+            errors.append(f"unknown acceptance criterion id: {entry_id}")
+            continue
+        if entry_id in seen_ids:
+            if entry_id not in duplicate_ids:
+                duplicate_ids.append(entry_id)
+                errors.append(f"duplicate acceptance criterion id: {entry_id}")
+            continue
+        seen_ids[entry_id] = item
+
+        want = expected_by_id[entry_id]
+        got = str(item.get("criterion") or "").strip()
+        verdict = _criterion_match(want, got)
+        if verdict != "exact":
+            # The id identifies the criterion. Different wording is only a caveat;
+            # a clear swap (the exact text of ANOTHER dispatched criterion) rejects.
+            swapped = any(
+                other_id != entry_id and _criterion_match(other_text, got) == "exact"
+                for other_id, other_text in expected_by_id.items()
+            )
+            if swapped:
+                errors.append(
+                    f"reported acceptance criterion {entry_id} carries the text of another dispatched criterion"
+                )
+                continue
+            pending_caveats.append(
+                {
+                    "code": "acceptance_criterion_paraphrased",
+                    "detail": f"criterion {entry_id} was reported with different wording than dispatched",
+                }
+            )
+
+        item_status = item.get("status")
+        if item_status not in valid_statuses:
+            errors.append(f"acceptance criterion {entry_id} has invalid status")
+        elif worker_status == "completed" and item_status != "passed":
+            errors.append(f"status=completed requires acceptance criterion {entry_id} to pass")
+
+        if (worker_status == "completed" or item_status == "passed") and not _has_nonempty_evidence(
+            item.get("evidence")
+        ):
+            errors.append(f"acceptance criterion {entry_id} requires non-empty evidence")
+
+    missing_ids = [cid for cid in expected_ids if cid not in seen_ids]
+    if missing_ids:
+        errors.append("missing acceptance criterion id(s): " + ", ".join(missing_ids))
+
+    if extra_entries:
+        if any(item.get("status") == "failed" for item in extra_entries):
+            errors.append("extra acceptance criterion entry without id reported failed status")
+        elif any(item.get("status") not in valid_statuses for item in extra_entries):
+            errors.append("extra acceptance criterion entry without id has invalid status")
+        elif not missing_ids:
+            pending_caveats.append(
+                {
+                    "code": "extra_acceptance_entries",
+                    "detail": (
+                        f"{len(extra_entries)} extra acceptance_criteria "
+                        f"{'entry' if len(extra_entries) == 1 else 'entries'} without a dispatched id"
+                    ),
+                }
+            )
+
+    if not errors:
+        caveats.extend(pending_caveats)
+    return errors
+
+
 def validate_flash_workhorse_result(
     outer: Any,
     package: dict[str, Any],
     staged: Any = None,
     caveats_out: list[dict[str, str]] | None = None,
+    weak_answers_out: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """Validate a worker's structured payload. The structured payload is
     PRIMARY: the CLI's own process/transport status (``outer["status"]``) is a
@@ -4824,11 +5808,22 @@ def validate_flash_workhorse_result(
     """
     errors: list[str] = []
     caveats = caveats_out if caveats_out is not None else []
+    weak_answers = weak_answers_out if weak_answers_out is not None else []
     if not isinstance(outer, dict):
         return None, ["agy JSON result is not an object"]
+    outer_status_raw = outer.get("status")
+    outer_status_upper = str(outer_status_raw or "").strip().upper()
     exit_status_mismatch = None
-    if str(outer.get("status") or "").upper() != "SUCCESS":
-        exit_status_mismatch = f"agy status was {outer.get('status') or 'missing'}"
+    agy_error_text = ""
+    is_malformed_tool_call_error = False
+    if outer_status_upper != "SUCCESS":
+        exit_status_mismatch = f"agy status was {outer_status_raw or 'missing'}"
+        agy_error_text = _extract_agy_error_text(outer)
+        is_malformed_tool_call_error = (
+            outer_status_upper == "ERROR"
+            and bool(agy_error_text)
+            and bool(_AGY_MALFORMED_TOOL_CALL_RE.search(agy_error_text))
+        )
     structured = outer.get("structured_output")
     if isinstance(structured, str):
         try:
@@ -4858,10 +5853,17 @@ def validate_flash_workhorse_result(
         # No structured payload to demote against -- the exit-status note is a
         # genuine rejection reason here, not a caveat.
         if exit_status_mismatch:
-            missing_errors.append(exit_status_mismatch)
+            detail = (
+                f"{exit_status_mismatch}: {agy_error_text[:200]}"
+                if agy_error_text
+                else exit_status_mismatch
+            )
+            missing_errors.append(detail)
         return None, missing_errors
 
-    required = set(flash_workhorse_output_schema(package)["required"])
+    # scope_gaps is required of the worker, but an older output without it is read
+    # as an empty list rather than rejected.
+    required = set(flash_workhorse_output_schema(package)["required"]) - {"scope_gaps"}
     missing = sorted(required.difference(structured))
     if missing:
         errors.append("missing fields: " + ", ".join(missing))
@@ -4893,6 +5895,8 @@ def validate_flash_workhorse_result(
     if not research_questions and coverage_items:
         errors.append("non-research packages require empty research_coverage")
 
+    roots = _scope_roots(staged, package)
+    read_only = package_is_read_only(package)
     allowed_source_kinds = {"code", "web", "document", "command", "provided_context"}
     for index, item in enumerate(coverage_items, 1):
         label = f"research_coverage[{index}]"
@@ -4965,15 +5969,37 @@ def validate_flash_workhorse_result(
                     errors.append(f"{label} answered status requires a compact answer")
                 if confidence == "low":
                     errors.append(f"{label} answered status cannot use low confidence")
-                if len(evidence_keys) < 2:
+                if len(evidence_keys) == 0:
                     errors.append(f"{label} answered status requires at least 2 distinct evidence probes")
+                elif len(evidence_keys) == 1:
+                    if read_only:
+                        weak_answers.append(
+                            _weak_answer_entry(
+                                index,
+                                "answered status requires at least 2 distinct evidence probes",
+                            )
+                        )
+                    else:
+                        errors.append(f"{label} answered status requires at least 2 distinct evidence probes")
                 if not any(str(value or "").strip() for value in competitors):
                     errors.append(f"{label} answered status requires a competing explanation check")
                 if not has_primary:
                     errors.append(f"{label} answered status requires a primary citation")
             elif status == "not_found":
-                if len(evidence_keys) < 2:
+                if len(evidence_keys) == 0:
                     errors.append(f"{label} not_found status requires at least 2 distinct search/evidence probes")
+                elif len(evidence_keys) == 1 and not _not_found_single_probe_allowed(
+                    structured, package, roots, index, item_evidence, gaps, coverage_items
+                ):
+                    if read_only:
+                        weak_answers.append(
+                            _weak_answer_entry(
+                                index,
+                                "not_found status requires at least 2 distinct search/evidence probes",
+                            )
+                        )
+                    else:
+                        errors.append(f"{label} not_found status requires at least 2 distinct search/evidence probes")
                 if not any(str(value or "").strip() for value in gaps):
                     errors.append(f"{label} not_found status requires searched-boundary gaps")
 
@@ -4981,7 +6007,6 @@ def validate_flash_workhorse_result(
     # manifest-relative vocabulary before comparison. Comparing a staged absolute
     # path against a workspace absolute path marked every obedient worker
     # out-of-scope and threw away real declared output.
-    roots = _scope_roots(staged, package)
     allowed = {_scope_key(path, roots) for path in package_writable_paths(package)}
     allowed.discard("")
     for changed in structured.get("files_changed") or []:
@@ -4991,16 +6016,25 @@ def validate_flash_workhorse_result(
         if allowed and _scope_key(changed["path"], roots) not in allowed:
             errors.append(f"out-of-scope file reported: {changed['path']}")
 
-    criteria = structured.get("acceptance_criteria") or []
+    raw_criteria = structured.get("acceptance_criteria")
+    criteria = raw_criteria if isinstance(raw_criteria, list) else []
     checks = structured.get("checks") or []
     ambiguities = structured.get("ambiguities") or []
     expected_criteria = package.get("acceptance_criteria") or []
-    reported_criteria = [
-        str(item.get("criterion") or "").strip()
+    has_criteria_ids = any(
+        isinstance(item, dict) and "id" in item and item.get("id") is not None
         for item in criteria
-        if isinstance(item, dict)
-    ]
-    if expected_criteria:
+    )
+    if expected_criteria and has_criteria_ids:
+        errors.extend(
+            _validate_criteria_by_id(criteria, expected_criteria, worker_status, caveats)
+        )
+    elif expected_criteria:
+        reported_criteria = [
+            str(item.get("criterion") or "").strip()
+            for item in criteria
+            if isinstance(item, dict)
+        ]
         if len(reported_criteria) != len(expected_criteria):
             errors.append("reported acceptance criteria do not match the dispatched package: count differs")
         else:
@@ -5019,9 +6053,16 @@ def validate_flash_workhorse_result(
                     )
     if worker_status == "completed":
         if ambiguities:
-            errors.append("status=completed contradicts non-empty ambiguities")
-        if any(not isinstance(item, dict) or item.get("status") != "passed" for item in criteria):
-            errors.append("status=completed requires every acceptance criterion to pass")
+            errors.append(
+                "status=completed contradicts non-empty ambiguities; if an entry is only a file "
+                "outside a read-only package's scope, report it in scope_gaps instead"
+            )
+        errors.extend(
+            _validate_scope_gaps(structured, package, roots, coverage_items, expected_criteria, criteria)
+        )
+        if not (expected_criteria and has_criteria_ids):
+            if any(not isinstance(item, dict) or item.get("status") != "passed" for item in criteria):
+                errors.append("status=completed requires every acceptance criterion to pass")
         if any(isinstance(item, dict) and item.get("status") == "failed" for item in checks):
             errors.append("status=completed contradicts a failed check")
 
@@ -5039,11 +6080,23 @@ def validate_flash_workhorse_result(
         if errors:
             # A genuine semantic failure already rejects this result on its own
             # merits; keep the exit-status note as extra diagnostic context.
-            errors.append(exit_status_mismatch)
+            detail = (
+                f"{exit_status_mismatch}: {agy_error_text[:200]}"
+                if agy_error_text
+                else exit_status_mismatch
+            )
+            errors.append(detail)
+        elif is_malformed_tool_call_error:
+            caveats.append(
+                {
+                    "code": "agy_malformed_tool_call",
+                    "detail": agy_error_text[:200],
+                }
+            )
         else:
-            # The structured payload is present, schema-valid, and in scope.
-            # Demote instead of rejecting: the CLI exit status is noise, not a
-            # verdict on the work.
+            # The structured payload is present, schema-valid, and in scope, and
+            # agy reported no error message. Demote instead of rejecting: the CLI
+            # process/transport status is noise, not a verdict on the work.
             caveats.append(
                 {
                     "code": "cli_exit_status_mismatch",
@@ -5223,6 +6276,7 @@ def kill_process_tree(proc: subprocess.Popen[Any]) -> None:
         try:
             subprocess.run(
                 ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=10,
@@ -5997,10 +7051,82 @@ FLASH_TIMEOUT_FIRST_LINE_CAP_BYTES = 64 * 1024
 FLASH_TIMEOUT_TRANSCRIPT_LINE_CAP = 5000
 FLASH_TIMEOUT_TRANSCRIPT_BYTE_CAP = 1_000_000
 FLASH_TIMEOUT_LAST_ACTION_CHARS = 200
+FLASH_TRANSCRIPT_SCAN_MAX_FILES = 50
+FLASH_TRANSCRIPT_TAIL_CAP_BYTES = 512 * 1024
+_FLASH_ATTESTATION_UNAVAILABLE_ERROR = (
+    "model attestation transcript was not available after a bounded wait; "
+    "an unattested model is never accepted before a workspace write"
+)
 # failure_kind values that mean "the subprocess actually launched and only
 # worker_execution timed out" -- as opposed to a genuine model-resolution
 # failure such as the CLI not being found at all.
 FLASH_TIMEOUT_FAILURE_KINDS = {"timeout_during_execution", "startup_stall", "timeout"}
+
+
+def _flash_transcript_path(conversation_id: str, filename: str = "transcript.jsonl") -> Path:
+    """Path to an agy session transcript file under `_antigravity_cli_home()`."""
+    return _antigravity_cli_home() / "brain" / str(conversation_id) / ".system_generated" / "logs" / filename
+
+
+def _read_transcript_tail(path: Path, max_bytes: int = FLASH_TRANSCRIPT_TAIL_CAP_BYTES) -> str:
+    """Read at most the last `max_bytes` bytes of a transcript file."""
+    size = path.stat().st_size
+    read_size = min(size, max(0, int(max_bytes)))
+    if read_size == 0:
+        return ""
+    with path.open("rb") as f:
+        if size > read_size:
+            f.seek(size - read_size)
+        chunk = f.read(read_size)
+    return chunk.decode("utf-8", errors="replace")
+
+
+def _find_flash_transcript_by_package(work_package_id: str, run_started_at: float) -> str | None:
+    """Locate the unique agy conversation id for a run when agy omitted
+    `conversation_id`, scanning up to the newest 50 `transcript_full.jsonl`
+    files modified at or after `run_started_at` (last 512 KB each).
+
+    Returns the conversation directory name only when exactly one candidate
+    contains `work_package_id`; returns None on zero, multiple, or I/O error.
+    """
+    pid = str(work_package_id or "").strip()
+    if not pid:
+        return None
+    try:
+        brain = _antigravity_cli_home() / "brain"
+        if not brain.exists():
+            return None
+        # Allow a sub-millisecond margin so NTFS/float64 mtime rounding does not
+        # drop a transcript written immediately after run_started_at.
+        cutoff = float(run_started_at) - 1e-4
+        candidates: list[tuple[float, str, Path]] = []
+        for session_dir in brain.iterdir():
+            if not session_dir.is_dir() or session_dir.name == "tempmediaStorage":
+                continue
+            transcript_full = _flash_transcript_path(session_dir.name, "transcript_full.jsonl")
+            try:
+                if not transcript_full.is_file():
+                    continue
+                mtime = transcript_full.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            candidates.append((mtime, session_dir.name, transcript_full))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        matches: list[str] = []
+        for _mtime, conv_id, transcript_full in candidates[:FLASH_TRANSCRIPT_SCAN_MAX_FILES]:
+            try:
+                text = _read_transcript_tail(transcript_full, FLASH_TRANSCRIPT_TAIL_CAP_BYTES)
+            except OSError:
+                continue
+            if pid in text:
+                matches.append(conv_id)
+                if len(matches) > 1:
+                    return None
+        return matches[0] if len(matches) == 1 else None
+    except Exception:
+        return None
 
 
 def _find_flash_timeout_transcript(package_id: str, launched_at: float) -> Path | None:
@@ -6028,7 +7154,7 @@ def _find_flash_timeout_transcript(package_id: str, launched_at: float) -> Path 
                 continue
         except OSError:
             continue
-        transcript = session_dir / ".system_generated" / "logs" / "transcript.jsonl"
+        transcript = _flash_transcript_path(session_dir.name)
         if not transcript.exists():
             continue
         with transcript.open("r", encoding="utf-8", errors="replace") as f:
@@ -6137,11 +7263,60 @@ def _classify_flash_timeout(package_id: str, launched_at: float) -> dict[str, An
 # Matches agy's transcript line recording an in-session model switch, e.g.
 # 'changed setting `Model Selection` from Gemini 3.5 Flash (High) to Gemini 3.8 Flash (High).'
 _ANTIGRAVITY_MODEL_SELECTION_RE = re.compile(
-    # display is matched greedily up to the LAST period on the line (not the
-    # non-greedy first one): a version like "3.6" embeds its own period, so a
-    # lazy match truncated the display name at "Gemini 3" every time.
-    r"changed setting `Model Selection` from .*? to (?P<display>.+?)\.(?:\s|$)", re.IGNORECASE
+    # display is matched greedily up to the LAST period before whitespace, EOL,
+    # or a JSON string/tag delimiter (not the first period): a version like
+    # "3.6" embeds its own period, while JSONL transcripts follow "." with
+    # '"', '\n' ("\\n"), or '<' rather than raw whitespace/EOL.
+    r"changed setting `Model Selection` from .*? to (?P<display>.+?)\.(?:\s|$|[\"'<\\])",
+    re.IGNORECASE,
 )
+
+
+def _extract_model_from_transcript_text(text: str) -> str | None:
+    """Read the model from agy's OWN settings record only.
+
+    agy writes the selection as a USER_INPUT / USER_EXPLICIT record containing a
+    <USER_SETTINGS_CHANGE> block. File contents a worker reads arrive as MODEL
+    records and can contain the same sentence as test data, so they must never
+    attest a model. The last trusted record wins (the model can change mid-run).
+    Plain-text (non-JSONL) input keeps the legacy first-match behaviour.
+    """
+    raw = str(text or "")
+    display: str | None = None
+    saw_json = False
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        saw_json = True
+        source = str(record.get("source") or "").upper()
+        kind = str(record.get("type") or "").upper()
+        if source != "USER_EXPLICIT" and kind != "USER_INPUT":
+            continue
+        content = str(record.get("content") or "")
+        if "USER_SETTINGS_CHANGE" not in content:
+            continue
+        for match in _ANTIGRAVITY_MODEL_SELECTION_RE.finditer(content):
+            candidate = match.group("display").strip()
+            if candidate:
+                display = candidate
+    if display is None and not saw_json:
+        match = _ANTIGRAVITY_MODEL_SELECTION_RE.search(raw)
+        if match:
+            display = match.group("display").strip() or None
+    if not display:
+        return None
+    target = normalize_lookup(display)
+    for item in discover_antigravity_models():
+        if normalize_lookup(item.get("display")) == target:
+            return str(item.get("id") or "") or None
+    return None
 
 
 def _attest_flash_model_from_transcript(conversation_id: str) -> str | None:
@@ -6149,21 +7324,23 @@ def _attest_flash_model_from_transcript(conversation_id: str) -> str | None:
     'changed setting `Model Selection` ... to <Display>.' line and map that
     display name to a catalog model id. Best-effort; never raises."""
     try:
-        transcript = _antigravity_cli_home() / "brain" / str(conversation_id) / ".system_generated" / "logs" / "transcript.jsonl"
-        if not transcript.exists():
-            return None
-        with transcript.open("r", encoding="utf-8", errors="replace") as f:
-            text = f.read(FLASH_TIMEOUT_FIRST_LINE_CAP_BYTES)
-        match = _ANTIGRAVITY_MODEL_SELECTION_RE.search(text)
-        if not match:
-            return None
-        display = match.group("display").strip()
-        if not display:
-            return None
-        target = normalize_lookup(display)
-        for item in discover_antigravity_models():
-            if normalize_lookup(item.get("display")) == target:
-                return str(item.get("id") or "") or None
+        transcript = _flash_transcript_path(conversation_id, "transcript.jsonl")
+        if transcript.exists():
+            with transcript.open("r", encoding="utf-8", errors="replace") as f:
+                attested = _extract_model_from_transcript_text(f.read(FLASH_TIMEOUT_FIRST_LINE_CAP_BYTES))
+            if attested:
+                return attested
+        transcript_full = _flash_transcript_path(conversation_id, "transcript_full.jsonl")
+        if transcript_full.exists():
+            with transcript_full.open("rb") as f:
+                head = f.read(FLASH_TRANSCRIPT_TAIL_CAP_BYTES).decode("utf-8", errors="replace")
+            attested = _extract_model_from_transcript_text(head)
+            if attested:
+                return attested
+            if transcript_full.stat().st_size > FLASH_TRANSCRIPT_TAIL_CAP_BYTES:
+                return _extract_model_from_transcript_text(
+                    _read_transcript_tail(transcript_full, FLASH_TRANSCRIPT_TAIL_CAP_BYTES)
+                )
         return None
     except Exception:
         return None
@@ -6177,25 +7354,46 @@ def _flash_apply_dir() -> Path:
 
 
 FLASH_APPLIED_OUTCOMES = ("applied_then_rejected", "apply_outcome_uncertain")
-FLASH_TRANSCRIPT_WAIT_SECONDS = 3.0
+FLASH_TRANSCRIPT_WAIT_SECONDS = 20.0  # agy can flush its transcript seconds after exit (3 s missed one on 11-18)
 _FLASH_APPLY_MEMORY: dict[tuple[str, str], dict[str, Any]] = {}
 _FLASH_STALE_NOT_APPLIED_RE = re.compile(
     r"NOT applied|nothing was written back|NOT accepted and NOT applied|not_applied", re.IGNORECASE
 )
 
 
-def flash_worker_env_overrides(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+def _create_flash_pycache_dir() -> Path:
+    """Create a broker-owned temporary PYTHONPYCACHEPREFIX directory outside staging."""
+    base = BROKER_DIR / "tmp"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix="flash-pycache-", dir=str(base)))
+    except OSError:
+        return Path(tempfile.mkdtemp(prefix="flash-pycache-"))
+
+
+def flash_worker_env_overrides(
+    environ: Mapping[str, str] | None = None,
+    *,
+    stage_repo: bool = False,
+    pycache_prefix: str | Path | None = None,
+) -> dict[str, str]:
     """Environment the Flash worker must NOT inherit from the allowlist alone.
 
     A worker that runs the tests would otherwise litter the staging tree with
     bytecode and a pytest cache. An existing PYTEST_ADDOPTS is preserved, not
-    replaced.
+    replaced. When ``stage_repo`` is true, bytecode caches are also redirected
+    to a broker-owned directory outside the staging folder via
+    ``PYTHONPYCACHEPREFIX``.
     """
     source = os.environ if environ is None else environ
     existing = str(source.get("PYTEST_ADDOPTS") or "").strip()
     if "no:cacheprovider" not in existing:
         existing = f"{existing} -p no:cacheprovider".strip()
-    return {"PYTHONDONTWRITEBYTECODE": "1", "PYTEST_ADDOPTS": existing}
+    overrides = {"PYTHONDONTWRITEBYTECODE": "1", "PYTEST_ADDOPTS": existing}
+    if stage_repo:
+        prefix = Path(pycache_prefix) if pycache_prefix is not None else _create_flash_pycache_dir()
+        overrides["PYTHONPYCACHEPREFIX"] = str(prefix)
+    return overrides
 
 
 def _flash_apply_record_path(package_id: str, token: str) -> Path:
@@ -6398,7 +7596,7 @@ def _wait_for_flash_transcript(conversation_id: str, wait_seconds: float | None 
     short, bounded time for it to exist and be non-empty."""
     bound = FLASH_TRANSCRIPT_WAIT_SECONDS if wait_seconds is None else wait_seconds
     deadline = time.monotonic() + max(0.0, bound)
-    transcript = _antigravity_cli_home() / "brain" / str(conversation_id) / ".system_generated" / "logs" / "transcript.jsonl"
+    transcript = _flash_transcript_path(conversation_id)
     while True:
         try:
             if transcript.exists() and transcript.stat().st_size > 0:
@@ -6522,6 +7720,9 @@ def consult_antigravity_cli(
         )
     package_kind = "implementation" if implementation_mode else "consult"
     package = work_package or prepare_flash_work_package({}, package_kind, prompt)
+    # The validator decides scope_gaps eligibility from the dispatched mode, never
+    # from the worker's report. Copy so a caller's dict is not mutated.
+    package = {**package, "mode": requested_mode}
     schema = flash_workhorse_output_schema(package)
     # The manifest is built BEFORE the command, because the worker has to be told
     # the staged paths and those do not exist until staging has run.
@@ -6530,31 +7731,32 @@ def consult_antigravity_cli(
             {
                 "package_id": package.get("package_id"),
                 "worker_status": "rejected",
+                "disposition": "rejected",
                 "rejection": rejection.to_dict(),
                 "message": rejection.message(),
             },
             ensure_ascii=False,
         )
 
+    stage_repo = bool(package.get("stage_repo"))
     try:
         manifest = flash_manifest.build_manifest(
             package, project_info.root_path, implementation_mode
         )
-        # Exactly the declared files are copied into a disposable tree. Nothing is
-        # walked. The previous design staged the smallest common ancestor of the
-        # allowlist -- and, for read packages, the entire project root -- so a
-        # one-file package against a large workspace could not run at all.
-        staged = flash_manifest.stage(manifest)
+        # Exactly the declared files are copied into a disposable tree unless
+        # stage_repo opts into staging a read-only copy of the git workspace.
+        staged = flash_manifest.stage(manifest, stage_repo=stage_repo)
     except flash_manifest.ManifestRejection as rejection:
         return _manifest_refusal(rejection)
     except OSError as exc:
         return f"Antigravity CLI structured-output validation failed: staging failed ({exc})."
 
+    effective_effort = _antigravity_effective_effort(model_name, effort)
     command = [agy]
     if model_name:
         command.extend(["--model", str(model_name)])
-    if effort:
-        command.extend(["--effort", str(effort)])
+    if effective_effort:
+        command.extend(["--effort", str(effective_effort)])
     # agy ignores --mode in print mode ("--mode is not supported in print mode") and
     # auto-denies every tool it cannot prompt for, which is why runs exited 0, reported
     # SUCCESS, and returned nothing whatsoever: the worker was never able to read a
@@ -6589,17 +7791,34 @@ def consult_antigravity_cli(
     outer: Any = None
     structured: dict[str, Any] | None = None
     caveats: list[dict[str, str]] = []
+    weak_answers: list[dict[str, Any]] = []
+    if staged.repo_staging and staged.repo_staging.get("caveat"):
+        caveats.append(
+            {
+                "code": "repo_staging_unavailable",
+                "detail": str(staged.repo_staging["caveat"]),
+            }
+        )
     pre_failure: dict[str, Any] | None = None
     attested_model: str | None = None
     attestation_source = "none"
+    conversation_id: Any = None
     candidates: list[str] = []
+    pycache_prefix: Path | None = None
+    run_started_at = flash_launch_epoch
     try:
+        if stage_repo:
+            pycache_prefix = _create_flash_pycache_dir()
+        run_started_at = time.time()
         code, stdout, stderr = run_process(
             command,
             str(staged.root),
             None,
             timeout=timeout,
-            extra_env=flash_worker_env_overrides(),
+            extra_env=flash_worker_env_overrides(
+                stage_repo=stage_repo,
+                pycache_prefix=pycache_prefix,
+            ),
         )
         # The ENTIRE staging tree is diffed, not just the declared paths: the case
         # worth catching is a worker that created or rewrote something it never
@@ -6633,7 +7852,7 @@ def consult_antigravity_cli(
                     pre_failure = {"kind": "invalid_json", "errors": [f"invalid JSON ({exc})"], "exc": str(exc)}
             if pre_failure is None:
                 structured, validation_errors = validate_flash_workhorse_result(
-                    outer, package, staged, caveats_out=caveats
+                    outer, package, staged, caveats_out=caveats, weak_answers_out=weak_answers
                 )
                 if validation_errors:
                     missing_context = (
@@ -6650,25 +7869,58 @@ def consult_antigravity_cli(
                 backend_model = outer.get("model") or outer.get("model_id") or None
                 attested_model = backend_model
                 attestation_source = "backend" if backend_model else "none"
-                conversation_id = outer.get("conversation_id")
+                conversation_id = str(outer.get("conversation_id") or "").strip() or None
                 if not attested_model and conversation_id:
                     if implementation_mode and model_name and not _wait_for_flash_transcript(str(conversation_id)):
                         pre_failure = {
                             "kind": "attestation_unavailable",
-                            "errors": [
-                                "model attestation transcript was not available after a bounded wait; "
-                                "an unattested model is never accepted before a workspace write"
-                            ],
+                            "errors": [_FLASH_ATTESTATION_UNAVAILABLE_ERROR],
                         }
                     else:
                         transcript_attested = _attest_flash_model_from_transcript(str(conversation_id))
                         if transcript_attested:
                             attested_model = transcript_attested
                             attestation_source = "transcript"
+                        elif implementation_mode and model_name:
+                            # The transcript exists but names no model: still unattested,
+                            # so nothing may be written back.
+                            pre_failure = {
+                                "kind": "attestation_unavailable",
+                                "errors": [_FLASH_ATTESTATION_UNAVAILABLE_ERROR],
+                            }
+                elif not attested_model and not conversation_id:
+                    matched_conversation_id = _find_flash_transcript_by_package(package_id, run_started_at)
+                    if matched_conversation_id:
+                        conversation_id = matched_conversation_id
+                        transcript_attested = _attest_flash_model_from_transcript(matched_conversation_id)
+                        if transcript_attested:
+                            attested_model = transcript_attested
+                            attestation_source = "transcript"
+                    if not attested_model:
+                        if implementation_mode and model_name:
+                            pre_failure = {
+                                "kind": "attestation_unavailable",
+                                "errors": [_FLASH_ATTESTATION_UNAVAILABLE_ERROR],
+                            }
+                        elif not implementation_mode:
+                            caveats.append(
+                                {
+                                    "code": "model_unattested",
+                                    "detail": (
+                                        "agy returned no conversation id and the matched transcript did not attest a model"
+                                        if matched_conversation_id
+                                        else "agy returned no conversation id and no transcript matched this package"
+                                    ),
+                                }
+                            )
             if pre_failure is None:
                 conflict = attested_model_conflict(model_name, attested_model)
                 if conflict:
                     pre_failure = {"kind": "attestation", "errors": [conflict]}
+            if not implementation_mode and stage_repo and pre_failure is None and staging_changes is not None:
+                scope_reasons = flash_manifest.scope_refusals(staging_changes)
+                if scope_reasons:
+                    pre_failure = {"kind": "validation", "errors": scope_reasons}
             if implementation_mode:
                 if pre_failure is not None:
                     apply_report = {
@@ -6696,6 +7948,8 @@ def consult_antigravity_cli(
     finally:
         # The staging tree outlives the apply on purpose and is removed only now.
         shutil.rmtree(staged.root, ignore_errors=True)
+        if pycache_prefix is not None:
+            shutil.rmtree(pycache_prefix, ignore_errors=True)
 
     committed_files = _flash_report_committed_files(apply_report)
     apply_uncertain = bool(apply_report and apply_report.get("apply_outcome_uncertain")) and not committed_files
@@ -6716,6 +7970,7 @@ def consult_antigravity_cli(
                     structured=structured,
                     containment=containment_report,
                     apply_report=apply_report,
+                    caveats=caveats,
                 )
             # Report and refuse; never "clean up". An unexpected file may belong to the
             # user or another process, and a deleted one cannot be restored from a hash.
@@ -6804,6 +8059,12 @@ def consult_antigravity_cli(
             # not match, so the caller should not treat this as an unqualified
             # completion without reading the caveat.
             demoted_worker_status = "completed_with_caveats"
+        if worker_reported_status == "completed":
+            disposition = "accepted_with_caveats" if caveats else "accepted"
+        elif worker_reported_status == "blocked":
+            disposition = "blocked"
+        else:
+            disposition = "rejected"
         normalized = {
             "package_id": package["package_id"],
             "worker_status": demoted_worker_status,
@@ -6811,14 +8072,15 @@ def consult_antigravity_cli(
             "caveats": caveats,
             # The broker's own acceptance verdict. Never infer acceptance from
             # "a payload exists" or "a path is present" -- key on this field.
-            "disposition": "accepted_with_caveats" if caveats else "accepted",
+            "disposition": disposition,
             "cli": {
-                "conversation_id": outer.get("conversation_id"),
+                "conversation_id": conversation_id,
                 "duration_seconds": outer.get("duration_seconds"),
                 "num_turns": outer.get("num_turns"),
                 "usage": outer.get("usage"),
                 "model": attested_model,
                 "requested_model": model_name,
+                "effort": effective_effort,
                 "attestation": attestation_source,
                 "model_attested": bool(
                     attested_model and model_name
@@ -6842,6 +8104,7 @@ def consult_antigravity_cli(
                     normalized["quarantine_sha256"] = skipped_q.get("quarantine_sha256")
                     normalized["quarantine_files"] = skipped_q.get("quarantine_files") or []
                     normalized["quarantine_diff"] = skipped_q.get("quarantine_diff")
+        normalized["weak_answers"] = weak_answers
         return json.dumps(normalized, ensure_ascii=False)
     except Exception as exc:  # noqa: BLE001
         # Anything that fails AFTER a real write must say so. Re-raising here would
@@ -6918,6 +8181,7 @@ def persist_worker_stderr(package_id: str, stderr: str) -> tuple[str, str | None
             subprocess.run(
                 ["icacls", str(WORKER_LOG_DIR), "/inheritance:r",
                  "/grant:r", f"{os.environ.get('USERNAME', '')}:(OI)(CI)F"],
+                stdin=subprocess.DEVNULL,
                 capture_output=True, timeout=15, check=False,
                 creationflags=WINDOWS_NO_WINDOW,
             )
@@ -7187,11 +8451,40 @@ def _rejection_validation_failures(response: str) -> list[str]:
 # rejection: the first can justify a native fallback, the second never can (it means
 # the worker misbehaved, and rerouting it to a different worker hides that).
 FLASH_OUTCOME_CREDITABLE = "completed_verified"
+# A read-only package that answered from its own files and listed only outside files
+# in scope_gaps. Same credit as completed_verified; brain verification is still required.
+FLASH_CREDITABLE_OUTCOMES = (FLASH_OUTCOME_CREDITABLE, FLASH_OUTCOME_WITH_GAPS)
 FLASH_INFRASTRUCTURE_PREFIXES = (
     "Antigravity CLI was not found.",
     "Antigravity CLI timed out after",
     "Antigravity CLI exited with code",
 )
+
+
+def _response_has_weak_answers(response: str) -> bool:
+    head = str(response or "").lstrip()
+    if not head.startswith("{") or '"weak_answers"' not in head:
+        return False
+    try:
+        payload = json.loads(head)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(payload, dict) and bool(payload.get("weak_answers"))
+
+
+def _structured_has_single_probe_research(structured: Any) -> bool:
+    coverage = structured.get("research_coverage") if isinstance(structured, dict) else None
+    if not isinstance(coverage, list):
+        return False
+    for item in coverage:
+        if not isinstance(item, dict):
+            continue
+        if item.get("status") not in {"answered", "not_found"}:
+            continue
+        evidence = item.get("evidence")
+        if isinstance(evidence, list) and len(_research_evidence_keys(evidence)) == 1:
+            return True
+    return False
 
 
 def classify_flash_outcome(
@@ -7235,6 +8528,12 @@ def classify_flash_outcome(
         return "failed_pre_mutation"
     worker_status = (structured or {}).get("status") if isinstance(structured, dict) else None
     if worker_status == "completed":
+        if (
+            _scope_gaps_of(structured)
+            or _response_has_weak_answers(text)
+            or _structured_has_single_probe_research(structured)
+        ):
+            return FLASH_OUTCOME_WITH_GAPS
         return FLASH_OUTCOME_CREDITABLE
     if worker_status == "blocked":
         return "blocked"
@@ -7351,7 +8650,7 @@ def flash_terminal_progress(
                 ("rolled_back" if apply_state == "rolled_back" else "not_applied") if implementation else "not_applicable",
             ),
         ]
-    elif outcome == FLASH_OUTCOME_CREDITABLE:
+    elif outcome in FLASH_CREDITABLE_OUTCOMES:
         state, current_phase = "completed", "workspace_apply" if implementation else "structured_validation"
         phases = [
             phase("model_resolution", "completed"),
@@ -7517,7 +8816,7 @@ def store_consultation(
     branch = run_git(project_info.root_path, ["rev-parse", "--abbrev-ref", "HEAD"])
     commit_sha = run_git(project_info.root_path, ["rev-parse", "HEAD"])
     caller = os.environ.get("AGENT_BROKER_CALLER") or "mcp-client"
-    with db_connect() as conn:
+    with contextlib.closing(db_connect()) as conn, conn:
         conn.execute(
             """
             INSERT INTO consultations (
@@ -7556,7 +8855,7 @@ def lookup_consultation_receipt(request_id: str) -> dict[str, Any] | None:
         return None
     try:
         init_db()
-        with db_connect() as conn:
+        with contextlib.closing(db_connect()) as conn:
             row = conn.execute(
                 """
                 SELECT request_id, consulted_model, mode, status, started_at, finished_at, receipt_meta
@@ -7846,6 +9145,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
     prompt = str(args.get("prompt") or "").strip()
     if not prompt:
         raise ValueError("prompt is required")
+    raw_user_prompt = prompt
     project_arg = args.get("project")
     topic_arg = str(args.get("topic") or "").strip() or None
     task_kind = normalize_task_kind(args.get("task_kind"))
@@ -7891,16 +9191,17 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             return {
                 "status": "needs_model_selection",
                 "reason": (
-                    "No eligible stable Gemini Flash High model was available from live Antigravity CLI "
+                    "No eligible stable Gemini Hydrogen High or Flash High model was available from live Antigravity CLI "
                     "discovery or its last valid observed catalog."
                 ),
                 "model_family": "antigravity",
                 "target_agent": "antigravity_cli",
                 "choices": catalog.get("models") or [],
                 "catalog_status": antigravity_catalog_status(),
-                "action": "Retry after Antigravity CLI advertises an eligible Flash High model, or use an explicit pin.",
+                "action": "Retry after Antigravity CLI advertises an eligible Hydrogen High or Flash High model, or use an explicit pin.",
             }
         resolved_model = antigravity_model_for_effort(resolved_model, effort)
+        effort = _antigravity_effective_effort(resolved_model, effort)
     # A direct serious Codex frontier consult/plan is forced to max — even if the caller passed
     # high/medium — unless it explicitly opted into a cheaper tier (model_policy=cheap_read /
     # balanced / lower_effort, or a Luna/Terra model). This is SAFE now: max no longer blocks
@@ -8067,15 +9368,14 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         ):
             status = "error"
         error = response if status == "error" else None
-        consulted_name = responder_model or (f"{model}:{resolved_model}" if resolved_model else model)
-        if effort and model != "codex":
-            consulted_name += f" [{effort}]"
         flash_outcome = None
         flash_cli_meta = {}
         consult_request_id = None
         if model == "antigravity":
             if isinstance(antigravity_envelope, dict):
                 flash_cli_meta = antigravity_envelope.get("cli") or {}
+                if flash_cli_meta.get("effort"):
+                    effort = str(flash_cli_meta["effort"])
             flash_outcome = classify_flash_outcome(
                 response, status, antigravity_structured, flash_timeout_meta.get("failure_kind")
             )
@@ -8086,6 +9386,9 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
                 if flash_async_worker
                 else str(uuid.uuid4())
             )
+        consulted_name = responder_model or (f"{model}:{resolved_model}" if resolved_model else model)
+        if effort and model != "codex":
+            consulted_name += f" [{effort}]"
         if not already_stored:
             store_consultation(
                 project_info, consulted_name, mode, prompt, response, status, error, started_at,
@@ -8098,6 +9401,7 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
                         "attested_model": flash_cli_meta.get("model"),
                         "attestation": flash_cli_meta.get("attestation", "none"),
                         "mode": mode,
+                        "prompt_sha256": _prompt_sha256(raw_user_prompt),
                     }
                     if model == "antigravity"
                     else None
@@ -8110,12 +9414,13 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
         redact_response = status != "ok"
         if len(response or "") > max_response_chars:
             response_truncated = True
-            response_payload = truncate_preserving_structure(response, max_response_chars, redact=redact_response)
+            stored_response = _pretty_json_if_valid(response) if redact_response else response
+            response_payload = truncate_preserving_structure(stored_response, max_response_chars, redact=redact_response)
             try:
                 response_ref = store_shared_context(
                     project_info.name,
                     topic_arg,
-                    response,
+                    _pretty_json_if_valid(response),
                     f"consultation:{consulted_name}",
                     "consultation_response",
                     max_response_chars,
@@ -8172,7 +9477,35 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
             # write a plausible-looking receipt into its own audit.
             result["receipt"] = f"broker:{consult_request_id}" if consult_request_id else None
             result["outcome"] = flash_outcome
-            result["credit_eligible"] = flash_outcome == FLASH_OUTCOME_CREDITABLE
+            result["credit_eligible"] = flash_outcome in FLASH_CREDITABLE_OUTCOMES
+            has_envelope_weak = isinstance(antigravity_envelope, dict) and "weak_answers" in antigravity_envelope
+            weak_answers = (
+                list(antigravity_envelope.get("weak_answers") or [])
+                if has_envelope_weak
+                else []
+            )
+            if (
+                not has_envelope_weak
+                and flash_outcome == FLASH_OUTCOME_WITH_GAPS
+                and flash_package is not None
+                and package_is_read_only(flash_package)
+                and isinstance(antigravity_structured, dict)
+            ):
+                weak_answers = _weak_answers_from_structured(antigravity_structured, flash_package)
+            if flash_outcome == FLASH_OUTCOME_WITH_GAPS:
+                gaps = _scope_gaps_of(antigravity_structured)
+                if gaps:
+                    result["scope_gaps"] = gaps
+                    result["suggested_read_context"] = [
+                        str(gap.get("path")) for gap in gaps if isinstance(gap, dict) and gap.get("path")
+                    ]
+                    result["suggested_read_context_note"] = (
+                        "A proposal for the brain only: it is never applied automatically. The answer is "
+                        "complete for the files given; re-dispatch with these paths in read_context if the "
+                        "missing files matter. Brain verification is still required."
+                    )
+                if weak_answers:
+                    result["weak_answers"] = weak_answers
             salvage_files, salvage_diff = _quarantine_salvage_from_response(response)
             if salvage_files or salvage_diff:
                 result["quarantine_files"] = salvage_files
@@ -8195,9 +9528,21 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
                         missing_context_files = [str(x) for x in json.loads(ctx_match.group("files"))]
                     except (json.JSONDecodeError, TypeError):
                         missing_context_files = []
+            flash_validation_failures = (
+                _rejection_validation_failures(response) if flash_outcome == "rejected" else []
+            )
             native_handoff = native_handoff_for_flash_outcome(
-                args, flash_outcome, result["receipt"], salvage_files, salvage_diff,
+                {**args, "prompt": raw_user_prompt},
+                flash_outcome,
+                result["receipt"],
+                salvage_files,
+                salvage_diff,
                 missing_context=missing_context_files,
+                validation_failures=flash_validation_failures or None,
+                structured_output=antigravity_structured,
+                response_text=response,
+                current_request_id=consult_request_id,
+                failure_kind=flash_timeout_meta.get("failure_kind"),
             )
             if native_handoff is not None:
                 result["native_handoff"] = native_handoff
@@ -8251,13 +9596,19 @@ def consult(model: str, args: dict[str, Any]) -> dict[str, Any]:
                 result["quarantine_path"] = quarantine_match.group("path") if quarantine_match else None
                 result["quarantine_sha256"] = quarantine_match.group("sha") if quarantine_match else None
                 result["artifact_disposition"] = "quarantined_untrusted" if quarantine_match else None
+            elif flash_outcome == "blocked":
+                if not result.get("disposition"):
+                    result["disposition"] = "blocked"
+            elif flash_outcome == "failed_pre_mutation" and isinstance(antigravity_envelope, dict):
+                if not result.get("disposition"):
+                    result["disposition"] = "rejected"
             elif flash_outcome == "rejected":
                 result["fallback_advice"] = (
                     "The worker's own output was rejected. Inspect the rejection and re-scope it "
                     "before using the structured native handoff; do not silently replay the package."
                 )
                 result["disposition"] = "rejected"
-                result["validation_failures"] = _rejection_validation_failures(response)
+                result["validation_failures"] = flash_validation_failures
                 quarantine_match = _QUARANTINE_SUFFIX_RE.search(response)
                 if quarantine_match:
                     result["quarantine_path"] = quarantine_match.group("path")
@@ -8397,7 +9748,7 @@ def _envelope_header_fields(result: Mapping[str, Any]) -> dict[str, Any]:
         "status", "outcome", "accepted", "credit_eligible", "worker_status", "disposition",
         "receipt", "work_package_id", "model", "attested_model", "attestation", "model_attested",
         "elapsed_seconds", "native_handoff", "caveats", "response_ref", "truncated",
-        "request_id", "async_worker", "poll",
+        "request_id", "async_worker", "poll", "scope_gaps", "weak_answers", "suggested_read_context",
     ):
         if key in result:
             header[key] = result[key]
@@ -8408,7 +9759,23 @@ def _envelope_header_fields(result: Mapping[str, Any]) -> dict[str, Any]:
 # (or any other bulky header object/string) could push the final serialized
 # result past max_response_chars with no guarantee re-check. These bound each
 # header field individually before the size math below runs.
-_NATIVE_HANDOFF_HEADER_KEYS = ("family", "role", "model", "flash_skip_reason", "action")
+_NATIVE_HANDOFF_HEADER_KEYS = (
+    "family",
+    "role",
+    "model",
+    "action",
+    "target",
+    "brain_adjudication_required",
+    "stage_repo_hint",
+    "suggested_read_context",
+    "validation_failures",
+    "brain_review",
+    "do_not_replay",
+    "do_not_replay_note",
+    "native",
+    "flash_skip_reason",
+)
+_HANDOFF_PRIORITY_HEADER_KEYS = frozenset({"native_handoff", "weak_answers", "scope_gaps"})
 # The minimum set apply_response_envelope_budget guarantees survives even a
 # pathological every-field-is-huge result, per WP-SB8D item 2.
 _ENVELOPE_ESSENTIAL_KEYS = (
@@ -8417,14 +9784,16 @@ _ENVELOPE_ESSENTIAL_KEYS = (
 )
 _HEADER_OBJECT_CONDENSE_CHARS = 300
 _HEADER_STRING_CAP_CHARS = 500
+_CONDENSED_FIELD_STRING_CAP = 300
 
 
 def _condense_header_value(key: str, value: Any) -> Any:
     """Reduce one bulky header-field value to something small and bounded.
-    native_handoff keeps only its essential scalar keys (family/role/model/
-    flash_skip_reason/action); any other header object (e.g. caveats) or long
-    string over the small condense cap collapses to a short stub or is
-    truncated -- the full value is always still reachable via response_ref."""
+    native_handoff keeps its essential handoff/review keys (plus top-level
+    family/role/model for compatibility); weak_answers and scope_gaps are
+    preserved in bounded form; any other header object over the small condense
+    cap collapses to a short stub -- the full value is always still reachable
+    via response_ref."""
     if key == "native_handoff" and isinstance(value, Mapping):
         # native_handoff_for_flash_outcome nests family/role/model under a
         # "native" sub-object; pull them up to top-level scalars either way so
@@ -8433,10 +9802,27 @@ def _condense_header_value(key: str, value: Any) -> Any:
         condensed: dict[str, Any] = {}
         for essential_key in _NATIVE_HANDOFF_HEADER_KEYS:
             if essential_key in value:
-                condensed[essential_key] = value[essential_key]
-            elif essential_key in nested:
-                condensed[essential_key] = nested[essential_key]
+                raw_val = value[essential_key]
+            elif essential_key in nested and essential_key in ("family", "role", "model"):
+                raw_val = nested[essential_key]
+            else:
+                continue
+            if essential_key == "suggested_read_context" and isinstance(raw_val, list):
+                condensed[essential_key] = _trim_long_strings(raw_val[:5], _CONDENSED_FIELD_STRING_CAP)
+            elif essential_key == "validation_failures" and isinstance(raw_val, list):
+                condensed[essential_key] = [
+                    _trim_long_strings(str(item), _CONDENSED_FIELD_STRING_CAP)
+                    for item in raw_val[:3]
+                ]
+            else:
+                condensed[essential_key] = _trim_long_strings(raw_val, _CONDENSED_FIELD_STRING_CAP)
         return condensed or {"note": "condensed; see response_ref"}
+    if key == "scope_gaps" and isinstance(value, list):
+        return _trim_long_strings(value[:5], _CONDENSED_FIELD_STRING_CAP)
+    if key == "weak_answers" and isinstance(value, list):
+        return _trim_long_strings(value, _CONDENSED_FIELD_STRING_CAP)
+    if key == "suggested_read_context" and isinstance(value, list):
+        return _trim_long_strings(value[:5], _CONDENSED_FIELD_STRING_CAP)
     if isinstance(value, (dict, list)):
         if len(json.dumps(value, ensure_ascii=False, default=str)) > _HEADER_OBJECT_CONDENSE_CHARS:
             return {"note": "condensed; see response_ref"}
@@ -8454,10 +9840,10 @@ def _bounded_header_fields(result: Mapping[str, Any]) -> dict[str, Any]:
 def _enforce_envelope_size_guarantee(final: dict[str, Any], budget: int) -> dict[str, Any]:
     """Last-mile guarantee for apply_response_envelope_budget: len(json.dumps(
     final)) <= budget in every case, even a pathological result where every
-    field (header included) is huge. Drops non-essential keys first (largest
-    first), then shrinks remaining string values, then -- only if the budget
-    is too small even for the essential keys alone -- drops down to status/
-    truncated."""
+    field (header included) is huge. Drops non-essential keys first (non-handoff
+    largest first, then handoff/gap priority keys if still over budget), then
+    shrinks remaining string values, then -- only if the budget is too small even
+    for the essential keys alone -- drops down to status/truncated."""
     def _size(obj: Mapping[str, Any]) -> int:
         return len(json.dumps(obj, ensure_ascii=False, default=str))
 
@@ -8465,7 +9851,12 @@ def _enforce_envelope_size_guarantee(final: dict[str, Any], budget: int) -> dict
         return final
 
     droppable = [k for k in final if k not in _ENVELOPE_ESSENTIAL_KEYS]
-    droppable.sort(key=lambda k: len(json.dumps(final[k], ensure_ascii=False, default=str)), reverse=True)
+    droppable.sort(
+        key=lambda k: (
+            k in _HANDOFF_PRIORITY_HEADER_KEYS,
+            -len(json.dumps(final[k], ensure_ascii=False, default=str)),
+        )
+    )
     for drop_key in droppable:
         final.pop(drop_key, None)
         if _size(final) <= budget:
@@ -8525,10 +9916,16 @@ def _condense_bulky_diagnostics(working: dict[str, Any]) -> dict[str, Any]:
         working["model_resolution"] = condensed
     progress = working.get("progress")
     if isinstance(progress, Mapping) and len(json.dumps(progress, ensure_ascii=False, default=str)) > 400:
-        working["progress"] = {"status": progress.get("status"), "note": "condensed; see response_ref"}
+        working["progress"] = {
+            "status": progress.get("status") or progress.get("state"),
+            "note": "condensed; see response_ref",
+        }
     containment = working.get("containment")
     if isinstance(containment, Mapping) and len(json.dumps(containment, ensure_ascii=False, default=str)) > 400:
-        working["containment"] = {"status": containment.get("status"), "note": "condensed; see response_ref"}
+        working["containment"] = {
+            "status": containment.get("status") or containment.get("integrity"),
+            "note": "condensed; see response_ref",
+        }
     return working
 
 
@@ -8567,8 +9964,9 @@ def apply_response_envelope_budget(
 
     try:
         redact = str(result.get("status")) not in ("ok", "completed")
+        stored_payload = json.dumps(result, indent=1, ensure_ascii=False, default=str)
         stored = store_shared_context(
-            project, topic, serialized, source or "response_envelope",
+            project, topic, stored_payload, source or "response_envelope",
             "response_envelope", None, redact=redact,
         )
         working["response_ref"] = stored.get("ref")
@@ -9142,12 +10540,38 @@ def _decision_failure(result: dict[str, Any]) -> tuple[str | None, bool]:
     return status, should_latch
 
 
-def _decision_evaluator_model() -> str | None:
+def _newest_live_neon(level: str) -> str | None:
+    """Owner 2026-11-19: the decision evaluator follows the newest live Neon at the requested level."""
+    tier = str(level or "").strip()
+    if not tier:
+        return None
+    try:
+        models = discover_antigravity_models()
+    except Exception:  # noqa: BLE001
+        return None
+    pattern = rf"gemini-([0-9]+(?:\.[0-9]+)*)-neon-{re.escape(tier)}"
+    best: tuple[tuple[int, ...], str] | None = None
+    for item in models or []:
+        if item.get("source") != "antigravity-cli":
+            continue
+        match = re.fullmatch(pattern, str(item.get("id") or ""), re.IGNORECASE)
+        if not match:
+            continue
+        version = tuple(int(part) for part in match.group(1).split("."))
+        if best is None or version > best[0]:
+            best = (version, str(item.get("id")))
+    return best[1] if best else None
+
+
+def _decision_evaluator_model(complexity: str | None = None) -> str | None:
     """The evaluator model id, or None when the evaluator is disabled
     ('' or 'off' in AGENT_BROKER_DECISION_EVALUATOR_MODEL)."""
     raw = os.environ.get("AGENT_BROKER_DECISION_EVALUATOR_MODEL")
     if raw is None:
-        return DECISION_EVALUATOR_DEFAULT_MODEL
+        level = "xhigh" if complexity in ("architecture", "critical") else "high"
+        return _newest_live_neon(level) or (
+            DECISION_EVALUATOR_HEAVY_DEFAULT_MODEL if level == "xhigh" else DECISION_EVALUATOR_DEFAULT_MODEL
+        )
     value = raw.strip()
     if not value or normalize_lookup(value) == "off":
         return None
@@ -9155,8 +10579,11 @@ def _decision_evaluator_model() -> str | None:
 
 
 def _decision_fable_mode() -> str:
-    mode = normalize_lookup(os.environ.get("AGENT_BROKER_FABLE_MODE") or "on_request").replace(" ", "_")
-    return "default" if mode == "default" else "on_request"
+    raw = os.environ.get("AGENT_BROKER_FABLE_MODE")
+    if not raw:
+        return "default"
+    mode = normalize_lookup(raw).replace(" ", "_")
+    return "on_request" if mode in {"on_request", "request", "off", "none"} else "default"
 
 
 _DECISION_EVALUATOR_PROMPT = (
@@ -9827,10 +11254,11 @@ def run_gemini_consult_worker(request_id: str) -> dict[str, Any]:
         "task_kind": GEMINI_CONSULT_TASK_KIND,
     }
     full = json.dumps(envelope, ensure_ascii=False, default=str)
+    pretty_full = json.dumps(envelope, indent=1, ensure_ascii=False, default=str)
     response_ref = None
     try:
         response_ref = store_shared_context(
-            data.get("project"), data.get("topic"), full, f"gemini_consult:{rid}",
+            data.get("project"), data.get("topic"), pretty_full, f"gemini_consult:{rid}",
             "gemini_consult_result", None, redact=False,
         ).get("ref")
     except Exception as exc:  # noqa: BLE001
@@ -10175,8 +11603,10 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
     native_value = args.get("native_consultation")
     consultations: list[dict[str, Any]] = []
     notices: list[str] = []
-    fable_enabled = args.get("include_fable") is True or _decision_fable_mode() == "default"
-    evaluator_model = _decision_evaluator_model()
+    fable_enabled = args.get("include_fable") is True or (
+        args.get("include_fable") is not False and _decision_fable_mode() == "default"
+    )
+    evaluator_model = _decision_evaluator_model(complexity)
     review_key = (session_key, package_id)
     review_text: str | None = None
     evaluator_pending: dict[str, Any] | None = None
@@ -10254,16 +11684,23 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
 
     def needs_native_result(candidate: dict[str, str], fallback_from: str | None = None) -> dict[str, Any]:
         adviser_instructions = _DECISION_ADVISER_INSTRUCTIONS
-        if review_text and candidate["family"] == "codex":
+        if review_text and candidate["family"] in {"codex", "claude"}:
             adviser_instructions += (
                 f" Evaluator review (Gemini 4): {review_text} You give the final verdict."
             )
+        if candidate["family"] == "claude":
+            adviser_instructions += FABLE_ANSWER_LIMIT
+        candidate_effort = (
+            FABLE_COMPLEXITY_EFFORT[complexity]
+            if candidate["family"] == "claude"
+            else effort
+        )
         native_request: dict[str, Any] = {
             "lane": "native_same_vendor",
             "mechanism": "host_native_subagent",
             "family": candidate["family"],
             "model": candidate["model"],
-            "effort": effort,
+            "effort": candidate_effort,
             "work_package_id": package_id,
             "max_summary_chars": DECISION_ADVICE_MAX_CHARS,
             "adviser_instructions": adviser_instructions,
@@ -10343,7 +11780,7 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
     run_native = native_capable and (host_family == "codex" or fable_enabled or native_value is not None)
     if run_native:
         if native_value is None:
-            if host_family == "codex":
+            if host_family in {"codex", "claude"}:
                 run_evaluator()
                 if evaluator_pending is not None:
                     return pending_evaluator_result()
@@ -10359,7 +11796,8 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
                     "proceeding straight to cross-vendor consultation."
                 )
         else:
-            native_entry = _normalized_native_consultation(native_value, host_family, native_chain, effort)
+            native_effort = FABLE_COMPLEXITY_EFFORT[complexity] if host_family == "claude" else effort
+            native_entry = _normalized_native_consultation(native_value, host_family, native_chain, native_effort)
             consultations.append(native_entry)
             matched_model = native_entry["resolved_model"]
             # Carry forward the fallback history: any chain candidate that
@@ -10432,6 +11870,7 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
             active, void_notice = _latch_active(key)
             if void_notice:
                 notices.append(void_notice)
+            target_effort = FABLE_COMPLEXITY_EFFORT[complexity] if family == "claude" else effort
             if active and not retry_unavailable:
                 latch = _FLAGSHIP_AVAILABILITY_LATCHES.get(key) or {}
                 status = latch.get("status") or "skipped_unavailable"
@@ -10440,7 +11879,7 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
                     "target": family,
                     "lane": "switchboard_cross_vendor",
                     "resolved_model": attempt_model,
-                    "requested_effort": effort,
+                    "requested_effort": target_effort,
                     "effective_effort": None,
                     "attestation": "not_run",
                     "status": status,
@@ -10454,7 +11893,7 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
                 continue
 
             leg_prompt = prompt
-            if family == "codex" and review_text:
+            if family in {"codex", "claude"} and review_text:
                 reviewed_prompt = (
                     prompt + f"\nEvaluator review (Gemini 4): {review_text}\nGive the final verdict."
                 )
@@ -10462,12 +11901,14 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
                     leg_prompt = reviewed_prompt
                 else:
                     notices.append("Evaluator review omitted from the final prompt: provider prompt budget exceeded.")
+            if family == "claude":
+                leg_prompt += FABLE_ANSWER_LIMIT
             call_args: dict[str, Any] = {
                 "project": args.get("project"),
                 "topic": args.get("topic"),
                 "prompt": leg_prompt,
                 "target_model": attempt_model,
-                "effort": effort,
+                "effort": target_effort,
                 "task_kind": "consult",
                 "token_budget": min(2000, max(500, DECISION_BRIEF_MAX_TOKENS)),
                 "include_context_pack": False,
@@ -10498,7 +11939,7 @@ def consult_decision(args: dict[str, Any]) -> dict[str, Any]:
                 "target": family,
                 "lane": "switchboard_cross_vendor",
                 "resolved_model": attempt_model,
-                "requested_effort": effort,
+                "requested_effort": target_effort,
                 "effective_effort": raw.get("actual_effort") or raw.get("effort"),
                 "attestation": "verified" if attested is True else ("unverified" if attested is False else "pending"),
                 "status": status,
@@ -12646,6 +14087,7 @@ def _kill_pid_tree(pid: Any) -> bool:
         try:
             subprocess.run(
                 ["taskkill", "/PID", str(pid_int), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=15,
@@ -12683,7 +14125,7 @@ def _assert_no_flash_write_overlap(paths: list[str]) -> None:
     blocks new work."""
     if not paths:
         return
-    with db_connect() as conn:
+    with contextlib.closing(db_connect()) as conn:
         conn.row_factory = sqlite3.Row
         rows = [
             dict(r)
@@ -12763,6 +14205,7 @@ def queue_flash_request(flash_args: dict[str, Any], autorun: Any = None) -> dict
             "acceptance_criteria": package["acceptance_criteria"],
             "forbidden_actions": package["forbidden_actions"],
             "research_questions": package["research_questions"],
+            "stage_repo": bool(package.get("stage_repo")),
             "timeout_seconds": timeout_seconds,
             "max_response_chars": max_response_chars,
             "caller": os.environ.get("AGENT_BROKER_CALLER") or _MCP_CLIENT_NAME or "",
@@ -12776,12 +14219,14 @@ def queue_flash_request(flash_args: dict[str, Any], autorun: Any = None) -> dict
         "files": manifest.get("files"),
         "bytes": manifest.get("bytes"),
     }
+    if manifest.get("stage_repo"):
+        manifest_summary["stage_repo"] = True
     request_id = str(uuid.uuid4())
     receipt = f"broker:{request_id}"
     now = utc_now()
     created_by = os.environ.get("AGENT_BROKER_CALLER") or "mcp-client"
     model_label = str(flash_args.get("target_model") or "") or None
-    with db_connect() as conn:
+    with contextlib.closing(db_connect()) as conn, conn:
         conn.execute(
             """
             INSERT INTO flash_requests (
@@ -12857,7 +14302,7 @@ def start_flash_request_worker(request_id: str) -> dict[str, Any]:
     rid = str(request_id or "").strip()
     if not rid:
         return {"started": False, "reason": "empty request id"}
-    with db_connect() as conn:
+    with contextlib.closing(db_connect()) as conn, conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM flash_requests WHERE id = ?", (rid,)).fetchone()
         if not row:
@@ -12926,7 +14371,7 @@ def start_flash_request_worker(request_id: str) -> dict[str, Any]:
                 env=env,
                 creationflags=creationflags,
             )
-        with db_connect() as conn:
+        with contextlib.closing(db_connect()) as conn, conn:
             conn.execute("UPDATE flash_requests SET worker_pid = ? WHERE id = ?", (proc.pid, rid))
         return {"started": True, "pid": proc.pid, "timeout_seconds": timeout, "log": str(out_path)}
     except Exception as exc:  # noqa: BLE001
@@ -12943,7 +14388,7 @@ def _flash_finalize_row(
     response_ref: str | None, responder_model: str | None,
 ) -> bool:
     now = utc_now()
-    with db_connect() as conn:
+    with contextlib.closing(db_connect()) as conn, conn:
         cur = conn.execute(
             """
             UPDATE flash_requests
@@ -13026,10 +14471,19 @@ def _flash_finalize_failure(
         envelope["worker_status"] = flash_outcome
         envelope["rollback_incomplete"] = post_commit["rollback_incomplete"]
         envelope["applied_files" if flash_outcome == "applied_then_rejected" else "candidate_files"] = post_commit["files"]
+    args_for_handoff = {
+        **args,
+        "work_package_id": package_id,
+        "task_kind": args.get("task_kind") or row.get("task_kind"),
+        "prompt": args.get("prompt") or row.get("prompt"),
+    }
     native_handoff = native_handoff_for_flash_outcome(
-        {**args, "work_package_id": package_id, "task_kind": args.get("task_kind") or row.get("task_kind")},
+        args_for_handoff,
         flash_outcome,
         receipt,
+        response_text=reason,
+        current_request_id=rid,
+        failure_kind=meta.get("failure_kind"),
     )
     if native_handoff is not None:
         envelope["native_handoff"] = native_handoff
@@ -13064,6 +14518,7 @@ def _flash_finalize_failure(
                     "attested_model": None,
                     "attestation": "none",
                     "mode": mode,
+                    "prompt_sha256": _prompt_sha256(row.get("prompt")),
                 },
             )
         except Exception as exc:  # noqa: BLE001
@@ -13112,7 +14567,7 @@ def _refresh_flash_request(row: dict[str, Any]) -> dict[str, Any]:
     if kill_first:
         _kill_pid_tree(row.get("worker_pid"))
     _flash_finalize_failure(row, reason, classify=True, failure_kind=failure_kind)
-    with db_connect() as conn:
+    with contextlib.closing(db_connect()) as conn:
         conn.row_factory = sqlite3.Row
         updated = conn.execute("SELECT * FROM flash_requests WHERE id = ?", (row.get("id"),)).fetchone()
     return dict(updated) if updated else row
@@ -13132,7 +14587,7 @@ def run_flash_request_worker(request_id: str) -> dict[str, Any]:
     rid = str(request_id or "").strip()
     if not rid:
         raise ValueError("request_id is required")
-    with db_connect() as conn:
+    with contextlib.closing(db_connect()) as conn, conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM flash_requests WHERE id = ?", (rid,)).fetchone()
         if not row:
@@ -13184,10 +14639,11 @@ def _flash_finalize_result(rid: str, data: Mapping[str, Any], result: Any) -> di
         result = {"status": "error", "response": str(result)}
     result["request_id"] = rid
     full = json.dumps(result, ensure_ascii=False, default=str)
+    pretty_full = json.dumps(result, indent=1, ensure_ascii=False, default=str)
     response_ref = None
     try:
         response_ref = store_shared_context(
-            data.get("project"), data.get("topic"), full, f"flash_async:{rid}",
+            data.get("project"), data.get("topic"), pretty_full, f"flash_async:{rid}",
             "flash_async_result", None, redact=False,
         ).get("ref")
     except Exception as exc:  # noqa: BLE001
@@ -13426,7 +14882,7 @@ _REQUEST_KIND = {
 
 
 def _find_request(rid: str) -> tuple[str, dict[str, Any]] | None:
-    with db_connect() as conn:
+    with contextlib.closing(db_connect()) as conn:
         conn.row_factory = sqlite3.Row
         for table in _REQUEST_TABLES:
             try:
@@ -13960,8 +15416,8 @@ def run_debate(
     # extra-high reasoning for debaters (Codex latest, Claude opus); user overrides win.
     eff_model_a = model_a or _debate_default_model(fam_a)
     eff_model_b = model_b or _debate_default_model(fam_b)
-    eff_effort_a = (effort_a or family_max_effort(fam_a) or "xhigh").strip().lower()
-    eff_effort_b = (effort_b or family_max_effort(fam_b) or "xhigh").strip().lower()
+    eff_effort_a = (effort_a or ("high" if fam_a == "antigravity" else family_max_effort(fam_a)) or "xhigh").strip().lower()
+    eff_effort_b = (effort_b or ("high" if fam_b == "antigravity" else family_max_effort(fam_b)) or "xhigh").strip().lower()
     debate_budget = TASK_BUDGETS.get("debate", 4500)
     # Self-contained debate instructions. Deliberately NOT task_contract_text(), whose
     # broker ground-rules ("respond via respond_to_request", "## Answer for <id>")
@@ -15142,6 +16598,7 @@ def _route_agent_task_impl(args: dict[str, Any]) -> dict[str, Any]:
                 "acceptance_criteria": args.get("acceptance_criteria"),
                 "forbidden_actions": args.get("forbidden_actions"),
                 "research_questions": args.get("research_questions"),
+                "stage_repo": truthy(args.get("stage_repo")),
             }
         flash_async, flash_async_reason = flash_async_decision(args, antigravity_mode)
         if flash_async:
@@ -15192,7 +16649,7 @@ TOOLS = [
     },
     {
         "name": "consult_decision",
-        "description": "Coordinate one bounded flagship decision brief. Pipeline: the brain drafts brief.proposed_choice, a short Gemini 4 Argon evaluator reviews it, then Astra gives the final verdict (a Codex host below Astra runs Astra as its native subagent and returns native_consultation). Fable is opt-in via include_fable. Effort scales high/xhigh/max. Flash is never used as a decision substitute.",
+        "description": "Coordinate one bounded flagship decision brief. Pipeline: the brain drafts brief.proposed_choice, the newest live Gemini Neon (High for bounded, Xhigh for architecture/critical) serves as the advisory decision evaluator (never the final verdict), then Astra and Fable give the final verdict (a Codex host below Astra runs Astra as its native subagent and returns native_consultation). Fable joins by default (high, critical xhigh, answer under 250 words, gets the evaluator review) and include_fable=false skips it for one call. Astra effort scales high/xhigh/max. Flash is never used as a decision substitute.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -15299,7 +16756,7 @@ TOOLS = [
                 },
                 "include_fable": {
                     "type": "boolean",
-                    "description": "Add Fable to this decision; only when the user asks or the plan includes it.",
+                    "description": "Fable joins by default (high, critical xhigh, answer under 250 words, gets the evaluator review); pass false to skip it for one call.",
                 },
             },
             "required": ["work_package_id", "host", "complexity", "brief"],
@@ -15366,7 +16823,7 @@ TOOLS = [
     },
     {
         "name": "consult_antigravity",
-        "description": "Use the standalone agy CLI for exactly one bounded Gemini Flash High work package. Switchboard always enforces --json-schema and returns brain_verification=pending. Research requires 1-3 explicit research_questions and rejects shallow/surface coverage. Implementation requires work_package_id, 1-5 allowed_files, and acceptance_criteria; danger-full-access and live deployment are rejected. Flash is non-authoritative: independently verify cited lines, actual diff, and checks before accepting or dispatching another package. On malformed output, ambiguity, failure, quota, timeout, or missing agy, use the host native reader/workhorse and record fallback.",
+        "description": "Use the standalone agy CLI for exactly one bounded Gemini Hydrogen High work package (effort high; xhigh for heavier packages). Switchboard always enforces --json-schema and returns brain_verification=pending. Research requires 1-3 explicit research_questions and rejects shallow/surface coverage. Implementation requires work_package_id, 1-5 allowed_files, and acceptance_criteria; danger-full-access and live deployment are rejected. Flash is non-authoritative: independently verify cited lines, actual diff, and checks before accepting or dispatching another package. On malformed output, ambiguity, failure, quota, timeout, or missing agy, use the host native reader/workhorse and record fallback.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -15390,7 +16847,7 @@ TOOLS = [
                 "token_budget": {"type": "integer", "minimum": 500, "maximum": 20000},
                 "include_task_contract": {"type": "boolean"},
                 "max_response_chars": {"type": "integer", "minimum": 800, "maximum": 200000},
-                "target_model": {"type": "string", "description": "Model name or stable agy slug. Omit it or use 'gemini flash' for the moving Flash High workhorse; use a versioned gemini-<version>-flash-high slug for an exact pin."},
+                "target_model": {"type": "string", "description": "Model name or stable agy slug. Omit it or use 'hydrogen' (or 'workhorse'; the old 'gemini flash' also works) for the moving Hydrogen High workhorse; use a versioned gemini-<version>-hydrogen-high or -flash-high slug for an exact pin."},
                 "effort": {"type": "string", "description": "Antigravity reasoning effort: low|medium|high. Explicit effort selects the matching live model variant when available."},
                 "timeout_seconds": {"type": "integer", "minimum": 15, "maximum": 240},
                 "work_package_id": {"type": "string", "description": "Required for implementation. Exactly one stable package id; Flash may not continue to another package."},
@@ -15402,6 +16859,7 @@ TOOLS = [
                 "acceptance_criteria": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "Required for implementation. Deterministic pass/fail criteria for this package only."},
                 "forbidden_actions": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "Additional package-specific prohibitions; global no-production/no-next-package rules always apply."},
                 "research_questions": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "minLength": 1, "maxLength": 500}, "description": "Required when task_kind=research. Exact bounded questions, preserved in order; vague research without them is rejected."},
+                "stage_repo": {"type": "boolean", "description": "Stage a read-only copy of the whole package root so the worker can import sibling modules and run the repo's tests; writes stay limited to allowed files."},
             },
             "required": ["prompt"],
         },
@@ -15499,14 +16957,14 @@ TOOLS = [
     },
     {
         "name": "route_agent_task",
-        "description": "DEFAULT WORKHORSE LANE for Codex/Claude brains handling one eligible bounded package, and the required MCP entry point for explicit routing to Antigravity, Codex, Claude, or Gemini. Gemini/Antigravity and unknown hosts receive no automatic downward route; their explicit routes and upward consult_decision remain available. Read-only call: {target_agent:'antigravity', surface:'cli', target_model:'gemini flash', effort:'high', mode:'plan', task_kind:'quick_check', work_package_id:'WP-...', prompt:'...'}. Implementation call: the same plus mode:'accept-edits', 1-5 allowed_writes (or allowed_creates for new files), and acceptance_criteria. SCOPE IS THE MANIFEST, NOT A DIRECTORY: only declared files are copied. Send exactly ONE package; never an entire plan, production SSH, credentials, migrations, or live deployment. Switchboard alone invokes agy, enforces --output-format json with --json-schema, and returns brain_verification=pending with a ledger receipt. Every non-creditable Flash outcome returns Codex/Claude callers a structured current-native reader/workhorse handoff with a broker-backed flash-failed or flash-unavailable reason; native work is never auto-launched. A completed dispatch is evidence, never acceptance. KEEP prompt SHORT.",
+        "description": "DEFAULT WORKHORSE LANE for Codex/Claude brains handling one eligible bounded package, and the required MCP entry point for explicit routing to Antigravity, Codex, Claude, or Gemini. Gemini/Antigravity and unknown hosts receive no automatic downward route; their explicit routes and upward consult_decision remain available. Read-only call: {target_agent:'antigravity', surface:'cli', target_model:'hydrogen', effort:'high', mode:'plan', task_kind:'quick_check', work_package_id:'WP-...', prompt:'...'}. Implementation call: the same plus mode:'accept-edits', 1-5 allowed_writes (or allowed_creates for new files), and acceptance_criteria. SCOPE IS THE MANIFEST, NOT A DIRECTORY: only declared files are copied. Send exactly ONE package; never an entire plan, production SSH, credentials, migrations, or live deployment. Switchboard alone invokes agy, enforces --output-format json with --json-schema, and returns brain_verification=pending with a ledger receipt. Every non-creditable Flash outcome returns Codex/Claude callers a structured current-native reader/workhorse handoff with a broker-backed flash-failed or flash-unavailable reason; native work is never auto-launched. A completed dispatch is evidence, never acceptance. KEEP prompt SHORT.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": {"type": "string"},
                 "topic": {"type": "string"},
                 "target_agent": {"type": "string"},
-                "target_model": {"type": "string", "description": "Model only (e.g. 'fable', 'gpt-6-astra', or 'gemini flash'). Bare Antigravity/'gemini flash' moves to the latest stable Flash High; a versioned agy slug pins exactly. Keep reasoning effort in the effort field."},
+                "target_model": {"type": "string", "description": "Model only (e.g. 'fable', 'gpt-6-astra', or 'hydrogen'). Bare Antigravity/'hydrogen'/'gemini flash' moves to the latest stable Hydrogen High (Flash High only as fallback); a versioned agy slug pins exactly. Keep reasoning effort in the effort field."},
                 "effort": {"type": "string", "description": "Reasoning effort for CLI surfaces. Codex: minimal|low|medium|high|xhigh|max; Claude: low|medium|high|xhigh|max; Antigravity: low|medium|high."},
                 "target_host": {
                     "type": "string",
@@ -15566,6 +17024,7 @@ TOOLS = [
                 "acceptance_criteria": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "For Flash implementation, required deterministic criteria for this package."},
                 "forbidden_actions": {"type": "array", "maxItems": 12, "items": {"type": "string"}, "description": "Additional prohibitions; global Flash safety rules cannot be removed."},
                 "research_questions": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "minLength": 1, "maxLength": 500}, "description": "Required when task_kind=research. Exact bounded questions, preserved in order; vague research without them is rejected."},
+                "stage_repo": {"type": "boolean", "description": "Stage a read-only copy of the whole package root so the worker can import sibling modules and run the repo's tests; writes stay limited to allowed files."},
                 "model_policy": {"type": "string", "description": "Explicit cost policy for Codex or Claude. 'cheap_read' selects the live Codex reader (Luna)/low or Haiku (no effort); 'balanced'/'efficient'/'lower_effort' selects the live Codex workhorse (Sol)/medium or Sonnet/medium. Omit for a frontier target: it follows the complexity ladder (bounded/architecture/critical -> high/xhigh/max, default xhigh; a risk flag raises it to max)."},
                 "complexity": {"type": "string", "enum": ["bounded", "architecture", "critical"], "description": "For a direct codex/claude frontier target with no explicit effort/model_policy: sets the progressive effort ladder (high/xhigh/max). Omit for the xhigh default."},
                 "risk_flags": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 80}, "description": "For a direct frontier target: any flag matching a critical-risk keyword (e.g. security, payment, migration, irreversible) raises the effort ladder to max."},
@@ -15584,7 +17043,7 @@ TOOLS = [
     },
     {
         "name": "list_agent_models",
-        "description": "List detected models, defaults, and roles. Antigravity Gemini Flash is a non-authoritative external workhorse for proactive bounded labour, not a native child agent or frontier role.",
+        "description": "List detected models, defaults, and roles. Antigravity Gemini Hydrogen (Flash as fallback) is a non-authoritative external workhorse for proactive bounded labour, not a native child agent or frontier role.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -16283,10 +17742,11 @@ TOOL_DESCRIPTION_OVERRIDES = {
     "route_agent_task": (
         "Required MCP entry for cross-vendor labour; never shell out to agy directly. Codex/Claude "
         "brains should proactively consider external Antigravity "
-        "Flash High for bounded cheap labour via target_agent='antigravity', surface='cli', "
-        "target_model='gemini flash', effort='high'; plan is read-only and accept-edits requires an "
-        "approved isolated package. Research uses task_kind='research' plus 1-3 exact "
-        "research_questions; vague research and shallow/surface coverage are rejected. Flash is "
+        "Gemini Hydrogen (effort high; xhigh for heavier packages) for bounded cheap labour via "
+        "target_agent='antigravity', surface='cli', target_model='hydrogen' (target_model 'hydrogen' "
+        "or 'gemini flash' both resolve to it), effort='high'; plan is read-only and accept-edits "
+        "requires an approved isolated package. Research uses task_kind='research' plus 1-3 exact "
+        "research_questions; vague research and shallow/surface coverage are rejected. The workhorse is "
         "non-authoritative and not a native child. On failure, "
         "use the host native reader/workhorse and record fallback. Parallelize only independent work. "
         "Call get_model_routing_guide/list_agent_models if unsure."

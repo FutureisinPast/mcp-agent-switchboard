@@ -1295,6 +1295,7 @@ def _discover_hierarchy_roles() -> tuple[dict, dict]:
         try:
             proc = subprocess.run(
                 [codex, "debug", "models"],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

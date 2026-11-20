@@ -85,6 +85,16 @@ def gate_mode() -> str:
     return "warn" if mode in {"warn", "warning", "shadow", "observe"} else "enforce"
 
 
+def native_flash_skip_mode() -> str:
+    """`enforce` (default), `warn`, or `off`."""
+    mode = str(os.environ.get(NATIVE_FLASH_SKIP_ENV, "enforce")).strip().lower()
+    if mode in {"off", "disable", "disabled", "false", "0"}:
+        return "off"
+    if mode in {"warn", "warning", "shadow", "observe"}:
+        return "warn"
+    return "enforce"
+
+
 def effective_direct_labour_limit() -> int:
     """The allowance actually applied.
 
@@ -102,12 +112,31 @@ def policy_is_relaxed() -> bool:
     return gate_mode() == "warn" or DIRECT_LABOUR_LIMIT > DIRECT_LABOUR_LIMIT_DEFAULT
 
 
-OVERRIDE_MAX_BUDGET_DEFAULT = 12
+OVERRIDE_MAX_BUDGET_DEFAULT = 6
+OVERRIDE_HOURLY_BUDGET_DEFAULT = 12
+OVERRIDE_CAP_ENV = "AGENT_BROKER_OVERRIDE_CAP"
+
+
+def override_cap_mode() -> str:
+    """`enforce` (default), `warn`, or `off`."""
+    mode = str(os.environ.get(OVERRIDE_CAP_ENV, "enforce")).strip().lower()
+    if mode in {"off", "disable", "disabled", "false", "0"}:
+        return "off"
+    if mode in {"warn", "warning", "shadow", "observe"}:
+        return "warn"
+    return "enforce"
 
 
 def override_max_budget() -> int:
     configured = _env_int("AGENT_BROKER_OVERRIDE_MAX_BUDGET", OVERRIDE_MAX_BUDGET_DEFAULT)
+    if override_cap_mode() != "off":
+        configured = max(1, min(12, configured))
     return max(effective_direct_labour_limit(), configured)
+
+
+def override_hourly_budget() -> int:
+    configured = _env_int("AGENT_BROKER_OVERRIDE_HOURLY_BUDGET", OVERRIDE_HOURLY_BUDGET_DEFAULT)
+    return max(1, min(48, configured))
 
 
 def _clamp_override_budget(budget: int | None) -> int | None:
@@ -135,7 +164,51 @@ SHELL_TOOL_NAMES = {"bash", "shell", "exec", "run_command", "localshell", "termi
 READ_TOOL_NAMES = {"read", "readfile", "read_file"}
 SEARCH_TOOL_NAMES = {"grep", "glob", "find", "search", "search_files"}
 WEB_RESEARCH_TOOL_NAMES = {"webfetch", "websearch"}
-DELEGATION_TOOL_NAMES = {"agent", "task", "spawn_agent"}
+DELEGATION_TOOL_NAMES = {"agent", "task", "spawn_agent", "followup_task"}
+COORDINATION_TOOL_NAMES = {
+    "send_message", "sendmessage", "send-message",
+    "wait_agent", "list_agents", "interrupt_agent",
+}
+NATIVE_FLASH_SKIP_ENV = "AGENT_BROKER_NATIVE_FLASH_SKIP"
+FLASH_SKIP_RE = re.compile(
+    r"flash_skip:\s*(host-tools|unshared-state|flash-failed|flash-unavailable|atomic-oversize):\s*(\S[^\n]{7,})",
+    re.IGNORECASE,
+)
+FLASH_UNAVAILABLE_TTL_SECONDS = 30 * 60
+FLASH_AVAILABILITY_OUTCOMES = {
+    "unavailable_pre_mutation",
+    "unavailable",
+    "flash_unavailable",
+    "flash-unavailable",
+    "provider_unavailable",
+    "model_unavailable",
+    "service_unavailable",
+    "cli_missing",
+    "quota",
+    "quota_exceeded",
+    "rate_limit",
+    "rate_limited",
+    "timeout",
+    "timed_out",
+    "deadline_exceeded",
+    "subscription_disabled",
+    "organization_disabled",
+    "family_access_unavailable",
+}
+FLASH_IN_PROGRESS_OUTCOMES = {"queued", "running", "pending", "async_started"}
+WORK_PACKAGE_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_-])(WP-[A-Za-z0-9._-]+)", re.IGNORECASE)
+FLASH_SKIP_HINT = (
+    "Route this bounded package to Flash with route_agent_task "
+    "(target_agent='antigravity', surface='cli', target_model='hydrogen', "
+    "effort='high'; 'xhigh' for heavier packages). "
+    "If the package needs the repo's tests, resend it with stage_repo=true. "
+    "Or add one line `flash_skip: <host-tools|unshared-state|flash-failed|flash-unavailable|atomic-oversize>:<evidence>`; "
+    "flash-failed/unavailable must cite the broker receipt."
+)
+STANDARD_HOST_TOOLS = {
+    "bash", "shell", "powershell", "read", "grep", "glob",
+    "edit", "write", "apply_patch", "exec", "execute", "view_image", "search",
+}
 # Bounded-request cap for a delegation call that explicitly names a flagship
 # model (fable/opus). Single source of truth: agent_broker_mcp.py's
 # DECISION_PROVIDER_PROMPT_MAX_BYTES is set equal to this constant where
@@ -216,7 +289,7 @@ CLAUDE_AGENT_NAMES = {
 CLAUDE_MODEL_ALIASES = {"fable", "opus", "sonnet", "haiku"}
 CLAUDE_CIRCUIT_CONTEXT = (
     "Claude consultation is temporarily unavailable until the reset window passes. "
-    "Before then, a needed second opinion may go to one bounded Gemini Flash High package as a "
+    "Before then, a needed second opinion may go to one bounded Gemini Hydrogen High package as a "
     "degraded, non-authoritative fallback (the brain keeps judgment). If the user explicitly asks "
     "for a Claude model, attempt it (retry_unavailable=true where supported) and report the real "
     "result - never call a model unavailable without a fresh attempt."
@@ -242,7 +315,7 @@ def format_claude_circuit_context(marker: dict | None) -> str:
     return (
         f"Claude {model_str} failed at {since_str} ({kind_str}); automatic routing skips it until "
         f"{until_str}, then the normal hierarchy applies again. Before then, a needed second "
-        "opinion may go to one bounded Gemini Flash High package as a degraded, non-authoritative "
+        "opinion may go to one bounded Gemini Hydrogen High package as a degraded, non-authoritative "
         "fallback (the brain keeps judgment). If the user explicitly asks for a Claude model, "
         "attempt it (retry_unavailable=true where supported) and report the real result - "
         "never call a model unavailable without a fresh attempt."
@@ -391,6 +464,22 @@ def normalize_tool_name(name: str) -> str:
         return text
     prefix, server, tool = parts
     return f"{prefix}__{server.replace('-', '_')}__{tool}"
+
+
+def _bare_collaboration_tool_name(normalized_name: str) -> str:
+    """Map a normalized Codex collaboration tool name to its bare name.
+
+    e.g. 'collaborationspawn_agent' -> 'spawn_agent',
+         'collaborationfollowup_task' -> 'followup_task',
+         'collaboration_spawn_agent' -> 'spawn_agent'.
+    """
+    text = str(normalized_name or "").strip().lower()
+    if text.startswith("collaboration"):
+        bare = text[len("collaboration"):]
+        if bare.startswith(("_", ":", ".")):
+            bare = bare[1:]
+        return bare
+    return text
 
 
 def _hook_host(payload: dict) -> str:
@@ -660,6 +749,69 @@ def _validate_project_reminded_dict(d: Any) -> dict[str, bool] | None:
     return res
 
 
+def _validate_flash_receipt_records_dict(d: Any) -> dict[str, dict] | None:
+    if not isinstance(d, dict) or len(d) > 100:
+        return None
+    res: dict[str, dict] = {}
+    for k, v in d.items():
+        if not isinstance(k, str) or not k or len(k) > 200 or not isinstance(v, dict):
+            return None
+        aliases = v.get("aliases")
+        if not isinstance(aliases, list):
+            aliases = []
+        clean_aliases = [str(a)[:200] for a in aliases if isinstance(a, str) and a.strip()][:10]
+        ts_val = v.get("ts")
+        ts_num = (
+            float(ts_val)
+            if isinstance(ts_val, (int, float)) and not isinstance(ts_val, bool)
+            else 0.0
+        )
+        cts_val = v.get("consumed_ts")
+        cts_num = (
+            float(cts_val)
+            if isinstance(cts_val, (int, float)) and not isinstance(cts_val, bool)
+            else None
+        )
+        res[k] = {
+            "receipt": str(v.get("receipt") or "")[:200],
+            "request_id": str(v.get("request_id") or "")[:200],
+            "aliases": clean_aliases,
+            "work_package_id": str(v.get("work_package_id") or "")[:200],
+            "outcome": str(v.get("outcome") or "")[:100],
+            "attempt_digest": str(v.get("attempt_digest") or "")[:64],
+            "ts": ts_num,
+            "consumed": bool(v.get("consumed")),
+            "consumed_ts": cts_num,
+            "consumed_agent_id": str(v.get("consumed_agent_id") or "")[:200],
+        }
+    return res
+
+
+def _validate_authorized_native_agents_dict(d: Any) -> dict[str, dict] | None:
+    if not isinstance(d, dict) or len(d) > 100:
+        return None
+    res: dict[str, dict] = {}
+    for k, v in d.items():
+        if not isinstance(k, str) or not k or len(k) > 200 or not isinstance(v, dict):
+            return None
+        wp_id = str(v.get("work_package_id") or "").strip()[:200]
+        if not wp_id:
+            return None
+        ts_val = v.get("ts")
+        ts_num = (
+            float(ts_val)
+            if isinstance(ts_val, (int, float)) and not isinstance(ts_val, bool)
+            else 0.0
+        )
+        res[k] = {
+            "agent_id": str(v.get("agent_id") or k)[:200],
+            "work_package_id": wp_id,
+            "receipt": str(v.get("receipt") or "")[:200],
+            "ts": ts_num,
+        }
+    return res
+
+
 def reset_turn_state(session_id: str) -> None:
     """Called on UserPromptSubmit: clear any mutation/blocked flags left over
     from a prior turn so they never leak into the new turn's Stop decision."""
@@ -701,6 +853,51 @@ def reset_turn_state(session_id: str) -> None:
         ):
             cited_paths = list(raw_cp)
 
+        raw_fr = state.get("flash_receipts")
+        flash_receipts = None
+        if (
+            isinstance(raw_fr, list)
+            and len(raw_fr) <= 50
+            and all(isinstance(x, str) and len(x) <= 200 for x in raw_fr)
+        ):
+            flash_receipts = list(raw_fr)
+
+        flash_receipt_records = _validate_flash_receipt_records_dict(
+            state.get("flash_receipt_records")
+        )
+        authorized_native_agents = _validate_authorized_native_agents_dict(
+            state.get("authorized_native_agents")
+        )
+
+        raw_fsc = state.get("flash_skip_counts")
+        flash_skip_counts = None
+        if (
+            isinstance(raw_fsc, dict)
+            and len(raw_fsc) <= 20
+            and all(isinstance(k, str) and isinstance(v, int) for k, v in raw_fsc.items())
+        ):
+            flash_skip_counts = dict(raw_fsc)
+
+        last_consult = state.get("last_consult_decision_ts")
+        last_consult_ts = None
+        if isinstance(last_consult, (int, float)) and not isinstance(last_consult, bool):
+            last_consult_ts = float(last_consult)
+
+        raw_og = state.get("override_grants")
+        override_grants = None
+        if isinstance(raw_og, list):
+            now = time.time()
+            override_grants = [
+                g
+                for g in raw_og
+                if isinstance(g, dict)
+                and isinstance(g.get("ts"), (int, float))
+                and not isinstance(g.get("ts"), bool)
+                and isinstance(g.get("budget"), int)
+                and not isinstance(g.get("budget"), bool)
+                and (now - float(g["ts"])) < 3600.0
+            ]
+
         state.clear()
         if isinstance(claude_unavailable, dict) and claude_unavailable.get("kind") in CLAUDE_UNAVAILABLE_REASONS:
             state["claude_unavailable"] = dict(claude_unavailable)
@@ -718,6 +915,18 @@ def reset_turn_state(session_id: str) -> None:
             state["relief_budget"] = relief_budget
         if cited_paths is not None:
             state["cited_paths"] = cited_paths
+        if flash_receipts is not None:
+            state["flash_receipts"] = flash_receipts
+        if flash_receipt_records is not None:
+            state["flash_receipt_records"] = flash_receipt_records
+        if authorized_native_agents is not None:
+            state["authorized_native_agents"] = authorized_native_agents
+        if flash_skip_counts is not None:
+            state["flash_skip_counts"] = flash_skip_counts
+        if last_consult_ts is not None:
+            state["last_consult_decision_ts"] = last_consult_ts
+        if override_grants is not None:
+            state["override_grants"] = override_grants
 
     _update_state(session_id, update)
 
@@ -829,14 +1038,650 @@ def _payload_is_cheap_native_call(payload: dict) -> bool:
 def _delegation_prompt_text(tool_input: dict) -> str:
     """The caller-supplied task text for a delegation call. Claude's Agent/Task
     tools use 'prompt'; Codex's spawn_agent does not -- it uses one of
-    message/input/task/instructions instead. First non-empty field wins."""
-    for field in ("prompt", "message", "input", "task", "instructions"):
+    message/input/task/instructions/items instead. First non-empty field wins."""
+    if not isinstance(tool_input, dict):
+        return ""
+    for field in ("prompt", "message", "input", "task", "instructions", "items"):
         value = tool_input.get(field)
-        if value:
-            text = str(value)
-            if text.strip():
+        if isinstance(value, str) and value.strip():
+            return value
+        elif value is not None and not isinstance(value, (dict, list)):
+            text = str(value).strip()
+            if text:
                 return text
     return ""
+
+
+def _extract_delegation_texts(tool_input: dict) -> tuple[bool, str]:
+    """Check if any delegation text field exists and return (has_text_field, combined_text).
+    Checks string fields: prompt, message, task, instructions, input, items.
+    """
+    if not isinstance(tool_input, dict):
+        return False, ""
+    has_field = False
+    chunks = []
+    for field in ("prompt", "message", "task", "instructions", "input", "items"):
+        if field in tool_input:
+            val = tool_input[field]
+            if isinstance(val, str):
+                has_field = True
+                if val:
+                    chunks.append(val)
+            elif isinstance(val, (int, float)):
+                has_field = True
+                chunks.append(str(val))
+    return has_field, "\n".join(chunks)
+
+
+def _canonical_receipt_id(token: object) -> str:
+    text = str(token or "").strip()
+    if text.lower().startswith("broker:"):
+        text = text.split(":", 1)[1].strip()
+    return text
+
+
+def _is_flash_availability_outcome(outcome: object) -> bool:
+    norm = str(outcome or "").strip().lower()
+    if not norm:
+        return False
+    return (
+        norm in FLASH_AVAILABILITY_OUTCOMES
+        or norm.startswith("unavailable_")
+        or norm.endswith("_unavailable")
+    )
+
+
+def _is_flash_non_creditable_outcome(outcome: object) -> bool:
+    norm = str(outcome or "").strip().lower()
+    if not norm:
+        return False
+    if norm in CREDITABLE_OUTCOMES or norm in FLASH_IN_PROGRESS_OUTCOMES:
+        return False
+    return norm not in {"ok", "success", "succeeded", "completed"}
+
+
+def _is_flash_rejected_or_failed_outcome(outcome: object) -> bool:
+    return _is_flash_non_creditable_outcome(outcome) and not _is_flash_availability_outcome(outcome)
+
+
+def _normalize_digest_items(value: object) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        items: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                cleaned = item.strip()
+            elif item is not None:
+                cleaned = json.dumps(item, sort_keys=True, ensure_ascii=False)
+            else:
+                cleaned = ""
+            if cleaned:
+                items.append(cleaned)
+        return sorted(items)
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _compute_attempt_digest(tool_input: object) -> str:
+    """Compute a short sha256 digest of prompt + sorted read_context + sorted allowed_files."""
+    if not isinstance(tool_input, dict):
+        return hashlib.sha256(b"").hexdigest()[:16]
+    prompt = str(tool_input.get("prompt") or tool_input.get("task") or "")
+    read_ctx = _normalize_digest_items(tool_input.get("read_context"))
+    allowed_files = _normalize_digest_items(tool_input.get("allowed_files"))
+    if read_ctx or allowed_files:
+        canonical = json.dumps(
+            {
+                "prompt": prompt,
+                "read_context": read_ctx,
+                "allowed_files": allowed_files,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    else:
+        canonical = prompt
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _extract_workhorse_metadata(payload: dict, result: dict | None) -> tuple[str, str]:
+    """Extract (work_package_id, outcome) from a workhorse PostToolUse payload."""
+    tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    res = result if isinstance(result, dict) else {}
+    structured = _coerce_json_dict(res.get("structured_output"))
+
+    wp_candidates = [
+        res.get("work_package_id"),
+        structured.get("package_id") if isinstance(structured, dict) else None,
+        tool_input.get("work_package_id"),
+    ]
+    work_package_id = ""
+    for cand in wp_candidates:
+        text = str(cand or "").strip()
+        if text and text != "unnamed-package":
+            work_package_id = text[:200]
+            break
+
+    outcome = str(res.get("outcome") or "").strip().lower()
+    if not outcome:
+        status = str(res.get("status") or "").strip().lower()
+        if status in {"queued", "running", "pending"} or _async_flash_started(res):
+            outcome = "async_started"
+        elif status in {"unavailable", "timeout", "quota", "rejected", "blocked", "failed", "error"}:
+            if status in {"failed", "error"}:
+                reason = str(res.get("reason") or res.get("error_kind") or "").strip().lower()
+                outcome = reason if _is_flash_availability_outcome(reason) else status
+            else:
+                outcome = status
+        elif isinstance(structured, dict):
+            st = str(structured.get("status") or "").strip().lower()
+            if st in {"blocked", "failed"}:
+                outcome = st
+        elif res.get("isError") is True:
+            outcome = "failed"
+    return work_package_id, outcome[:100]
+
+
+def _evidence_matches_alias(evidence: str, alias: str) -> bool:
+    if not evidence or not alias:
+        return False
+    return bool(
+        re.search(
+            rf"(?<![A-Za-z0-9_-]){re.escape(alias)}(?![A-Za-z0-9_-])",
+            evidence,
+        )
+    )
+
+
+def _find_flash_receipt_record(state: dict, evidence: str) -> tuple[str | None, dict | None]:
+    records = state.get("flash_receipt_records")
+    if not isinstance(records, dict):
+        return None, None
+    best_match: tuple[int, str, dict] | None = None
+    for key, rec in records.items():
+        if not isinstance(rec, dict):
+            continue
+        candidates: list[str] = []
+        for val in (key, rec.get("receipt"), rec.get("request_id"), *(rec.get("aliases") or [])):
+            s = str(val or "").strip()
+            if s and s not in candidates:
+                candidates.append(s)
+            bare = _canonical_receipt_id(s)
+            if bare and bare not in candidates:
+                candidates.append(bare)
+        for cand in candidates:
+            if _evidence_matches_alias(evidence, cand):
+                score = len(cand)
+                if best_match is None or score > best_match[0]:
+                    best_match = (score, key, rec)
+    if best_match is None:
+        return None, None
+    return best_match[1], best_match[2]
+
+
+def _validate_flash_skip_detailed(
+    state: dict, text: str, now: float | None = None
+) -> tuple[bool, str | None, str | None, dict]:
+    """Parse and validate flash_skip in delegation text with structured failure details."""
+    match = FLASH_SKIP_RE.search(text)
+    if not match:
+        return False, None, None, {
+            "reason_code": "flash_skip_missing",
+            "message": "Routing gate: native cheap-role delegation requires a valid flash_skip reason.",
+        }
+    kind = match.group(1).lower()
+    evidence = match.group(2).strip()
+    if len(evidence) < 8:
+        return False, kind, evidence, {
+            "reason_code": "flash_skip_short_evidence",
+            "message": "Routing gate: native cheap-role delegation requires a valid flash_skip reason.",
+        }
+
+    if kind in {"unshared-state", "atomic-oversize"}:
+        return True, kind, evidence, {}
+
+    if kind == "host-tools":
+        tokens = re.findall(r"[A-Za-z0-9_-]+", evidence)
+        first_word = tokens[0].lower() if tokens else ""
+        if first_word in STANDARD_HOST_TOOLS:
+            return False, kind, evidence, {
+                "reason_code": "flash_skip_standard_host_tool",
+                "message": "Routing gate: flash_skip host-tools may not name a standard host tool.",
+            }
+        return True, kind, evidence, {}
+
+    if kind == "flash-unavailable":
+        rec_key, rec = _find_flash_receipt_record(state, evidence)
+        if rec is None:
+            return False, kind, evidence, {
+                "reason_code": "flash_skip_unknown_receipt",
+                "message": "Routing gate: flash_skip flash-unavailable cites an unknown receipt not recorded in this session.",
+            }
+        outcome = str(rec.get("outcome") or "").strip().lower()
+        if not _is_flash_availability_outcome(outcome):
+            return False, kind, evidence, {
+                "reason_code": "flash_skip_not_availability_failure",
+                "message": (
+                    f"Routing gate: flash_skip flash-unavailable cites receipt with "
+                    f"non-availability outcome '{outcome or 'unknown'}'."
+                ),
+            }
+        check_now = time.time() if now is None else float(now)
+        rec_ts = rec.get("ts")
+        if (
+            not isinstance(rec_ts, (int, float))
+            or isinstance(rec_ts, bool)
+            or float(rec_ts) <= 0
+            or (check_now - float(rec_ts)) >= FLASH_UNAVAILABLE_TTL_SECONDS
+        ):
+            return False, kind, evidence, {
+                "reason_code": "flash_skip_unavailable_expired",
+                "message": (
+                    "Routing gate: flash_skip flash-unavailable receipt has expired "
+                    "(older than 30 minutes)."
+                ),
+            }
+        return True, kind, evidence, {
+            "record_key": rec_key,
+            "work_package_id": str(rec.get("work_package_id") or ""),
+        }
+
+    if kind == "flash-failed":
+        rec_key, rec = _find_flash_receipt_record(state, evidence)
+        if rec is None:
+            return False, kind, evidence, {
+                "reason_code": "flash_skip_unknown_receipt",
+                "message": "Routing gate: flash_skip flash-failed cites an unknown receipt not recorded in this session.",
+            }
+        outcome = str(rec.get("outcome") or "").strip().lower()
+        if not _is_flash_non_creditable_outcome(outcome):
+            return False, kind, evidence, {
+                "reason_code": "flash_skip_not_non_creditable",
+                "message": (
+                    f"Routing gate: flash_skip flash-failed cites receipt with outcome "
+                    f"'{outcome or 'pending'}', which is not a workhorse failure."
+                ),
+            }
+        rec_wp = str(rec.get("work_package_id") or "").strip()
+        if not rec_wp:
+            return False, kind, evidence, {
+                "reason_code": "flash_skip_missing_work_package",
+                "message": "Routing gate: flash_skip flash-failed receipt has no recorded work_package_id.",
+            }
+        prompt_wps = [tok.rstrip(".") for tok in WORK_PACKAGE_TOKEN_RE.findall(text)]
+        if not any(tok.lower() == rec_wp.lower() for tok in prompt_wps):
+            found_str = ", ".join(dict.fromkeys(prompt_wps)) if prompt_wps else "none"
+            return False, kind, evidence, {
+                "reason_code": "flash_skip_wrong_package",
+                "message": (
+                    f"Routing gate: flash_skip flash-failed cites receipt for wrong package "
+                    f"({rec_wp}); spawn prompt names {found_str}."
+                ),
+            }
+        if rec.get("consumed") is True:
+            return False, kind, evidence, {
+                "reason_code": "flash_skip_receipt_already_used",
+                "message": f"Routing gate: flash_skip flash-failed receipt already used for {rec_wp}.",
+            }
+        if _is_flash_availability_outcome(outcome):
+            return True, kind, evidence, {"record_key": rec_key, "work_package_id": rec_wp}
+
+        records = state.get("flash_receipt_records") or {}
+        failed_attempts = [
+            r
+            for r in records.values()
+            if isinstance(r, dict)
+            and str(r.get("work_package_id") or "").strip().lower() == rec_wp.lower()
+            and _is_flash_rejected_or_failed_outcome(r.get("outcome"))
+        ]
+        distinct_digests = {
+            str(r.get("attempt_digest") or "").strip()
+            for r in failed_attempts
+            if str(r.get("attempt_digest") or "").strip()
+        }
+        if len(distinct_digests) < 2:
+            if len(failed_attempts) <= 1:
+                msg = (
+                    f"Routing gate: flash_skip flash-failed for {rec_wp} has only one "
+                    "rejection so far; fix and resend the package to the workhorse first."
+                )
+            else:
+                msg = (
+                    f"Routing gate: flash_skip flash-failed for {rec_wp} has only one "
+                    f"distinct attempt so far (same attempt_digest across {len(failed_attempts)} "
+                    "rejections); fix and resend the package to the workhorse first."
+                )
+            return False, kind, evidence, {
+                "reason_code": "flash_skip_insufficient_rejections",
+                "message": msg,
+            }
+        return True, kind, evidence, {"record_key": rec_key, "work_package_id": rec_wp}
+
+    return False, None, None, {}
+
+
+def _validate_flash_skip(state: dict, text: str) -> tuple[bool, str | None, str | None]:
+    """Parse and validate flash_skip in delegation text.
+    Returns (is_valid, skip_kind, skip_evidence).
+    """
+    is_valid, kind, evidence, _ = _validate_flash_skip_detailed(state, text)
+    return is_valid, kind, evidence
+
+
+def _attest_model_from_transcript(transcript_path: object) -> str:
+    """Read at most the last 256 KB of transcript and extract the last "model":"<id>" value."""
+    try:
+        if not transcript_path:
+            return ""
+        p = Path(str(transcript_path))
+        if not p.is_file():
+            return ""
+        size = p.stat().st_size
+        read_size = min(size, 256 * 1024)
+        with open(p, "rb") as f:
+            if size > read_size:
+                f.seek(size - read_size)
+            chunk = f.read(read_size)
+        text = chunk.decode("utf-8", errors="replace")
+        matches = re.findall(r'"model"\s*:\s*"([^"\r\n]+)"', text)
+        if matches:
+            return matches[-1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _is_route_agent_task_tool(normalized_tool: str) -> bool:
+    return (
+        normalized_tool == CREDITABLE_DISPATCH_TOOL
+        or normalized_tool.endswith("__route_agent_task")
+        or normalized_tool.endswith("__route-agent-task")
+        or normalized_tool in {"route_agent_task", "route-agent-task"}
+    )
+
+
+def _is_request_result_tool(normalized_tool: str) -> bool:
+    return (
+        normalized_tool == _TELEMETRY_REQUEST_RESULT_TOOL
+        or normalized_tool.endswith("__request_result")
+        or normalized_tool.endswith("__request-result")
+        or normalized_tool in {"request_result", "request-result"}
+    )
+
+
+def _record_flash_receipts(session_id: str, payload: dict) -> None:
+    if not session_id:
+        return
+    raw_tool = payload.get("tool_name")
+    normalized_tool = normalize_tool_name(raw_tool)
+    is_route = (not str(raw_tool or "").strip()) or _is_route_agent_task_tool(normalized_tool)
+    is_result = _is_request_result_tool(normalized_tool)
+    if not is_route and not is_result:
+        return
+
+    tool_input = payload.get("tool_input")
+    result = _extract_dispatch_result(payload)
+    if is_route and _is_claude_consult_route(raw_tool, tool_input or {}):
+        return
+    res_dict = result if isinstance(result, dict) else {}
+    in_dict = tool_input if isinstance(tool_input, dict) else {}
+    explicit_target = str(
+        res_dict.get("target_agent") or in_dict.get("target_agent") or ""
+    ).strip().lower()
+    if explicit_target and explicit_target != "antigravity":
+        return
+    if isinstance(res_dict.get("decision_update"), dict):
+        return
+    kind_hint = str(
+        res_dict.get("kind") or res_dict.get("request_kind") or res_dict.get("lane") or ""
+    ).strip().lower()
+    if kind_hint in {"decision", "consult", "codex", "claude", "flagship"}:
+        return
+
+    items: list[str] = []
+    req_id_res = str(res_dict.get("request_id") or "").strip()
+    receipt_res = str(res_dict.get("receipt") or "").strip()
+    for candidate in (req_id_res, receipt_res):
+        if candidate and candidate not in items:
+            items.append(candidate)
+        if candidate.startswith("broker:"):
+            bare_id = candidate.split(":", 1)[1].strip()
+            if bare_id and bare_id not in items:
+                items.append(bare_id)
+
+    req_id_in = str(in_dict.get("request_id") or "").strip()
+    receipt_in = str(in_dict.get("receipt") or "").strip()
+    for candidate in (req_id_in, receipt_in):
+        if candidate and candidate not in items:
+            items.append(candidate)
+        if candidate.startswith("broker:"):
+            bare_id = candidate.split(":", 1)[1].strip()
+            if bare_id and bare_id not in items:
+                items.append(bare_id)
+    if not items:
+        return
+
+    primary_raw = receipt_res or req_id_res or receipt_in or req_id_in
+    canon_id = _canonical_receipt_id(primary_raw)
+    if not canon_id:
+        return
+
+    aliases: list[str] = []
+    for item in items:
+        if item and item not in aliases:
+            aliases.append(item[:200])
+    broker_alias = f"broker:{canon_id}"
+    if broker_alias not in aliases:
+        aliases.append(broker_alias[:200])
+
+    work_package_id, outcome = _extract_workhorse_metadata(payload, result)
+    has_prompt_inputs = any(k in in_dict for k in ("prompt", "task", "read_context", "allowed_files"))
+    computed_digest = _compute_attempt_digest(in_dict) if has_prompt_inputs else None
+    looks_like_flash = (
+        explicit_target == "antigravity"
+        or kind_hint in {"flash", "workhorse", "antigravity"}
+        or bool(outcome)
+    )
+    now_ts = time.time()
+
+    def update(state: dict) -> None:
+        records = state.setdefault("flash_receipt_records", {})
+        existing_key = None
+        if canon_id in records:
+            existing_key = canon_id
+        else:
+            alias_canon_set = {_canonical_receipt_id(a) for a in aliases if _canonical_receipt_id(a)}
+            for k, rec in records.items():
+                if not isinstance(rec, dict):
+                    continue
+                rec_ids = {_canonical_receipt_id(k)} | {
+                    _canonical_receipt_id(a) for a in (rec.get("aliases") or []) if _canonical_receipt_id(a)
+                }
+                if alias_canon_set & rec_ids:
+                    existing_key = k
+                    break
+
+        if is_result and existing_key is None and not looks_like_flash:
+            return
+
+        receipts = state.setdefault("flash_receipts", [])
+        for item in items:
+            if item not in receipts:
+                receipts.append(item)
+        if len(receipts) > 50:
+            state["flash_receipts"] = receipts[-50:]
+
+        if existing_key is not None:
+            rec = records[existing_key]
+            merged_aliases = list(rec.get("aliases") or [])
+            for a in aliases:
+                if a not in merged_aliases:
+                    merged_aliases.append(a)
+            rec["aliases"] = merged_aliases[:10]
+            if (receipt_res or receipt_in) and not rec.get("receipt"):
+                rec["receipt"] = (receipt_res or receipt_in)[:200]
+            if (req_id_res or req_id_in) and not rec.get("request_id"):
+                rec["request_id"] = (req_id_res or req_id_in)[:200]
+            if work_package_id and not rec.get("work_package_id"):
+                rec["work_package_id"] = work_package_id
+            if computed_digest is not None and (is_route or not rec.get("attempt_digest")):
+                rec["attempt_digest"] = computed_digest
+            if outcome:
+                prev_outcome = str(rec.get("outcome") or "").strip().lower()
+                if (
+                    not prev_outcome
+                    or prev_outcome in FLASH_IN_PROGRESS_OUTCOMES
+                    or (outcome not in FLASH_IN_PROGRESS_OUTCOMES and outcome != prev_outcome)
+                ):
+                    rec["outcome"] = outcome
+                    rec["ts"] = now_ts
+        else:
+            records[canon_id[:200]] = {
+                "receipt": (receipt_res or receipt_in or broker_alias)[:200],
+                "request_id": (req_id_res or req_id_in or canon_id)[:200],
+                "aliases": aliases[:10],
+                "work_package_id": work_package_id,
+                "outcome": outcome,
+                "attempt_digest": (
+                    computed_digest if computed_digest is not None else _compute_attempt_digest(in_dict)
+                ),
+                "ts": now_ts,
+                "consumed": False,
+                "consumed_ts": None,
+                "consumed_agent_id": "",
+            }
+            if len(records) > 100:
+                for old_k in list(records.keys())[:-100]:
+                    records.pop(old_k, None)
+
+    _update_state(session_id, update)
+
+
+def _bind_authorized_native_agent(
+    state: dict,
+    agent_ids: list[str],
+    auth_entry: dict,
+    primary_agent_id: str = "",
+) -> None:
+    wp_id = str(auth_entry.get("work_package_id") or "").strip()
+    rec_key = str(auth_entry.get("receipt") or "").strip()
+    if not wp_id or not agent_ids:
+        return
+    now_ts = time.time()
+    auth_map = state.setdefault("authorized_native_agents", {})
+    for aid in agent_ids:
+        if not aid:
+            continue
+        auth_map[aid[:200]] = {
+            "agent_id": aid[:200],
+            "work_package_id": wp_id[:200],
+            "receipt": rec_key[:200],
+            "ts": now_ts,
+        }
+    if len(auth_map) > 100:
+        for old_k in list(auth_map.keys())[:-100]:
+            auth_map.pop(old_k, None)
+
+    chosen_id = (primary_agent_id or agent_ids[0])[:200]
+    records = state.get("flash_receipt_records")
+    if isinstance(records, dict) and rec_key in records and isinstance(records[rec_key], dict):
+        if not records[rec_key].get("consumed_agent_id") or primary_agent_id:
+            records[rec_key]["consumed_agent_id"] = chosen_id
+    agents = state.get("native_agents")
+    if isinstance(agents, dict) and chosen_id in agents and isinstance(agents[chosen_id], dict):
+        agents[chosen_id]["work_package_id"] = wp_id
+        agents[chosen_id]["authorized_receipt"] = rec_key
+
+
+def _extract_spawned_agent_ids(payload: dict) -> list[str]:
+    ids: list[str] = []
+
+    def add_id(val: object) -> None:
+        if isinstance(val, str) and val.strip():
+            s = val.strip()[:200]
+            if s not in ids:
+                ids.append(s)
+
+    parsed = _extract_dispatch_result(payload)
+    if isinstance(parsed, dict):
+        for key in (
+            "agent_id", "agentId", "spawned_agent_id", "target_agent_id",
+            "subagent_id", "thread_id", "id", "nickname", "name",
+        ):
+            add_id(parsed.get(key))
+        nested = parsed.get("agent")
+        if isinstance(nested, dict):
+            for key in ("agent_id", "agentId", "id", "name"):
+                add_id(nested.get(key))
+        elif isinstance(nested, str):
+            add_id(nested)
+    elif isinstance(payload.get("tool_response"), str):
+        m = re.search(r"\b(?:agent_id|agentId)\s*[:=]\s*([A-Za-z0-9_.:-]+)", payload["tool_response"])
+        if m:
+            add_id(m.group(1))
+
+    tool_input = payload.get("tool_input")
+    if isinstance(tool_input, dict):
+        add_id(tool_input.get("name"))
+        add_id(tool_input.get("agent_name"))
+    return ids
+
+
+def _record_spawned_native_agent(session_id: str, payload: dict) -> None:
+    if not session_id:
+        return
+    tool_use_id = str(payload.get("tool_use_id") or "").strip()
+    extracted_ids = _extract_spawned_agent_ids(payload)
+
+    def update(state: dict) -> None:
+        auth_entry = None
+        tool_auths = state.get("tool_use_native_auths")
+        if tool_use_id and isinstance(tool_auths, dict) and tool_use_id in tool_auths:
+            auth_entry = tool_auths.pop(tool_use_id, None)
+        pending_auths = state.get("pending_native_auths")
+        if isinstance(pending_auths, list) and pending_auths:
+            if tool_use_id:
+                for idx, item in enumerate(pending_auths):
+                    if isinstance(item, dict) and item.get("tool_use_id") == tool_use_id:
+                        popped = pending_auths.pop(idx)
+                        if auth_entry is None:
+                            auth_entry = popped
+                        break
+            elif auth_entry is None and extracted_ids:
+                auth_entry = pending_auths.pop(0)
+        if isinstance(auth_entry, dict) and extracted_ids:
+            _bind_authorized_native_agent(
+                state, extracted_ids, auth_entry, primary_agent_id=extracted_ids[0]
+            )
+
+    _update_state(session_id, update)
+
+
+def _extract_followup_target_ids(tool_input: object) -> list[str]:
+    if not isinstance(tool_input, dict):
+        return []
+    ids: list[str] = []
+    for key in (
+        "id", "agent_id", "target_agent_id", "to", "recipient", "target",
+        "agent", "agent_name", "name",
+    ):
+        val = tool_input.get(key)
+        if isinstance(val, str) and val.strip():
+            s = val.strip()
+            if s not in ids:
+                ids.append(s)
+    return ids
+
+
+def _find_authorized_native_agent(state: dict, tool_input: object) -> tuple[str, dict] | None:
+    auth_map = state.get("authorized_native_agents")
+    if not isinstance(auth_map, dict) or not auth_map:
+        return None
+    for target_id in _extract_followup_target_ids(tool_input):
+        entry = auth_map.get(target_id)
+        if isinstance(entry, dict) and entry.get("work_package_id"):
+            return target_id, entry
+    return None
 
 
 def _is_flagship_agent_model(value: object) -> bool:
@@ -882,7 +1727,36 @@ def subagent_start(payload: dict) -> dict:
             "turn_id": str(payload.get("turn_id") or ""),
             "model": str(payload.get("model") or ""),
         }
+        mode = native_flash_skip_mode()
+        should_relieve = False
         if _normalized_agent_type(agent_type) in NATIVE_CHEAP_AGENT_TYPES:
+            if mode == "off":
+                should_relieve = True
+            elif state.get("pending_native_relief") is True:
+                should_relieve = True
+                state["pending_native_relief"] = False
+            pending_auths = state.get("pending_native_auths")
+            if isinstance(pending_auths, list) and pending_auths:
+                payload_tuid = str(payload.get("tool_use_id") or "").strip()
+                match_idx = None
+                if payload_tuid:
+                    for idx, item in enumerate(pending_auths):
+                        if isinstance(item, dict) and item.get("tool_use_id") == payload_tuid:
+                            match_idx = idx
+                            break
+                if match_idx is None:
+                    match_idx = 0
+                auth_entry = pending_auths.pop(match_idx)
+                if isinstance(auth_entry, dict):
+                    start_ids = [agent_id]
+                    extra_name = str(payload.get("agent_name") or payload.get("name") or "").strip()
+                    if extra_name and extra_name not in start_ids:
+                        start_ids.append(extra_name)
+                    _bind_authorized_native_agent(
+                        state, start_ids, auth_entry, primary_agent_id=agent_id
+                    )
+
+        if should_relieve:
             state["direct_labour_since_relief"] = 0
             state["direct_labour_block_counts"] = {}
             state["labour_relief_sequence"] = int(
@@ -915,6 +1789,12 @@ def subagent_stop(payload: dict) -> dict:
         return {}
 
     completion = {"recorded": False}
+    model_from_payload = str(payload.get("model") or "").strip()
+    attested_model = ""
+    if not model_from_payload:
+        transcript_path = payload.get("agent_transcript_path")
+        if transcript_path:
+            attested_model = _attest_model_from_transcript(transcript_path)
 
     def update(state: dict) -> None:
         agents = state.setdefault("native_agents", {})
@@ -926,6 +1806,7 @@ def subagent_stop(payload: dict) -> dict:
             return
         if _normalized_agent_type(previous.get("agent_type")) != _normalized_agent_type(agent_type):
             return
+        completed_model = model_from_payload or attested_model or str(previous.get("model") or "")
         agents[agent_id] = {
             **previous,
             "agent_id": agent_id,
@@ -933,11 +1814,10 @@ def subagent_stop(payload: dict) -> dict:
             "status": "completed",
             "completed": True,
             "turn_id": stop_turn_id,
-            "model": str(payload.get("model") or previous.get("model") or ""),
+            "model": completed_model,
             "has_result": bool(str(payload.get("last_assistant_message") or "").strip()),
         }
         completion["recorded"] = True
-        completed_model = str(payload.get("model") or previous.get("model") or "")
         if _is_native_flagship_model(completed_model):
             receipts = state.setdefault("decision_receipts", [])
             receipt = f"native:{agent_id}"
@@ -949,10 +1829,11 @@ def subagent_stop(payload: dict) -> dict:
 
     _update_state(session_id, update)
     if completion["recorded"]:
+        completed_model_log = model_from_payload or attested_model or ""
         log_gate_decision(
             session_id, "SubagentStop", "-", None, "native-complete",
             extra={"agent_id": agent_id, "agent_type": agent_type,
-                   "model": str(payload.get("model") or "")},
+                   "model": completed_model_log},
         )
     return {}
 
@@ -1001,6 +1882,8 @@ def _tool_input_text(tool_input: object) -> str:
 
 
 def _shell_command_text(tool_input: object) -> str:
+    if isinstance(tool_input, str):
+        return tool_input
     if not isinstance(tool_input, dict):
         return ""
     return "\n".join(
@@ -1008,6 +1891,119 @@ def _shell_command_text(tool_input: object) -> str:
         for key in ("command", "cmd", "script")
         if tool_input.get(key) is not None
     )
+
+
+DANGEROUS_SSH_OPTIONS = ("proxycommand", "localcommand", "permitlocalcommand")
+REMOTE_COMMAND_START_RE = re.compile(r"^(?:ssh|scp|sftp|rsync)(?:\.exe)?(?:\s|$)", re.IGNORECASE)
+
+
+def _unwrap_cmd_c(command: str) -> str:
+    stripped = command.strip()
+    m = re.match(r"^cmd(?:\.exe)?\s+/c\s+(.*)$", stripped, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return stripped
+    rest = m.group(1).strip()
+    if not (rest.startswith('"') and rest.endswith('"') and len(rest) >= 2):
+        return stripped
+    i = 1
+    end = len(rest) - 1
+    while i < end:
+        ch = rest[i]
+        if ch == '\\' and i + 1 < end and rest[i + 1] == '"':
+            i += 2
+            continue
+        if ch == '"':
+            return stripped
+        i += 1
+    return rest[1:-1].strip()
+
+
+def _is_single_path_token(text: str) -> bool:
+    text = text.strip()
+    if not text:
+        return False
+    if text.startswith(('"', "'")):
+        q = text[0]
+        i = 1
+        m = len(text)
+        closed_at = -1
+        while i < m:
+            if text[i] == '\\' and i + 1 < m and text[i + 1] == q:
+                i += 2
+                continue
+            if text[i] == q:
+                closed_at = i
+                break
+            i += 1
+        if closed_at == -1:
+            return False
+        return text[closed_at + 1:].strip() == ""
+    for forbidden in (";", "&", "|", "`", ">", "<", "$"):
+        if forbidden in text:
+            return False
+    return len(text.split()) == 1
+
+
+def _is_live_remote_command(raw_command: str) -> bool:
+    try:
+        cmd = _unwrap_cmd_c(raw_command)
+        if not REMOTE_COMMAND_START_RE.match(cmd):
+            return False
+        quote = None
+        i = 0
+        n = len(cmd)
+        less_pos = -1
+        while i < n:
+            ch = cmd[i]
+            if quote:
+                if quote == '"' and ch == '\\' and i + 1 < n and cmd[i + 1] == '"':
+                    i += 2
+                    continue
+                elif ch == quote:
+                    quote = None
+                i += 1
+            else:
+                if ch in ('"', "'"):
+                    quote = ch
+                    i += 1
+                elif ch in (";", "&", "|", "`", "\n", "\r"):
+                    return False
+                elif ch == ">":
+                    return False
+                elif ch == "$" and i + 1 < n and cmd[i + 1] == "(":
+                    return False
+                elif ch == "<":
+                    if less_pos >= 0:
+                        return False
+                    less_pos = i
+                    i += 1
+                else:
+                    i += 1
+        if quote is not None:
+            return False
+        if less_pos >= 0:
+            after_less = cmd[less_pos + 1:]
+            if not _is_single_path_token(after_less):
+                return False
+            target_part = cmd[:less_pos]
+        else:
+            target_part = cmd
+        tokens = shlex.split(target_part, posix=False)
+        for idx, token in enumerate(tokens):
+            tok = token.strip('"\'')
+            tok_lower = tok.lower()
+            if tok_lower == "-o":
+                if idx + 1 < len(tokens):
+                    next_tok = tokens[idx + 1].strip('"\'').lower()
+                    if any(opt in next_tok for opt in DANGEROUS_SSH_OPTIONS):
+                        return False
+            elif tok_lower.startswith("-o"):
+                opt_val = tok_lower[2:].lstrip("=")
+                if any(opt in opt_val for opt in DANGEROUS_SSH_OPTIONS):
+                    return False
+        return True
+    except Exception:
+        return False
 
 
 def _neutralize_quoted_separators(command: str) -> str:
@@ -1135,7 +2131,8 @@ def _is_child_guarded_tool(tool_name: object) -> bool:
     name = normalize_tool_name(tool_name)
     if not name:
         return False
-    if name in DELEGATION_TOOL_NAMES:
+    bare = _bare_collaboration_tool_name(name)
+    if bare in DELEGATION_TOOL_NAMES:
         return True
     if name.startswith("mcp__agent_switchboard__") and any(
         name.endswith(suffix) for suffix in CHILD_GUARD_SWITCHBOARD_SUFFIXES
@@ -1146,7 +2143,8 @@ def _is_child_guarded_tool(tool_name: object) -> bool:
 
 def _direct_labour_category(tool_name: object, tool_input: object) -> str | None:
     name = normalize_tool_name(tool_name)
-    if not name or name in DELEGATION_TOOL_NAMES:
+    bare = _bare_collaboration_tool_name(name)
+    if not name or bare in DELEGATION_TOOL_NAMES or bare in COORDINATION_TOOL_NAMES:
         return None
     # Opposite-vendor consultation is brain work, not same-vendor labour. The
     # broker independently rejects same-vendor labour unless native-unavailable
@@ -1188,6 +2186,8 @@ def _direct_labour_category(tool_name: object, tool_input: object) -> str | None
         # quoted string, so a chained command after the invocation (`;`, `&&`,
         # `|`) still fails to match and gets no free pass.
         if ROUTING_OVERRIDE_COMMAND_RE.search(_neutralize_quoted_separators(text)):
+            return None
+        if _is_live_remote_command(text):
             return None
         return "tests" if TEST_COMMAND_RE.search(text) else "other"
     if name in MUTATING_TOOL_NAMES:
@@ -1430,7 +2430,7 @@ def _standing_policy_context(session_id: str) -> str:
             f"{audit_line}"
             "The owner has a STANDING REQUEST to delegate eligible labour: dispatching one "
             "bounded package to the Flash workhorse (route_agent_task, target_agent='antigravity', "
-            "surface='cli', target_model='gemini flash', effort='high') or to a managed native "
+            "surface='cli', target_model='hydrogen', effort='high'; 'xhigh' for heavier packages) or to a managed native "
             "subagent is pre-authorized and does not need fresh permission this turn. Flash is the "
             "default lane for bounded reading, search, extraction, summarising and drafting/writing; "
             "use a native role when the package needs host-only tools or session state, and say why. "
@@ -1448,6 +2448,7 @@ def register_brain_override(
     package_id: str,
     reason: str,
     budget: int | None = None,
+    out: dict | None = None,
 ) -> bool:
     session_id = str(session_id or "").strip()
     package_id = str(package_id or "").strip()
@@ -1457,46 +2458,190 @@ def register_brain_override(
         or not re.fullmatch(r"WP[A-Za-z0-9_.-]+", package_id, re.IGNORECASE)
         or len(reason) < 12
     ):
+        if out is not None:
+            effective_budget = (
+                _clamp_override_budget(budget)
+                if budget is not None
+                else effective_direct_labour_limit()
+            )
+            out.update({
+                "registered": False,
+                "package": package_id,
+                "budget": effective_budget,
+            })
         return False
 
     clamped_budget = _clamp_override_budget(budget)
+    requested = (
+        clamped_budget
+        if clamped_budget is not None
+        else effective_direct_labour_limit()
+    )
+
+    cap_mode = override_cap_mode()
+    cap = override_hourly_budget()
+
+    result = {
+        "ok": False,
+        "granted": 0,
+        "refused": False,
+        "refusal_reason": "",
+        "warn": False,
+    }
 
     def update(state: dict) -> None:
+        now = time.time()
+        raw_grants = state.get("override_grants")
+        valid_grants = [
+            g
+            for g in (raw_grants if isinstance(raw_grants, list) else [])
+            if isinstance(g, dict)
+            and isinstance(g.get("ts"), (int, float))
+            and not isinstance(g.get("ts"), bool)
+            and isinstance(g.get("budget"), int)
+            and not isinstance(g.get("budget"), bool)
+            and (now - float(g["ts"])) < 3600.0
+        ]
+        used = sum(int(g["budget"]) for g in valid_grants)
+        available = max(0, cap - used)
+
+        if cap_mode == "off":
+            granted = requested
+        else:
+            granted = min(requested, available)
+
+        if cap_mode != "off" and granted == 0:
+            if valid_grants:
+                oldest_ts = min(float(g["ts"]) for g in valid_grants)
+                wait_ts = oldest_ts + 3600.0
+            else:
+                wait_ts = now + 3600.0
+            wait_str = availability_reset.fmt_utc(wait_ts)
+            refusal_text = (
+                f"hourly override budget used ({used}/{cap} direct calls in the last hour); "
+                "route this labour to Flash with route_agent_task (target_agent antigravity, "
+                f"surface cli, target_model hydrogen, effort high; xhigh for heavier packages) or wait until {wait_str}"
+            )
+            if cap_mode == "warn":
+                granted = requested
+                valid_grants.append({"ts": now, "budget": granted})
+                state["override_grants"] = valid_grants
+                result["warn"] = True
+                result["refusal_reason"] = refusal_text
+            else:
+                state["override_grants"] = valid_grants
+                result["refused"] = True
+                result["refusal_reason"] = refusal_text
+                return
+
+        valid_grants.append({"ts": now, "budget": granted})
+        state["override_grants"] = valid_grants
+
         overrides = state.setdefault("brain_overrides", {})
         entry = {
             "package_id": package_id,
             "reason": reason,
-            "registered_at": time.time(),
+            "registered_at": now,
+            "budget": granted,
         }
-        if clamped_budget is not None:
-            entry["budget"] = clamped_budget
-            state["relief_budget"] = clamped_budget
+        overrides[package_id.lower()] = entry
+
+        if clamped_budget is not None or granted < effective_direct_labour_limit():
+            state["relief_budget"] = granted
         else:
             state.pop("relief_budget", None)
-        overrides[package_id.lower()] = entry
+
         state["direct_labour_since_relief"] = 0
         state["direct_labour_block_counts"] = {}
-        state["labour_relief_sequence"] = int(
-            state.get("labour_relief_sequence") or 0
-        ) + 1
-
-    ok = _update_state(session_id, update) is not None
-    if ok:
-        # Also append to the durable log. Session STATE is reset each turn, so
-        # anything recorded only there vanishes and the rendered audit silently
-        # loses packages; the log is append-only and survives.
-        effective_budget = (
-            clamped_budget if clamped_budget is not None else effective_direct_labour_limit()
+        state["labour_relief_sequence"] = (
+            int(state.get("labour_relief_sequence") or 0) + 1
         )
+        result["ok"] = True
+        result["granted"] = granted
+
+    state_after = _update_state(session_id, update)
+    if state_after is None:
+        if out is not None:
+            out.update({
+                "registered": False,
+                "package": package_id,
+                "budget": requested,
+            })
+        return False
+
+    if result["refused"]:
         log_gate_decision(
-            session_id, "Override", "-", None, "override",
+            session_id,
+            "Override",
+            "-",
+            None,
+            "refused",
             extra={
                 "work_package_id": package_id,
                 "reason": reason,
-                "budget": effective_budget,
+                "refusal_reason": result["refusal_reason"],
+                "budget": 0,
             },
         )
-    return ok
+        if out is not None:
+            out.update({
+                "registered": False,
+                "package": package_id,
+                "reason": result["refusal_reason"],
+            })
+        return False
+
+    if result["ok"]:
+        granted_budget = result["granted"]
+        if result["warn"]:
+            log_gate_decision(
+                session_id,
+                "Override",
+                "-",
+                None,
+                "override-cap-would-refuse",
+                extra={
+                    "work_package_id": package_id,
+                    "reason": reason,
+                    "budget": granted_budget,
+                    "warning": result["refusal_reason"],
+                },
+            )
+            if out is not None:
+                out.update({
+                    "registered": True,
+                    "package": package_id,
+                    "budget": granted_budget,
+                    "warning": result["refusal_reason"],
+                })
+        else:
+            log_gate_decision(
+                session_id,
+                "Override",
+                "-",
+                None,
+                "override",
+                extra={
+                    "work_package_id": package_id,
+                    "reason": reason,
+                    "budget": granted_budget,
+                },
+            )
+            if out is not None:
+                out.update({
+                    "registered": True,
+                    "package": package_id,
+                    "budget": granted_budget,
+                })
+        return True
+
+    if out is not None:
+        out.update({
+            "registered": False,
+            "package": package_id,
+            "budget": requested,
+        })
+    return False
 
 
 def routing_override_cli(argv: list[str]) -> int:
@@ -1509,21 +2654,11 @@ def routing_override_cli(argv: list[str]) -> int:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code or 2)
-    effective_budget = (
-        _clamp_override_budget(args.budget)
-        if args.budget is not None
-        else effective_direct_labour_limit()
-    )
+    out: dict = {}
     ok = register_brain_override(
-        args.session, args.package, args.reason, budget=args.budget
+        args.session, args.package, args.reason, budget=args.budget, out=out
     )
-    sys.stdout.write(
-        json.dumps({
-            "registered": ok,
-            "package": args.package,
-            "budget": effective_budget,
-        })
-    )
+    sys.stdout.write(json.dumps(out))
     return 0 if ok else 2
 
 
@@ -2138,16 +3273,17 @@ def _suggested_dispatch_snippet(category: str) -> str:
     if category in _RESEARCH_CATEGORIES:
         return (
             "route_agent_task {target_agent:'antigravity', surface:'cli', "
-            "target_model:'gemini flash', effort:'high', mode:'plan', task_kind:'research', "
+            "target_model:'hydrogen', effort:'high', mode:'plan', task_kind:'research', "
             "research_questions:['<1-3 exact questions>'], work_package_id:'WP-<id>', "
             "prompt:'<one bounded package>'}"
         )
     kind = "implementation" if category in {"tests", "docs"} else "quick_check"
     return (
         "route_agent_task {target_agent:'antigravity', surface:'cli', "
-        f"target_model:'gemini flash', effort:'high', mode:'plan', task_kind:'{kind}', "
+        f"target_model:'hydrogen', effort:'high', mode:'plan', task_kind:'{kind}', "
         "work_package_id:'WP-<id>', prompt:'<one bounded package>'}\n"
-        "   (add mode:'accept-edits' + allowed_files + acceptance_criteria to implement)"
+        "   (add mode:'accept-edits' + allowed_files + acceptance_criteria to implement; "
+        "if the package needs the repo's tests, resend it with stage_repo=true)"
     )
 
 
@@ -2205,6 +3341,15 @@ def pre_tool_use(payload: dict) -> dict:
         return {}
     marker = active_claude_unavailable_marker(session_id)
     tool_input = payload.get("tool_input") or {}
+    if session_id and (
+        normalized_tool == "consult_decision"
+        or normalized_tool.endswith("__consult_decision")
+        or normalized_tool.endswith("__consult-decision")
+        or normalized_tool in {"consult_decision", "consult-decision"}
+    ):
+        _update_state(
+            session_id, lambda st: st.__setitem__("last_consult_decision_ts", time.time())
+        )
     if marker and _is_claude_consult_route(payload.get("tool_name"), tool_input):
         req_model = str(tool_input.get("target_model") or tool_input.get("model") or "").strip().lower()
         if _model_matches(marker.get("model", "*"), req_model):
@@ -2254,9 +3399,100 @@ def pre_tool_use(payload: dict) -> dict:
                 ),
             }
         }
-    if normalized_tool in DELEGATION_TOOL_NAMES:
+    bare_tool = _bare_collaboration_tool_name(normalized_tool)
+    if bare_tool in {"send_message", "sendmessage", "send-message"}:
+        if session_id:
+            state_snapshot = _read_state(session_id)
+            matched_auth = _find_authorized_native_agent(state_snapshot, tool_input)
+            if matched_auth:
+                auth_id, auth_entry = matched_auth
+                log_gate_decision(
+                    session_id,
+                    "PreToolUse",
+                    normalized_tool,
+                    None,
+                    "followup-authorized-allow",
+                    extra={
+                        "agent_id": auth_id,
+                        "work_package_id": auth_entry.get("work_package_id"),
+                    },
+                )
+                return {}
+    if bare_tool in DELEGATION_TOOL_NAMES:
         tool_input = payload.get("tool_input") or {}
-        if _is_flagship_agent_model(tool_input.get("model")):
+        skip_mode = native_flash_skip_mode()
+        raw_agent_type = tool_input.get("agent_type") or tool_input.get("subagent_type")
+        agent_type = _normalized_agent_type(raw_agent_type)
+        is_flagship = _is_flagship_agent_model(tool_input.get("model"))
+        is_cheap_role = agent_type in NATIVE_CHEAP_AGENT_TYPES
+        is_followup = (bare_tool == "followup_task")
+
+        if is_followup and session_id:
+            state_snapshot = _read_state(session_id)
+            matched_auth = _find_authorized_native_agent(state_snapshot, tool_input)
+            if matched_auth:
+                auth_id, auth_entry = matched_auth
+                log_gate_decision(
+                    session_id,
+                    "PreToolUse",
+                    normalized_tool,
+                    None,
+                    "followup-authorized-allow",
+                    extra={
+                        "agent_id": auth_id,
+                        "work_package_id": auth_entry.get("work_package_id"),
+                    },
+                )
+                return {}
+
+        # Step 4: Flagship and default spawns
+        if skip_mode != "off" and not is_followup:
+            is_empty_or_default = agent_type in {"", "default"}
+            step4_candidate = False
+            if is_empty_or_default or is_flagship:
+                if host == "claude":
+                    if is_empty_or_default:
+                        step4_candidate = True
+                    elif agent_type in {"general-purpose", "general"} and is_flagship:
+                        step4_candidate = True
+                else:
+                    step4_candidate = True
+
+            if step4_candidate:
+                state_snapshot = _read_state(session_id) if session_id else {}
+                last_consult = float(state_snapshot.get("last_consult_decision_ts") or 0.0)
+                now = time.time()
+                consult_recent = (last_consult > 0.0 and (now - last_consult) <= 900.0)
+                if not consult_recent:
+                    reason = (
+                        "Routing gate: flagship and default spawns require a recent consult_decision within 900 seconds. "
+                        "Labour goes to Flash or a managed explorer/worker with flash_skip, and decisions go through consult_decision first."
+                    )
+                    if session_id:
+                        _update_state(session_id, lambda st: st.__setitem__("pending_native_relief", False))
+                    if skip_mode == "warn":
+                        log_gate_decision(session_id, "PreToolUse", normalized_tool, None, "flash-skip-would-deny")
+                        return {
+                            "hookSpecificOutput": {
+                                "hookEventName": "PreToolUse",
+                                "permissionDecision": "allow",
+                                "additionalContext": reason,
+                            }
+                        }
+                    log_gate_decision(
+                        session_id, "PreToolUse", normalized_tool, None, "deny",
+                        extra={"reason": "flagship_or_default_without_consult_decision"},
+                    )
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": reason,
+                        }
+                    }
+
+        # Original flagship prompt byte caps
+        if is_flagship:
             prompt_text = _delegation_prompt_text(tool_input)
             prompt_bytes = len(prompt_text.encode("utf-8"))
             if prompt_bytes > FLAGSHIP_PROMPT_EXTENDED_MAX_BYTES:
@@ -2294,11 +3530,141 @@ def pre_tool_use(payload: dict) -> dict:
                         ),
                     }
                 }
+
+        # Step 3: Cheap-role spawns and followup_task
+        if skip_mode != "off" and (is_cheap_role or is_followup):
+            has_text_field, combined_text = _extract_delegation_texts(tool_input)
+            if not has_text_field:
+                if session_id:
+                    _update_state(session_id, lambda st: st.__setitem__("pending_native_relief", False))
+                log_gate_decision(session_id, "PreToolUse", normalized_tool, None, "flash-skip-unknown-shape")
+                return {}
+
+            outcome_box: dict = {
+                "is_valid": False,
+                "skip_kind": None,
+                "skip_evidence": None,
+                "detail": {},
+            }
+            if session_id:
+                def update_skip(st: dict) -> None:
+                    now_ts = time.time()
+                    ok, kind, ev, det = _validate_flash_skip_detailed(
+                        st, combined_text, now=now_ts
+                    )
+                    outcome_box["is_valid"] = ok
+                    outcome_box["skip_kind"] = kind
+                    outcome_box["skip_evidence"] = ev
+                    outcome_box["detail"] = det
+                    if ok and kind:
+                        counts = st.setdefault("flash_skip_counts", {})
+                        counts[kind] = int(counts.get(kind) or 0) + 1
+                        st["pending_native_relief"] = True
+                        if kind == "flash-failed":
+                            rec_key = det.get("record_key")
+                            records = st.get("flash_receipt_records")
+                            if (
+                                isinstance(records, dict)
+                                and rec_key in records
+                                and isinstance(records[rec_key], dict)
+                            ):
+                                rec = records[rec_key]
+                                rec["consumed"] = True
+                                rec["consumed_ts"] = now_ts
+                                wp_id = str(rec.get("work_package_id") or "")
+                                tuid = str(payload.get("tool_use_id") or "").strip()
+                                auth_entry = {
+                                    "work_package_id": wp_id,
+                                    "receipt": rec_key,
+                                    "tool_use_id": tuid,
+                                    "ts": now_ts,
+                                }
+                                if isinstance(tool_input, dict):
+                                    req_name = str(
+                                        tool_input.get("name")
+                                        or tool_input.get("agent_name")
+                                        or ""
+                                    ).strip()
+                                    if req_name:
+                                        auth_entry["agent_name"] = req_name
+                                        _bind_authorized_native_agent(st, [req_name], auth_entry)
+                                pending_auths = st.setdefault("pending_native_auths", [])
+                                pending_auths.append(auth_entry)
+                                if len(pending_auths) > 20:
+                                    st["pending_native_auths"] = pending_auths[-20:]
+                                if tuid:
+                                    tool_auths = st.setdefault("tool_use_native_auths", {})
+                                    tool_auths[tuid] = dict(auth_entry)
+                                    if len(tool_auths) > 50:
+                                        for old_k in list(tool_auths.keys())[:-50]:
+                                            tool_auths.pop(old_k, None)
+                    else:
+                        st["pending_native_relief"] = False
+
+                if _update_state(session_id, update_skip) is None:
+                    log_gate_decision(
+                        session_id, "PreToolUse", normalized_tool, None, "allow",
+                        extra={"fail_open": True},
+                    )
+                    return {}
+            else:
+                ok, kind, ev, det = _validate_flash_skip_detailed(
+                    {}, combined_text, now=time.time()
+                )
+                outcome_box["is_valid"] = ok
+                outcome_box["skip_kind"] = kind
+                outcome_box["skip_evidence"] = ev
+                outcome_box["detail"] = det
+
+            is_valid = outcome_box["is_valid"]
+            skip_kind = outcome_box["skip_kind"]
+            detail = outcome_box["detail"] or {}
+            if is_valid and skip_kind:
+                log_gate_decision(
+                    session_id, "PreToolUse", normalized_tool, None, "flash-skip-allow",
+                    extra={"skip_kind": skip_kind},
+                )
+                return {}
+
+            reason_prefix = detail.get("message") or (
+                "Routing gate: native cheap-role delegation requires a valid flash_skip reason."
+            )
+            deny_reason = f"{reason_prefix} {FLASH_SKIP_HINT}"
+            if skip_mode == "warn":
+                log_gate_decision(session_id, "PreToolUse", normalized_tool, None, "flash-skip-would-deny")
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "additionalContext": deny_reason,
+                    }
+                }
+            log_gate_decision(
+                session_id, "PreToolUse", normalized_tool, None, "deny",
+                extra={"reason": detail.get("reason_code") or "flash_skip_missing_or_invalid"},
+            )
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": deny_reason,
+                }
+            }
+
+        log_gate_decision(session_id, "PreToolUse", normalized_tool, None, "allow")
+        return {}
     category = _direct_labour_category(
         payload.get("tool_name"), payload.get("tool_input") or {}
     )
     if not session_id or not category:
-        log_gate_decision(session_id, "PreToolUse", normalized_tool, category, "allow")
+        if (
+            session_id
+            and (normalized_tool in SHELL_TOOL_NAMES or "shell" in normalized_tool)
+            and _is_live_remote_command(_shell_command_text(payload.get("tool_input") or {}))
+        ):
+            log_gate_decision(session_id, "PreToolUse", normalized_tool, None, "live-remote")
+        else:
+            log_gate_decision(session_id, "PreToolUse", normalized_tool, category, "allow")
         return {}
     if normalized_tool in READ_TOOL_NAMES or normalized_tool in SEARCH_TOOL_NAMES:
         tool_input = payload.get("tool_input")
@@ -2893,6 +4259,18 @@ def post_tool_use(payload: dict) -> dict:
         except Exception:
             pass
 
+    if session_id and _is_switchboard_result_or_route_tool(normalized_tool):
+        try:
+            _record_flash_receipts(session_id, payload)
+        except Exception:
+            pass
+
+    if session_id and _bare_collaboration_tool_name(normalized_tool) in {"agent", "task", "spawn_agent"}:
+        try:
+            _record_spawned_native_agent(session_id, payload)
+        except Exception:
+            pass
+
     # WP-SB8A item 1: credit/decision-receipt must be computed from the ORIGINAL
     # payload BEFORE any ingress replacement is considered. The old order returned
     # on ingress_feedback first, so a completed Flash dispatch whose own response
@@ -2961,9 +4339,10 @@ def post_tool_use(payload: dict) -> dict:
                         f"calls in this block ({block_observed}). The next eligible labour call "
                         "will be denied. Cheapest next move: dispatch the bounded package with "
                         "route_agent_task (target_agent='antigravity', surface='cli', "
-                        "target_model='gemini flash', effort='high', mode='plan'); use "
+                        "target_model='hydrogen', effort='high', mode='plan'; xhigh for heavier packages); use "
                         "task_kind='research' with 1-3 research_questions for reads/searches/"
                         "evidence, or task_kind='implementation'/'quick_check' for tests/other. "
+                        "If the package needs the repo's tests, resend it with stage_repo=true. "
                         f"For a live investigation, register one override with --budget N (max {override_max_budget()}) "
                         "instead of many; reading lines cited by a delegated result is free."
                     ),
@@ -2975,6 +4354,9 @@ def post_tool_use(payload: dict) -> dict:
 
 CREDITABLE_DISPATCH_TOOL = "mcp__agent_switchboard__route_agent_task"
 CREDITABLE_OUTCOME = "completed_verified"
+# completed_with_gaps: a read-only package answered from its own files and listed only
+# outside files in scope_gaps. It earns the same relief; brain verification still applies.
+CREDITABLE_OUTCOMES = (CREDITABLE_OUTCOME, "completed_with_gaps")
 
 
 def _coerce_json_dict(value: object) -> dict | None:
@@ -3375,7 +4757,7 @@ def _credit_async_flash_start(
 def _credit_switchboard_dispatch(session_id: str, normalized_tool: str, payload: dict) -> dict | None:
     """Grant one bounded block for a dispatch that actually completed.
 
-    Only `completed_verified` earns relief. A blocked, rejected, failed, or
+    Only `completed_verified` and `completed_with_gaps` earn relief. A blocked, rejected, failed, or
     unavailable dispatch earns nothing: otherwise a sender could farm credit by
     repeatedly firing a route it knows is broken, which is strictly cheaper than
     doing the work and would make the gate an incentive to spam a dead lane."""
@@ -3411,7 +4793,7 @@ def _credit_switchboard_dispatch(session_id: str, normalized_tool: str, payload:
         log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "no-credit",
                           extra={"reason": "missing or malformed receipt", **outcome_details})
         return None
-    if outcome != CREDITABLE_OUTCOME:
+    if outcome not in CREDITABLE_OUTCOMES:
         log_gate_decision(session_id, "PostToolUse", normalized_tool, None, "no-credit",
                           extra={"reason": f"outcome={outcome or 'unknown'}", **outcome_details})
         return None

@@ -10,7 +10,7 @@ The one binary is dual-mode so a GitHub user needs no Python at all:
   agent-switchboard.exe doctor [--json] -> read-only capability report for this machine
   agent-switchboard.exe bridge <args>   -> broker CLI used by the bridge extension
   agent-switchboard.exe --version       -> print the packaged release version
-  agent-switchboard.exe routing-override -> register a package-specific gate override
+  agent-switchboard.exe routing-override -> register a package-specific gate override [--budget N]
   agent-switchboard.exe routing-report  -> summarize a session's routing lanes
   agent-switchboard.exe code-graph-usage [--days N] -> summarize code_graph usage events
   agent-switchboard.exe canary flash    -> live read-only Flash dispatch + receipt

@@ -218,7 +218,7 @@ def probe_git_state(args: dict[str, Any], roots: list[Path] | None) -> dict[str,
         argv = ["git", "-c", "core.fsmonitor=false", *_GIT_SUBCOMMANDS[query]]
         try:
             proc = subprocess.run(
-                argv, cwd=str(cwd), capture_output=True, text=True,
+                argv, cwd=str(cwd), stdin=subprocess.DEVNULL, capture_output=True, text=True,
                 timeout=PROBE_TIMEOUT_SECONDS, creationflags=WINDOWS_NO_WINDOW,
             )
         except Exception as exc:  # noqa: BLE001
@@ -303,7 +303,7 @@ def probe_process_list(args: dict[str, Any], _roots: list[Path] | None) -> dict[
         argv = ["ps", "-eo", "pid,ppid,comm"]
     try:
         proc = subprocess.run(
-            argv, capture_output=True, text=True,
+            argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
             timeout=PROBE_TIMEOUT_SECONDS, creationflags=WINDOWS_NO_WINDOW,
         )
     except Exception as exc:  # noqa: BLE001

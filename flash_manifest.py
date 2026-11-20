@@ -32,6 +32,7 @@ import hashlib
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +49,41 @@ MANIFEST_MAX_CREATES = 5
 MANIFEST_MAX_READ_CONTEXT = 20
 MANIFEST_MAX_FILES = 25
 MANIFEST_MAX_BYTES = 8 * 1024 * 1024
+
+REPO_MAX_FILE_BYTES = 5 * 1024 * 1024
+REPO_MAX_FILES = 5000
+REPO_MAX_TOTAL_BYTES = 200 * 1024 * 1024
+REPO_GIT_TIMEOUT_SECONDS = 30
+REPO_EXCLUDED_DIR_SEGMENTS = frozenset(
+    {
+        ".git",
+        "node_modules",
+        ".venv",
+        "venv",
+        "env",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".tox",
+        "build",
+        "dist",
+    }
+)
+_REPO_SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".kdbx")
+_REPO_SECRET_PREFIXES = ("id_rsa", "id_ed25519", "known_hosts")
+_REPO_SECRET_SUBSTRINGS = ("credential", "secret", "token")
+_GIT_C_ESCAPES = {
+    "a": ord("\a"),
+    "b": ord("\b"),
+    "f": ord("\f"),
+    "n": ord("\n"),
+    "r": ord("\r"),
+    "t": ord("\t"),
+    "v": ord("\v"),
+    "\\": ord("\\"),
+    '"': ord('"'),
+}
+_WINDOWS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 _DRIVE_PREFIX_LEN = 2  # "C:" -- the only legitimate colon in a Windows path
 
@@ -253,6 +289,8 @@ class StagedPackage:
     read_only: set[str] = field(default_factory=set)
     staged_bytes: int = 0
     containment_mode: str = "snapshot"
+    repo_files: set[str] = field(default_factory=set)
+    repo_staging: dict[str, Any] | None = None
 
     def staged_path(self, rel: str) -> Path:
         return self.root / rel
@@ -414,7 +452,7 @@ def build_manifest(
             rescope_hint="Name fewer or smaller files; a package should be answerable from a bounded excerpt.",
         )
 
-    return {
+    manifest: dict[str, Any] = {
         "workspace_root": workspace_root,
         "writes": writes,
         "creates": creates,
@@ -422,9 +460,259 @@ def build_manifest(
         "files": total_files,
         "bytes": total_bytes,
     }
+    if package.get("stage_repo"):
+        manifest["stage_repo"] = True
+    return manifest
 
 
-def stage(manifest: dict[str, Any], containment_mode: str = "snapshot") -> StagedPackage:
+def _unquote_git_path(raw: str) -> str:
+    """Decode git's C-style quoted output paths when core.quotePath quotes bytes."""
+    if len(raw) < 2 or not (raw.startswith('"') and raw.endswith('"')):
+        return raw
+    inner = raw[1:-1]
+    out = bytearray()
+    i = 0
+    n = len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch != "\\":
+            out.extend(ch.encode("utf-8"))
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            out.append(ord("\\"))
+            break
+        esc = inner[i]
+        if esc in _GIT_C_ESCAPES:
+            out.append(_GIT_C_ESCAPES[esc])
+            i += 1
+        elif esc in "01234567" and i + 2 < n and all(c in "01234567" for c in inner[i : i + 3]):
+            out.append(int(inner[i : i + 3], 8))
+            i += 3
+        else:
+            out.extend(esc.encode("utf-8"))
+            i += 1
+    return out.decode("utf-8", errors="replace")
+
+
+def _is_secret_like_name(name: str) -> bool:
+    """True for secret-like filenames (case-insensitive) excluded from repo staging."""
+    low = name.lower()
+    if low == ".env" or low.startswith(".env."):
+        return True
+    if low.endswith(_REPO_SECRET_SUFFIXES):
+        return True
+    if low.startswith(_REPO_SECRET_PREFIXES):
+        return True
+    return any(marker in low for marker in _REPO_SECRET_SUBSTRINGS)
+
+
+def _is_excluded_repo_path(rel: str) -> bool:
+    """True when a repo-relative path hits an excluded dir segment or secret name."""
+    parts = [p for p in rel.split("/") if p]
+    if not parts:
+        return True
+    if any(part.lower() in REPO_EXCLUDED_DIR_SEGMENTS for part in parts):
+        return True
+    return _is_secret_like_name(parts[-1])
+
+
+def _find_reparse_in_rel(workspace_root: Path, rel: str) -> str | None:
+    """Return the first symlink/junction/reparse segment inside workspace_root, or None."""
+    probe = workspace_root
+    parts = [p for p in rel.split("/") if p]
+    for idx, part in enumerate(parts):
+        probe = probe / part
+        try:
+            probe.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return "/".join(parts[: idx + 1])
+        if is_reparse_point(probe):
+            return "/".join(parts[: idx + 1])
+    return None
+
+
+def _list_repo_files(workspace_root: Path) -> tuple[list[str] | None, str | None]:
+    """List tracked and untracked-non-ignored files via git ls-files."""
+    if not workspace_root.is_dir():
+        return None, "workspace root is not a directory"
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=str(workspace_root),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=REPO_GIT_TIMEOUT_SECONDS,
+            check=False,
+            shell=False,
+            creationflags=_WINDOWS_NO_WINDOW,
+        )
+    except FileNotFoundError:
+        return None, "git executable not found"
+    except subprocess.TimeoutExpired:
+        return None, "git ls-files timed out"
+    except OSError as exc:
+        return None, f"git execution failed ({exc})"
+    if proc.returncode != 0:
+        stderr = " ".join((proc.stderr or "").split())
+        if "not a git repository" in stderr.lower():
+            return None, "not a git repository"
+        detail = f": {stderr[:160]}" if stderr else ""
+        return None, f"git ls-files failed with code {proc.returncode}{detail}"
+    seen: set[str] = set()
+    files: list[str] = []
+    for raw_line in (proc.stdout or "").splitlines():
+        line = raw_line.rstrip("\r\n")
+        if not line:
+            continue
+        rel = _unquote_git_path(line).replace("\\", "/").strip("/")
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        files.append(rel)
+    return files, None
+
+
+def _repo_staging_unavailable(
+    reason: str,
+    *,
+    excluded_count: int = 0,
+    skipped_links: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "files": 0,
+        "bytes": 0,
+        "excluded_count": excluded_count,
+        "skipped_links": sorted(set(skipped_links or [])),
+        "caveat": f"repo_staging_unavailable: {reason}; repo tests could not run in the sandbox",
+    }
+
+
+def _stage_repo_tree(staged: StagedPackage) -> None:
+    """Populate ``staged`` with a filtered read-only copy of git-known repo files.
+
+    Manifest files already staged take precedence. Falls back to manifest-only
+    with a structured caveat when git is unavailable or caps are exceeded.
+    """
+    workspace_root = staged.workspace_root
+    git_files, git_error = _list_repo_files(workspace_root)
+    if git_error is not None or git_files is None:
+        staged.repo_staging = _repo_staging_unavailable(git_error or "git unavailable")
+        return
+
+    manifest_rels_cf = {
+        rel.casefold()
+        for rel in (set(staged.write_targets) | set(staged.create_targets) | set(staged.read_only))
+    }
+    excluded_count = 0
+    skipped_links: list[str] = []
+    skipped_link_set: set[str] = set()
+    candidates: list[tuple[str, Path]] = []
+    total_files = len(staged.baseline)
+    total_bytes = staged.staged_bytes
+
+    for rel in git_files:
+        parts = [p for p in rel.split("/") if p]
+        if not parts or rel.startswith("/") or ".." in parts or ":" in parts[0]:
+            excluded_count += 1
+            continue
+        if rel.casefold() in manifest_rels_cf:
+            continue
+        if _is_excluded_repo_path(rel):
+            excluded_count += 1
+            continue
+        link_rel = _find_reparse_in_rel(workspace_root, rel)
+        if link_rel is not None:
+            if link_rel not in skipped_link_set:
+                skipped_link_set.add(link_rel)
+                skipped_links.append(link_rel)
+            continue
+        src = workspace_root.joinpath(*parts)
+        try:
+            st = src.lstat()
+        except OSError:
+            excluded_count += 1
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            excluded_count += 1
+            continue
+        size = int(st.st_size)
+        if size > REPO_MAX_FILE_BYTES:
+            excluded_count += 1
+            continue
+        total_files += 1
+        total_bytes += size
+        if total_files > REPO_MAX_FILES or total_bytes > REPO_MAX_TOTAL_BYTES:
+            staged.repo_staging = _repo_staging_unavailable(
+                "caps exceeded",
+                excluded_count=excluded_count,
+                skipped_links=skipped_links,
+            )
+            return
+        candidates.append((rel, src))
+
+    for rel, src in candidates:
+        destination = staged.root.joinpath(*rel.split("/"))
+        try:
+            if is_reparse_point(src):
+                if rel not in skipped_link_set:
+                    skipped_link_set.add(rel)
+                    skipped_links.append(rel)
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, destination, follow_symlinks=False)
+            if is_reparse_point(destination):
+                try:
+                    destination.unlink()
+                except OSError:
+                    pass
+                if rel not in skipped_link_set:
+                    skipped_link_set.add(rel)
+                    skipped_links.append(rel)
+                continue
+            digest = file_digest(destination)
+            if digest is None:
+                try:
+                    destination.unlink()
+                except OSError:
+                    pass
+                excluded_count += 1
+                continue
+            staged_size = int(destination.stat().st_size)
+        except OSError:
+            try:
+                if destination.exists() or destination.is_symlink():
+                    destination.unlink()
+            except OSError:
+                pass
+            excluded_count += 1
+            continue
+        staged.baseline[rel] = digest
+        staged.repo_files.add(rel)
+        staged.staged_bytes += staged_size
+
+    staged.repo_staging = {
+        "enabled": True,
+        "files": len(staged.baseline),
+        "bytes": staged.staged_bytes,
+        "excluded_count": excluded_count,
+        "skipped_links": sorted(skipped_links),
+        "caveat": None,
+    }
+
+
+def stage(
+    manifest: dict[str, Any],
+    containment_mode: str = "snapshot",
+    stage_repo: bool | None = None,
+) -> StagedPackage:
     """Copy exactly the declared files into a disposable tree."""
     workspace_root: Path = manifest["workspace_root"]
     staging = Path(tempfile.mkdtemp(prefix="flash-manifest-"))
@@ -478,6 +766,10 @@ def stage(manifest: dict[str, Any], containment_mode: str = "snapshot") -> Stage
             staged.baseline[rel] = digest
             staged.read_only.add(rel)
             staged.staged_bytes += destination.stat().st_size
+
+        use_repo = bool(manifest.get("stage_repo", False)) if stage_repo is None else bool(stage_repo)
+        if use_repo:
+            _stage_repo_tree(staged)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -604,6 +896,22 @@ def _remove_created(target: Path) -> None:
     target.unlink()
 
 
+def scope_refusals(changes: dict[str, Any]) -> list[str]:
+    """Return refusal reasons for any out-of-scope mutation detected in ``changes``."""
+    refusals: list[str] = []
+    if changes["undeclared"]:
+        refusals.append(f"undeclared changes in staging: {changes['undeclared']}")
+    if changes["deleted"]:
+        refusals.append(f"deletions are not supported: {changes['deleted']}")
+    if changes["read_context_modified"]:
+        refusals.append(f"read_context was modified: {changes['read_context_modified']}")
+    if changes["reparse_planted"]:
+        refusals.append(f"reparse points planted: {changes['reparse_planted']}")
+    if changes["unreadable"]:
+        refusals.append(f"unreadable staged files: {changes['unreadable']}")
+    return refusals
+
+
 def apply_changes(staged: StagedPackage, changes: dict[str, Any]) -> dict[str, Any]:
     """Write declared changes back, or nothing at all.
 
@@ -619,17 +927,7 @@ def apply_changes(staged: StagedPackage, changes: dict[str, Any]) -> dict[str, A
     what is still changed. A caller must treat any non-empty ``applied`` as a
     committed write regardless of ``refused``.
     """
-    refusals: list[str] = []
-    if changes["undeclared"]:
-        refusals.append(f"undeclared changes in staging: {changes['undeclared']}")
-    if changes["deleted"]:
-        refusals.append(f"deletions are not supported: {changes['deleted']}")
-    if changes["read_context_modified"]:
-        refusals.append(f"read_context was modified: {changes['read_context_modified']}")
-    if changes["reparse_planted"]:
-        refusals.append(f"reparse points planted: {changes['reparse_planted']}")
-    if changes["unreadable"]:
-        refusals.append(f"unreadable staged files: {changes['unreadable']}")
+    refusals = scope_refusals(changes)
 
     planned = planned_targets(staged, changes)
 
@@ -805,7 +1103,8 @@ def prompt_appendix(staged: StagedPackage, real_table: bool = False) -> str:
     edits the live tree directly, and the staged copy it was given is never
     touched -- which reads back as "the worker changed nothing".
     """
-    if not staged.baseline and not staged.create_targets:
+    repo_enabled = bool(staged.repo_staging and staged.repo_staging.get("enabled"))
+    if not staged.baseline and not staged.create_targets and not repo_enabled:
         return ""
     lines = [
         "",
@@ -833,6 +1132,12 @@ def prompt_appendix(staged: StagedPackage, real_table: bool = False) -> str:
             except ValueError:
                 shown = Path(real).name
             lines.append(f"  {shown} -> {staged_path}")
+    if repo_enabled:
+        lines.append("")
+        lines.append(
+            "The whole project is staged read-only so you can import modules and run tests; "
+            "you may change only the allowed files; any other change rejects the package."
+        )
     lines.append("")
     lines.append("Do not delete or rename anything. Do not create undeclared files.")
     return "\n".join(lines)
@@ -854,8 +1159,11 @@ def containment_receipt(
     if apply_report is not None:
         declared = apply_report.get("integrity", "indeterminate")
     elif changes is not None:
-        declared = "indeterminate" if changes.get("undeclared") else "verified"
-    return {
+        violated = bool(changes.get("undeclared")) or (
+            bool(staged and staged.repo_staging is not None and changes.get("deleted"))
+        )
+        declared = "indeterminate" if violated else "verified"
+    receipt: dict[str, Any] = {
         "containment_mode": staged.containment_mode if staged else "none",
         "os_write_barrier": False,
         "isolation_note": (
@@ -875,3 +1183,6 @@ def containment_receipt(
         },
         "staging_diff": changes or {},
     }
+    if staged is not None and staged.repo_staging is not None:
+        receipt["repo_staging"] = dict(staged.repo_staging)
+    return receipt

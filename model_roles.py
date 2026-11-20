@@ -13,11 +13,19 @@ responsible for honoring that when they consume the selections below.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 
 WORKHORSE_KEYWORDS = ("balanced", "everyday", "workhorse")
 READER_KEYWORDS = ("affordable", "cost-efficient", "cost efficient", "fast", "repeatable")
 FRONTIER_KEYWORDS = ("frontier", "flagship", "most capable")
+
+CODEX_FAMILY_ROLES = {
+    "astra": "frontier",
+    "sol": "workhorse",
+    "luna": "reader",
+}
+_CODEX_FAMILY_RE = re.compile(r"^gpt-(\d+(?:\.\d+)*)-([a-z0-9-]+)$", re.IGNORECASE)
 
 CLAUDE_PEER_ALIASES = {"frontier": "best", "workhorse": "sonnet", "reader": "haiku"}
 # User policy: the Claude flagship chain carries no same-vendor fallback model.
@@ -51,17 +59,21 @@ CODEX_FRONTIER_SEED = {
 
 
 def seed_codex_frontier(models_json: dict) -> dict:
-    """Return a shallow catalog copy containing the current flagship seed.
+    """Return a shallow catalog copy containing the current flagship seed when needed.
 
-    Live entries win by id, and role selection still uses catalog priority rather
-    than lexical model versions.  This keeps older Codex CLIs progressive without
-    rewriting the user's selected main model.
+    When no visible ``astra`` entry exists, appends ``CODEX_FRONTIER_SEED`` if
+    absent so older Codex CLIs stay progressive without rewriting the user's
+    selected main model.
     """
     source = models_json if isinstance(models_json, dict) else {}
     result = dict(source)
     models = list(source.get("models") or []) if isinstance(source.get("models"), list) else []
     ids = {_entry_id(item).lower() for item in models if isinstance(item, dict)}
-    if CODEX_FRONTIER_SEED["id"].lower() not in ids:
+    has_visible_astra = any(
+        (_codex_family_version(item["id"]) or (None,))[0] == "astra"
+        for item in _visible_entries({"models": models})
+    )
+    if not has_visible_astra and CODEX_FRONTIER_SEED["id"].lower() not in ids:
         models.append(dict(CODEX_FRONTIER_SEED))
     result["models"] = models
     return result
@@ -168,6 +180,43 @@ def _visible_entries(models_json: dict) -> list[dict]:
     return out
 
 
+def _codex_family_version(entry_id: str) -> tuple[str, tuple[int, ...]] | None:
+    """Return ``(family, version_tuple)`` for known Codex role families, else ``None``."""
+    match = _CODEX_FAMILY_RE.match(entry_id.strip())
+    if not match:
+        return None
+    version_text, family_text = match.groups()
+    family = family_text.lower()
+    if family not in CODEX_FAMILY_ROLES:
+        return None
+    return family, tuple(int(part) for part in version_text.split("."))
+
+
+def _pick_family_candidate(by_priority: list[dict], family: str) -> dict | None:
+    """Return the visible entry in ``family`` with the highest integer-tuple version."""
+    best_entry: dict | None = None
+    best_version: tuple[int, ...] = ()
+    for entry in by_priority:
+        # Keep the static frontier seed only as a fallback when no live astra exists.
+        if family == "astra" and entry["raw"] == CODEX_FRONTIER_SEED:
+            continue
+        parsed = _codex_family_version(entry["id"])
+        if parsed is None or parsed[0] != family:
+            continue
+        version = parsed[1]
+        if best_entry is None or version > best_version:
+            best_entry = entry
+            best_version = version
+    return best_entry
+
+
+def _pick_fallback_role(non_frontier: list[dict], tier: str, default_index: int) -> dict | None:
+    for entry in non_frontier:
+        if _capability_tier(entry["raw"]) == tier:
+            return entry
+    return non_frontier[default_index] if non_frontier else None
+
+
 @dataclass
 class CodexRoles:
     frontier: dict | None
@@ -181,34 +230,29 @@ def select_codex_roles(models_json: dict) -> CodexRoles:
         return CodexRoles(frontier=None, workhorse=None, reader=None)
 
     by_priority = sorted(entries, key=lambda e: (e["priority"], e["id"]))
-    explicit_frontiers = [
-        entry for entry in by_priority if _capability_tier(entry["raw"]) == "frontier"
-    ]
-    # Prefer a known/declared frontier. If the catalog exposes no capability
-    # signal at all, preserve the previous priority-only behavior for fixtures
-    # and older CLIs.
-    frontier = explicit_frontiers[0] if explicit_frontiers else by_priority[0]
+
+    frontier = _pick_family_candidate(by_priority, "astra")
+    if frontier is None:
+        explicit_frontiers = [
+            entry for entry in by_priority if _capability_tier(entry["raw"]) == "frontier"
+        ]
+        # Prefer a known/declared frontier. If the catalog exposes no capability
+        # signal at all, preserve the previous priority-only behavior for fixtures
+        # and older CLIs.
+        frontier = explicit_frontiers[0] if explicit_frontiers else by_priority[0]
 
     non_frontier = [entry for entry in by_priority if entry["id"] != frontier["id"]]
 
-    workhorse = None
-    for entry in non_frontier:
-        if _capability_tier(entry["raw"]) == "workhorse":
-            workhorse = entry
-            break
+    workhorse = _pick_family_candidate(by_priority, "sol")
     if workhorse is None:
-        workhorse = non_frontier[0] if non_frontier else None
+        workhorse = _pick_fallback_role(non_frontier, "workhorse", 0)
 
-    reader = None
-    for entry in non_frontier:
-        if _capability_tier(entry["raw"]) == "reader":
-            reader = entry
-            break
+    reader = _pick_family_candidate(by_priority, "luna")
     if reader is None:
         # A two-model catalog may legitimately use the one non-frontier model
         # for both cheap roles. It is still cheaper than silently inheriting the
         # selected frontier brain.
-        reader = non_frontier[-1] if non_frontier else None
+        reader = _pick_fallback_role(non_frontier, "reader", -1)
 
     # The live catalog may embed full base-instruction templates in each raw
     # entry. They are useful only while matching descriptions and would add

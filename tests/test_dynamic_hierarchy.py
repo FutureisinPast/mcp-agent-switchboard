@@ -225,7 +225,7 @@ class DynamicAntigravityRoleTests(unittest.TestCase):
         for args in (read_args, write_args):
             self.assertEqual(args["target_agent"], "antigravity")
             self.assertEqual(args["surface"], "cli")
-            self.assertEqual(args["target_model"], "gemini flash")
+            self.assertEqual(args["target_model"], "hydrogen")
             self.assertEqual(args["effort"], "high")
         self.assertEqual(read_args["mode"], "plan")
         self.assertEqual(write_args["mode"], "accept-edits")
@@ -561,7 +561,7 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
             ["native_same_vendor", "switchboard_cross_vendor"],
         )
         self.assertEqual([call.args[0] for call in consult.call_args_list], ["claude"])
-        self.assertTrue(all(call.args[1]["effort"] == "xhigh" for call in consult.call_args_list))
+        self.assertTrue(all(call.args[1]["effort"] == "high" for call in consult.call_args_list))
         self.assertEqual(result["status"], "complete")
         self.assertEqual(result["ledger_ref"], "event:17")
 
@@ -593,20 +593,20 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in gemini_consult.call_args_list], ["codex", "claude"])
 
     def test_gemini_complexity_routes_both_flagships_at_progressive_effort(self):
-        for complexity, expected_effort in (
-            ("bounded", "high"),
-            ("architecture", "xhigh"),
-            ("critical", "max"),
+        for complexity, (astra_effort, fable_effort) in (
+            ("bounded", ("high", "high")),
+            ("architecture", ("xhigh", "high")),
+            ("critical", ("max", "xhigh")),
         ):
             with self.subTest(complexity=complexity):
                 result, consult = self._run(
                     self._args("gemini", "gemini-3.8-flash-high", complexity)
                 )
-            self.assertEqual([call.args[0] for call in consult.call_args_list], ["codex", "claude"])
-            self.assertEqual([call.args[1]["effort"] for call in consult.call_args_list], [expected_effort, expected_effort])
-            self.assertEqual([item["requested_effort"] for item in result["consultations"]], [expected_effort, expected_effort])
+                self.assertEqual([call.args[0] for call in consult.call_args_list], ["codex", "claude"])
+                self.assertEqual([call.args[1]["effort"] for call in consult.call_args_list], [astra_effort, fable_effort])
+                self.assertEqual([item["requested_effort"] for item in result["consultations"]], [astra_effort, fable_effort])
 
-    def test_gemini_bounded_critical_risk_promotes_both_calls_to_max(self):
+    def test_gemini_bounded_critical_risk_promotes_astra_max_fable_xhigh(self):
         result, consult = self._run(
             self._args(
                 "gemini", "gemini-3.8-flash-high", "bounded", risk_flags=["data-loss"]
@@ -615,7 +615,7 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         self.assertEqual(result["complexity"], "critical")
         self.assertTrue(result["complexity_escalated"])
         self.assertEqual([call.args[0] for call in consult.call_args_list], ["codex", "claude"])
-        self.assertEqual([call.args[1]["effort"] for call in consult.call_args_list], ["max", "max"])
+        self.assertEqual([call.args[1]["effort"] for call in consult.call_args_list], ["max", "xhigh"])
 
     def test_risk_flag_raises_effort_to_max(self):
         result, consult = self._run(
@@ -629,7 +629,7 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
         )
         self.assertEqual(result["complexity"], "critical")
         self.assertTrue(result["complexity_escalated"])
-        self.assertTrue(all(call.args[1]["effort"] == "max" for call in consult.call_args_list))
+        self.assertTrue(all(call.args[1]["effort"] == "xhigh" for call in consult.call_args_list))
 
     def test_native_unavailable_falls_back_to_cross_vendor_at_bounded_effort(self):
         # Codex/gpt-5.6-sol has no further native chain member once Astra is
@@ -831,7 +831,7 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
             "blocked": {**strong, "status": "blocked"},
             "empty answer": {**strong, "answer": ""},
             "low confidence": {**strong, "confidence": "low"},
-            "one probe": {**strong, "evidence": strong["evidence"][:1]},
+            "zero probes": {**strong, "evidence": []},
             "no competitor": {**strong, "competing_explanations_checked": []},
             "no primary": {
                 **strong,
@@ -847,6 +847,25 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
                     self._research_outer(package, [coverage]), package
                 )
                 self.assertTrue(errors)
+        with self.subTest(name="one probe"):
+            weak_answers: list = []
+            structured, errors = broker.validate_flash_workhorse_result(
+                self._research_outer(package, [{**strong, "evidence": strong["evidence"][:1]}]),
+                package,
+                weak_answers_out=weak_answers,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(
+                weak_answers,
+                [
+                    {
+                        "question": 1,
+                        "requirement": "answered status requires at least 2 distinct evidence probes",
+                        "follow_up": "confirm with a second independent probe before relying on it",
+                    }
+                ],
+            )
+            self.assertEqual(broker.classify_flash_outcome("{}", "ok", structured), "completed_with_gaps")
 
     def test_research_rejects_bad_web_and_code_document_citations(self):
         package = self._research_package("Q1")
@@ -1221,28 +1240,101 @@ class ProgressiveDecisionConsultTests(unittest.TestCase):
             "allowed_files": package["allowed_files"],
             "acceptance_criteria": package["acceptance_criteria"],
         }
-        responses = {
-            "unavailable_pre_mutation": "Antigravity CLI was not found. test",
-            "rejected": "Antigravity CLI structured-output validation failed: missing field",
-            "blocked": json.dumps({"worker_status": "blocked", "structured_output": {"status": "blocked"}, "cli": {}}),
-            "failed_pre_mutation": json.dumps({"worker_status": "failed", "structured_output": {"status": "failed"}, "cli": {}}),
-        }
-        for expected_outcome, response in responses.items():
-            with self.subTest(outcome=expected_outcome), \
-                 mock.patch.object(broker, "_MCP_CLIENT_NAME", "codex-vscode"), \
-                 mock.patch.object(broker, "load_config", return_value={"compact_task_contract": False}), \
-                 mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
-                 mock.patch.object(broker, "consult_antigravity_cli", return_value=response), \
-                 mock.patch.object(broker, "store_consultation"), \
-                 mock.patch.object(broker, "current_codex_role_model", return_value="gpt-live-terra"):
-                result = broker.consult("antigravity", {**args, "async": False})
-            self.assertEqual(result["outcome"], expected_outcome)
-            handoff = result["native_handoff"]
-            self.assertEqual(handoff["semantic_lane"], "workhorse")
-            self.assertEqual(handoff["native"]["role"], "worker")
-            self.assertEqual(handoff["native"]["model"], "gpt-live-terra")
-            self.assertTrue(handoff["flash_skip_reason"].endswith(result["receipt"]))
-            self.assertFalse(handoff["auto_launch"])
+        cases = [
+            (
+                "unavailable_pre_mutation",
+                "Antigravity CLI was not found. test",
+                None,
+                "native",
+                "flash-unavailable:",
+            ),
+            (
+                "failed_pre_mutation",
+                "Antigravity CLI timed out after 60 seconds: still working",
+                "timeout_during_execution",
+                "native",
+                "flash-failed:",
+            ),
+            (
+                "rejected",
+                "Antigravity CLI structured-output validation failed: missing field",
+                None,
+                "redispatch",
+                None,
+            ),
+            (
+                "blocked",
+                json.dumps({"worker_status": "blocked", "structured_output": {"status": "blocked"}, "cli": {}}),
+                None,
+                "redispatch",
+                None,
+            ),
+            (
+                "failed_pre_mutation",
+                json.dumps({"worker_status": "failed", "structured_output": {"status": "failed"}, "cli": {}}),
+                None,
+                "redispatch",
+                None,
+            ),
+            (
+                "applied_then_rejected",
+                json.dumps({"disposition": "applied_then_rejected", "applied_files": ["src/a.py"], "cli": {}}),
+                None,
+                "applied",
+                None,
+            ),
+            (
+                "apply_outcome_uncertain",
+                json.dumps({"disposition": "apply_outcome_uncertain", "candidate_files": ["src/a.py"], "cli": {}}),
+                None,
+                "applied",
+                None,
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            isolated_db = Path(tmp) / "state.sqlite"
+            isolated_quarantine = Path(tmp) / "quarantine"
+            for expected_outcome, response, failure_kind, expected_shape, prefix in cases:
+                def _fake_cli(*_args, timeout_meta_out=None, _resp=response, _fk=failure_kind, **_kwargs):
+                    if _fk and isinstance(timeout_meta_out, dict):
+                        timeout_meta_out["failure_kind"] = _fk
+                        if _fk == "timeout_during_execution":
+                            timeout_meta_out["timeout_evidence"] = {"steps": 1, "last_action": "editing"}
+                    return _resp
+
+                with self.subTest(outcome=expected_outcome, failure_kind=failure_kind), \
+                     mock.patch.object(broker, "DB_PATH", isolated_db), \
+                     mock.patch.object(broker, "QUARANTINE_ROOT", isolated_quarantine), \
+                     mock.patch.object(broker, "_MCP_CLIENT_NAME", "codex-vscode"), \
+                     mock.patch.object(broker, "load_config", return_value={"compact_task_contract": False}), \
+                     mock.patch.object(broker, "resolve_project", return_value=broker.ProjectInfo("p", ".")), \
+                     mock.patch.object(broker, "consult_antigravity_cli", side_effect=_fake_cli), \
+                     mock.patch.object(broker, "store_consultation"), \
+                     mock.patch.object(broker, "current_codex_role_model", return_value="gpt-live-terra"):
+                    result = broker.consult("antigravity", {**args, "async": False})
+                self.assertEqual(result["outcome"], expected_outcome)
+                handoff = result["native_handoff"]
+                self.assertEqual(handoff["semantic_lane"], "workhorse")
+                self.assertFalse(handoff["auto_launch"])
+                if expected_shape == "native":
+                    self.assertEqual(handoff["native"]["role"], "worker")
+                    self.assertEqual(handoff["native"]["model"], "gpt-live-terra")
+                    self.assertEqual(handoff["flash_skip_reason"], f"{prefix}{result['receipt']}")
+                    self.assertIn(handoff["flash_skip_reason"], handoff["record_requirement"])
+                    self.assertNotIn("brain_review", handoff)
+                    self.assertNotEqual(handoff["action"], "fix_and_redispatch")
+                elif expected_shape == "redispatch":
+                    self.assertEqual(handoff["action"], "fix_and_redispatch")
+                    self.assertNotIn("native", handoff)
+                    self.assertNotIn("flash_skip_reason", handoff)
+                    self.assertTrue(handoff["brain_review"]["required"])
+                else:
+                    self.assertEqual(handoff["action"], "review_applied_files_first")
+                    self.assertIs(handoff["do_not_replay"], True)
+                    self.assertTrue(handoff["do_not_replay_note"])
+                    self.assertNotIn("native", handoff)
+                    self.assertNotIn("flash_skip_reason", handoff)
+                    self.assertTrue(handoff["brain_review"]["required"])
 
 
 class ClaudeFrontierFallbackTests(unittest.TestCase):

@@ -56,6 +56,33 @@ def _no_live_decision_evaluator(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _fable_mode_on_request(monkeypatch):
+    """Existing decision tests assume Fable is opt-in; tests that exercise Fable by default
+    override or pop AGENT_BROKER_FABLE_MODE."""
+    monkeypatch.setenv("AGENT_BROKER_FABLE_MODE", "on_request")
+
+
+@pytest.fixture(autouse=True)
+def _native_flash_skip_off(monkeypatch):
+    """Older gate tests predate the native flash_skip check; tests/test_native_flash_skip.py
+    turns it back on."""
+    monkeypatch.setenv("AGENT_BROKER_NATIVE_FLASH_SKIP", "off")
+
+
+@pytest.fixture(autouse=True)
+def _override_cap_off(monkeypatch):
+    """Older gate tests predate the hourly override cap; tests/test_override_budget.py
+    turns it back on."""
+    monkeypatch.setenv("AGENT_BROKER_OVERRIDE_CAP", "off")
+    monkeypatch.setenv("AGENT_BROKER_OVERRIDE_MAX_BUDGET", "12")
+
+
+@pytest.fixture(autouse=True)
+def _clear_agent_broker_child(monkeypatch):
+    monkeypatch.setenv("AGENT_BROKER_CHILD", "")
+
+
+@pytest.fixture(autouse=True)
 def _isolated_broker_home_and_fast_wait(tmp_path, monkeypatch):
     """Inline-wait for detached workers is capped low, and every path derived from the
     broker home (worker logs, runs/ layout, retention) lands under a per-test tmp dir."""
